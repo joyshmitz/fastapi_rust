@@ -17,6 +17,9 @@
 6. [Validation Rules](#6-validation-rules)
 7. [OpenAPI Generation](#7-openapi-generation)
 8. [Error Handling](#8-error-handling)
+9. [Security Module](#9-security-module)
+10. [Application Configuration](#10-application-configuration)
+11. [Router Configuration](#11-router-configuration)
 
 ---
 
@@ -599,6 +602,357 @@ EndpointContext = TypedDict("EndpointContext", {
 
 ---
 
+## 9. Security Module
+
+### 9.1 Security Base Class
+
+All security classes inherit from `SecurityBase` which provides:
+- OpenAPI integration via `model` attribute
+- `scheme_name` for OpenAPI security scheme identification
+- `auto_error` behavior (raise HTTPException or return None)
+
+### 9.2 OAuth2 Security
+
+#### OAuth2 Base
+```
+OAuth2:
+    flows: OAuthFlowsModel         # OAuth2 flows configuration
+    scheme_name: str | None        # Security scheme name (default: class name)
+    description: str | None        # OpenAPI description
+    auto_error: bool = true        # Raise exception if auth fails
+
+    __call__(request) -> str | None:
+        # Returns full Authorization header value
+        # Raises 401 with "WWW-Authenticate: Bearer" if auto_error
+```
+
+#### OAuth2PasswordBearer
+```
+OAuth2PasswordBearer:
+    tokenUrl: str                  # REQUIRED - URL to obtain token
+    scopes: dict[str, str] | None  # OAuth2 scopes {scope: description}
+    refreshUrl: str | None         # Token refresh URL
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> str | None:
+        # Validates Authorization: Bearer <token>
+        # Returns token (without "Bearer " prefix)
+        # Returns None or raises 401 if missing/invalid
+```
+
+#### OAuth2AuthorizationCodeBearer
+```
+OAuth2AuthorizationCodeBearer:
+    authorizationUrl: str          # REQUIRED - Authorization endpoint
+    tokenUrl: str                  # REQUIRED - Token endpoint
+    refreshUrl: str | None
+    scopes: dict[str, str] | None
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> str | None:
+        # Same extraction as OAuth2PasswordBearer
+```
+
+#### OAuth2PasswordRequestForm (Dependency)
+```
+OAuth2PasswordRequestForm:
+    grant_type: str | None = None  # Optional (should be "password")
+    username: str                  # REQUIRED
+    password: str                  # REQUIRED
+    scope: str = ""                # Space-separated scopes
+    client_id: str | None = None
+    client_secret: str | None = None
+
+    # Computed:
+    scopes: list[str]              # scope.split()
+```
+
+#### OAuth2PasswordRequestFormStrict
+Same as `OAuth2PasswordRequestForm` but `grant_type` is REQUIRED and must be "password".
+
+#### SecurityScopes (Auto-Injected)
+```
+SecurityScopes:
+    scopes: list[str]              # All scopes from dependency chain
+    scope_str: str                 # " ".join(scopes)
+```
+
+### 9.3 HTTP Authentication
+
+#### HTTPBasicCredentials
+```
+HTTPBasicCredentials:
+    username: str
+    password: str
+```
+
+#### HTTPAuthorizationCredentials
+```
+HTTPAuthorizationCredentials:
+    scheme: str      # e.g., "Bearer", "Digest"
+    credentials: str # The token/credential value
+```
+
+#### HTTPBasic
+```
+HTTPBasic:
+    scheme_name: str | None
+    realm: str | None              # HTTP Basic realm
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> HTTPBasicCredentials | None:
+        # Validates Authorization: Basic <base64>
+        # Decodes base64 → "username:password"
+        # Returns HTTPBasicCredentials or raises 401
+        # WWW-Authenticate: Basic [realm="..."]
+```
+
+#### HTTPBearer
+```
+HTTPBearer:
+    bearerFormat: str | None       # OpenAPI bearer format hint
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> HTTPAuthorizationCredentials | None:
+        # Validates Authorization: Bearer <token>
+        # Returns {scheme: "Bearer", credentials: <token>}
+```
+
+#### HTTPDigest
+```
+HTTPDigest:
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    # Note: Stub only - doesn't implement full Digest
+    __call__(request) -> HTTPAuthorizationCredentials | None
+```
+
+### 9.4 API Key Authentication
+
+#### APIKeyQuery
+```
+APIKeyQuery:
+    name: str                      # REQUIRED - Query parameter name
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> str | None:
+        # Extracts request.query_params.get(name)
+```
+
+#### APIKeyHeader
+```
+APIKeyHeader:
+    name: str                      # REQUIRED - Header name
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> str | None:
+        # Extracts request.headers.get(name)
+```
+
+#### APIKeyCookie
+```
+APIKeyCookie:
+    name: str                      # REQUIRED - Cookie name
+    scheme_name: str | None
+    description: str | None
+    auto_error: bool = true
+
+    __call__(request) -> str | None:
+        # Extracts request.cookies.get(name)
+```
+
+### 9.5 Authorization Header Parsing
+
+```python
+def get_authorization_scheme_param(authorization: str | None) -> tuple[str, str]:
+    if not authorization:
+        return "", ""
+    scheme, _, param = authorization.partition(" ")
+    return scheme, param
+```
+
+### 9.6 Security Error Responses
+
+| Security Type | WWW-Authenticate Header |
+|---------------|------------------------|
+| OAuth2 | `Bearer` |
+| HTTPBasic | `Basic` or `Basic realm="..."` |
+| HTTPBearer | `Bearer` |
+| HTTPDigest | `Digest` |
+| APIKey* | `APIKey` (custom, non-standard) |
+
+---
+
+## 10. Application Configuration
+
+### 10.1 FastAPI Class Parameters
+
+#### Core Settings
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `debug` | bool | `false` | Enable debug tracebacks |
+| `title` | str | `"FastAPI"` | API title for OpenAPI |
+| `summary` | str\|None | `None` | Short API summary |
+| `description` | str | `""` | API description (Markdown) |
+| `version` | str | `"0.1.0"` | API version string |
+
+#### OpenAPI Configuration
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `openapi_url` | str\|None | `"/openapi.json"` | OpenAPI schema URL (None disables) |
+| `openapi_tags` | list[dict] | `None` | Tag definitions with descriptions |
+| `openapi_external_docs` | dict | `None` | External docs link {url, description} |
+| `servers` | list[dict] | `None` | Server list [{url, description}] |
+
+#### Documentation UI
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `docs_url` | str\|None | `"/docs"` | Swagger UI URL (None disables) |
+| `redoc_url` | str\|None | `"/redoc"` | ReDoc URL (None disables) |
+| `swagger_ui_oauth2_redirect_url` | str | `"/docs/oauth2-redirect"` | OAuth2 redirect |
+| `swagger_ui_init_oauth` | dict | `None` | Swagger OAuth2 config |
+| `swagger_ui_parameters` | dict | `None` | Swagger UI parameters |
+
+#### API Metadata
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `terms_of_service` | str\|None | `None` | Terms of service URL |
+| `contact` | dict | `None` | Contact {name, url, email} |
+| `license_info` | dict | `None` | License {name, identifier, url} |
+
+#### Routing & Responses
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `redirect_slashes` | bool | `true` | Auto-redirect trailing slashes |
+| `default_response_class` | type | `JSONResponse` | Default response class |
+| `responses` | dict | `None` | Global additional responses |
+| `dependencies` | list[Depends] | `None` | Global dependencies |
+| `callbacks` | list[BaseRoute] | `None` | Global OpenAPI callbacks |
+| `webhooks` | APIRouter | `None` | Webhook documentation router |
+
+#### Schema Generation
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `separate_input_output_schemas` | bool | `true` | Separate input/output schemas |
+| `generate_unique_id_function` | Callable | `generate_unique_id` | Operation ID generator |
+| `include_in_schema` | bool | `true` | Include routes in OpenAPI |
+| `deprecated` | bool | `None` | Mark all routes deprecated |
+
+#### Lifecycle
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lifespan` | Lifespan | `None` | Async context manager for startup/shutdown |
+| `on_startup` | list[Callable] | `None` | Startup event handlers (deprecated) |
+| `on_shutdown` | list[Callable] | `None` | Shutdown event handlers (deprecated) |
+
+#### Middleware & Exceptions
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `middleware` | list[Middleware] | `None` | Middleware stack |
+| `exception_handlers` | dict | `None` | Custom exception handlers |
+
+#### Proxy Configuration
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `root_path` | str | `""` | ASGI root path for reverse proxy |
+| `root_path_in_servers` | bool | `true` | Add root_path to OpenAPI servers |
+
+### 10.2 Runtime Attributes
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `state` | State | Application-wide state object |
+| `dependency_overrides` | dict | Dependency override mapping for testing |
+| `openapi_schema` | dict\|None | Cached OpenAPI schema |
+| `openapi_version` | str | OpenAPI version (default "3.1.0") |
+
+### 10.3 Default Exception Handlers
+
+```
+exception_handlers = {
+    HTTPException: http_exception_handler,
+    RequestValidationError: request_validation_exception_handler,
+    WebSocketRequestValidationError: websocket_request_validation_exception_handler,
+}
+```
+
+---
+
+## 11. Router Configuration
+
+### 11.1 APIRouter Parameters
+
+```
+APIRouter:
+    prefix: str = ""                      # URL prefix for all routes
+    tags: list[str | Enum] | None = None  # Default tags
+    dependencies: list[Depends] | None    # Default dependencies
+    responses: dict | None                # Default additional responses
+    callbacks: list[BaseRoute] | None     # OpenAPI callbacks
+    redirect_slashes: bool = True         # Slash redirect behavior
+    default_response_class: type = Default(JSONResponse)
+    deprecated: bool | None = None        # Mark all routes deprecated
+    include_in_schema: bool = True        # Include in OpenAPI
+    generate_unique_id_function: Callable # Operation ID generator
+    route_class: type = APIRoute          # Custom route class
+    on_startup: list[Callable] | None     # Startup handlers
+    on_shutdown: list[Callable] | None    # Shutdown handlers
+    lifespan: Lifespan | None             # Async context manager
+```
+
+### 11.2 Router Inclusion (include_router)
+
+```python
+app.include_router(
+    router,
+    prefix="/api",           # Added to router's prefix
+    tags=["api"],            # Merged with router's tags
+    dependencies=[...],      # Added to router's dependencies
+    responses={...},         # Merged with router's responses
+    deprecated=False,        # Override router's deprecated
+    include_in_schema=True,  # Override router's include_in_schema
+    callbacks=[...],         # Merged with router's callbacks
+    generate_unique_id_function=...,  # Override
+    default_response_class=...,       # Override
+)
+```
+
+### 11.3 Route Inclusion Order
+
+1. `prefix` is prepended to all route paths
+2. `tags` are prepended to route tags
+3. `dependencies` are prepended to route dependencies
+4. `responses` are merged (route overrides router overrides app)
+5. `callbacks` are merged
+6. Boolean flags use override if provided, else inherit
+
+### 11.4 Sub-Application Mounting
+
+```python
+app.mount("/subapp", subapp)  # Mount at path prefix
+```
+
+**Behavior:**
+- Sub-app receives requests with path prefix stripped
+- Sub-app's OpenAPI is NOT merged into parent
+- Independent middleware stacks
+- Use `include_router` for OpenAPI integration instead
+
+---
+
 ## Appendix A: Behaviors NOT to Implement
 
 Per `PLAN_TO_PORT_FASTAPI_TO_RUST.md`, these are EXCLUDED:
@@ -649,5 +1003,6 @@ Per `PLAN_TO_PORT_FASTAPI_TO_RUST.md`, these are EXCLUDED:
 
 ---
 
-*Document version: 1.0*
+*Document version: 2.0*
 *Extracted from FastAPI v0.128.0*
+*Last updated: 2026-01-17*
