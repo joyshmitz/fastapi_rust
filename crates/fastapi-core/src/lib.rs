@@ -28,9 +28,11 @@
 mod context;
 mod error;
 mod extract;
+pub mod logging;
 pub mod middleware;
 mod request;
 mod response;
+pub mod testing;
 
 pub use context::{CancelledError, IntoOutcome, RequestContext};
 pub use error::{HttpError, ValidationError, ValidationErrors};
@@ -44,3 +46,9 @@ pub use response::{IntoResponse, Response, ResponseBody, StatusCode};
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
+
+// Re-export testing utilities
+pub use testing::{CookieJar, RequestBuilder, TestClient, TestResponse};
+
+// Re-export logging utilities
+pub use logging::{AutoSpan, LogConfig, LogEntry, LogLevel, Span};

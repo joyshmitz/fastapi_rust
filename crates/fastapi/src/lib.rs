@@ -66,6 +66,9 @@ pub use fastapi_core::{
     FromRequest, HttpError, IntoResponse, Method, Request, Response, ResponseBody, StatusCode,
     ValidationError, ValidationErrors,
 };
+
+// Re-export testing utilities
+pub use fastapi_core::{CookieJar, RequestBuilder, TestClient, TestResponse};
 pub use fastapi_macros::{delete, get, patch, post, put, JsonSchema, Validate};
 pub use fastapi_openapi::{OpenApi, OpenApiBuilder};
 pub use fastapi_router::{Route, Router};
@@ -78,6 +81,11 @@ pub mod prelude {
         ValidationError, ValidationErrors,
     };
     pub use serde::{Deserialize, Serialize};
+}
+
+/// Testing utilities module.
+pub mod testing {
+    pub use fastapi_core::testing::{CookieJar, RequestBuilder, TestClient, TestResponse};
 }
 
 // TODO: Extractors module (Path, Query, Json, Header, Cookie)
