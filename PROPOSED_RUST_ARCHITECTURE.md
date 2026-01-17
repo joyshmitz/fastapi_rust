@@ -3,7 +3,7 @@
 > **Design from spec, not translation.** This document describes how to implement FastAPI's behaviors in idiomatic Rust.
 
 **Reference:** `EXISTING_FASTAPI_STRUCTURE.md` (THE SPEC)
-**Runtime:** asupersync (co-developed)
+**Runtime:** asupersync (co-developed at `/data/projects/asupersync`)
 **Created:** 2026-01-17
 
 ---
@@ -11,16 +11,17 @@
 ## Table of Contents
 
 1. [Design Principles](#1-design-principles)
-2. [Crate Structure](#2-crate-structure)
-3. [HTTP Layer](#3-http-layer)
-4. [Router Design](#4-router-design)
-5. [Extractor System](#5-extractor-system)
-6. [Validation](#6-validation)
-7. [Dependency Injection](#7-dependency-injection)
-8. [Security Extractors](#8-security-extractors)
-9. [OpenAPI Generation](#9-openapi-generation)
-10. [Error Handling](#10-error-handling)
-11. [Application Builder](#11-application-builder)
+2. [Asupersync Integration](#2-asupersync-integration)
+3. [Crate Structure](#3-crate-structure)
+4. [HTTP Layer](#4-http-layer)
+5. [Router Design](#5-router-design)
+6. [Extractor System](#6-extractor-system)
+7. [Validation](#7-validation)
+8. [Dependency Injection](#8-dependency-injection)
+9. [Security Extractors](#9-security-extractors)
+10. [OpenAPI Generation](#10-openapi-generation)
+11. [Error Handling](#11-error-handling)
+12. [Application Builder](#12-application-builder)
 
 ---
 
@@ -47,21 +48,276 @@ async fn get_item(
 ) -> Json<Item> { ... }
 ```
 
-### 1.3 Capability-Based Request Context
+### 1.3 Built on Asupersync
 
-Use asupersync's `Cx` as the request context carrier:
+Every design decision leverages asupersync's structured concurrency model:
+
+- **Cx** — Capability token for all effects
+- **Outcome** — Four-valued result with severity lattice
+- **Budget** — Request timeouts and resource limits
+- **Two-Phase** — Cancel-safe resource acquisition
+- **Lab Runtime** — Deterministic testing
+
+---
+
+## 2. Asupersync Integration
+
+### 2.1 The Cx Capability Token
+
+Every HTTP handler receives a `Cx` reference — the capability token that gates all effects:
 
 ```rust
-// Cx provides:
-// - Cancellation token
-// - Budget/timeout
-// - Request-scoped values (dependencies)
-async fn handler(cx: &Cx, ...) -> Response { ... }
+use asupersync::Cx;
+
+#[get("/items/{id}")]
+async fn get_item(cx: &Cx, id: Path<i64>) -> Outcome<Json<Item>, HttpError> {
+    // Cx provides:
+    // - cx.region_id()        → Request's region identity
+    // - cx.task_id()          → Handler's task identity
+    // - cx.budget()           → Remaining time/poll quota
+    // - cx.checkpoint()?      → Cancellation check point
+    // - cx.is_cancel_requested() → Check without yielding
+    // - cx.masked(|| ...)     → Critical section (can't be cancelled)
+    // - cx.trace("msg")       → Deterministic logging
+
+    cx.checkpoint()?;  // Early exit if client disconnected
+
+    let item = db_query(cx, id.0).await?;
+    Outcome::Ok(Json(item))
+}
+```
+
+### 2.2 Request Lifecycle as Region
+
+Each HTTP request becomes an asupersync **Region**:
+
+```
+Connection Accepted
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  Request Region (owns all request tasks)     │
+│  ┌─────────────────────────────────────────┐│
+│  │  Handler Task (main request processing) ││
+│  │  ├── Dependency Task (DB query)         ││
+│  │  ├── Dependency Task (cache lookup)     ││
+│  │  └── Background Task (logging)          ││
+│  └─────────────────────────────────────────┘│
+│                                              │
+│  Region close waits for ALL tasks to finish │
+└─────────────────────────────────────────────┘
+    │
+    ▼
+Response Sent (only after region quiescent)
+```
+
+**Benefits:**
+- No orphaned tasks — region close waits for children
+- Client disconnect → cancel request region → all tasks cleaned up
+- Request timeout → budget exhausted → graceful cancellation
+
+### 2.3 Budget for Request Timeouts
+
+Use asupersync's `Budget` for HTTP timeouts:
+
+```rust
+use asupersync::{Budget, Time};
+
+impl App {
+    async fn handle_request(&self, cx: &Cx, req: Request) -> Response {
+        // Apply request timeout budget
+        let timeout_budget = Budget::new()
+            .with_deadline(Time::now().saturating_add_secs(30))
+            .with_poll_quota(10_000);  // Prevent infinite loops
+
+        let request_cx = cx.with_budget(timeout_budget);
+
+        // Handler runs with combined budget (tightest wins)
+        match self.router.dispatch(&request_cx, req).await {
+            Outcome::Ok(resp) => resp,
+            Outcome::Err(e) => e.into_response(),
+            Outcome::Cancelled(reason) => {
+                // Client disconnected or timeout
+                Response::with_status(StatusCode::REQUEST_TIMEOUT)
+            }
+            Outcome::Panicked(payload) => {
+                // Handler panicked - log and return 500
+                Response::internal_error()
+            }
+        }
+    }
+}
+```
+
+### 2.4 Outcome for Handler Returns
+
+Handlers return `Outcome<T, E>` instead of `Result<T, E>` to properly handle cancellation:
+
+```rust
+use asupersync::Outcome;
+
+// Handler signature
+async fn handler(cx: &Cx, ...) -> Outcome<Response, HttpError>;
+
+// Outcome severity lattice:
+// Ok(T)           → severity 0 (success)
+// Err(E)          → severity 1 (application error)
+// Cancelled(R)    → severity 2 (request cancelled)
+// Panicked(P)     → severity 3 (handler crashed)
+
+// When joining concurrent operations (e.g., fan-out):
+// The outcome with HIGHEST severity wins
+// Example: join(Ok, Cancelled) → Cancelled
+```
+
+### 2.5 Two-Phase Pattern for Resources
+
+Use asupersync's two-phase pattern for cancel-safe resource acquisition:
+
+```rust
+use asupersync::channel::{Sender, Permit};
+
+// Database connection pool example
+impl DbPool {
+    pub async fn acquire(&self, cx: &Cx) -> Outcome<DbConn, PoolError> {
+        // Phase 1: Reserve connection (cancel-safe)
+        let permit = self.permits.reserve(cx).await?;
+
+        // Phase 2: Get actual connection (infallible)
+        let conn = permit.take_connection();
+
+        Outcome::Ok(DbConn { conn, permit })
+    }
+}
+
+// If cancelled during Phase 1: no cleanup needed
+// If cancelled during Phase 2: permit drop returns connection to pool
+```
+
+### 2.6 Structured Concurrency Combinators
+
+Use asupersync combinators for concurrent HTTP patterns:
+
+```rust
+use asupersync::combinator::{join_all, race, timeout, retry};
+
+// Fan-out to multiple services
+#[get("/aggregate")]
+async fn aggregate(cx: &Cx) -> Outcome<Json<Combined>, Error> {
+    // Run all in parallel, wait for all
+    let results = join_all(cx, [
+        fetch_service_a(cx),
+        fetch_service_b(cx),
+        fetch_service_c(cx),
+    ]).await;
+
+    // Aggregate outcomes (worst severity wins)
+    Outcome::Ok(Json(Combined::from(results)))
+}
+
+// First successful response wins
+#[get("/fastest")]
+async fn fastest(cx: &Cx) -> Outcome<Json<Data>, Error> {
+    // Race returns (winner_index, outcome), cancels losers
+    let (_, outcome) = race(cx, [
+        fetch_primary(cx),
+        fetch_replica(cx),
+    ]).await;
+
+    outcome.map(Json)
+}
+
+// Retry with exponential backoff
+#[post("/reliable")]
+async fn reliable(cx: &Cx, body: Json<Payload>) -> Outcome<(), Error> {
+    retry(cx,
+        || send_to_queue(cx, &body.0),
+        RetryPolicy::exponential(base: 100ms, max: 10s, attempts: 5)
+    ).await
+}
+```
+
+### 2.7 Lab Runtime for Testing
+
+Use asupersync's `LabRuntime` for deterministic HTTP tests:
+
+```rust
+use asupersync::lab::{LabRuntime, LabConfig};
+
+#[test]
+fn concurrent_requests_deterministic() {
+    let config = LabConfig::new().with_seed(12345);
+    let lab = LabRuntime::new(config);
+
+    lab.run(|| async {
+        let app = App::new();
+
+        // Spawn concurrent requests
+        let results = join_all(&lab.cx(), [
+            app.handle(Request::get("/a")),
+            app.handle(Request::get("/b")),
+            app.handle(Request::get("/c")),
+        ]).await;
+
+        // Results are deterministic for this seed
+        assert_eq!(results[0].status(), 200);
+    });
+
+    // Same seed → same execution → reproducible bugs
+}
+
+#[test]
+fn request_timeout_cleanup() {
+    let lab = LabRuntime::new(LabConfig::default());
+
+    lab.run(|| async {
+        let app = App::new();
+
+        // Request that will timeout
+        let cx = lab.cx().with_budget(Budget::new()
+            .with_deadline(Time::from_millis(100)));
+
+        let result = app.handle(&cx, slow_request()).await;
+
+        // Verify cancelled, not stuck
+        assert!(result.is_cancelled());
+
+        // Verify no task leaks
+        assert!(!lab.has_leaked_tasks());
+    });
+}
+```
+
+### 2.8 Cancellation Checkpoints
+
+Insert cancellation checkpoints in long operations:
+
+```rust
+async fn process_large_batch(cx: &Cx, items: Vec<Item>) -> Outcome<(), Error> {
+    for (i, item) in items.iter().enumerate() {
+        // Check for cancellation every N items
+        if i % 100 == 0 {
+            cx.checkpoint()?;  // Returns Cancelled if request aborted
+        }
+
+        process_item(cx, item).await?;
+    }
+    Outcome::Ok(())
+}
+
+// For critical cleanup that must complete:
+async fn finalize_transaction(cx: &Cx, txn: Transaction) -> Outcome<(), Error> {
+    cx.masked(|| async {
+        // Inside masked: cx.checkpoint() always returns Ok
+        // This section WILL complete even if cancelled
+        txn.commit().await
+    }).await
+}
 ```
 
 ---
 
-## 2. Crate Structure
+## 3. Crate Structure
 
 ```
 fastapi_rust/
@@ -106,7 +362,7 @@ fastapi_rust/
 │           └── spec.rs           # OpenAPI document
 ```
 
-### 2.1 Dependency Graph
+### 3.1 Dependency Graph
 
 ```
 fastapi (facade)
@@ -121,7 +377,7 @@ fastapi (facade)
     └── fastapi-core
 ```
 
-### 2.2 External Dependencies
+### 3.2 External Dependencies
 
 ```toml
 [workspace.dependencies]
@@ -135,9 +391,9 @@ serde_json = "1"
 
 ---
 
-## 3. HTTP Layer
+## 4. HTTP Layer
 
-### 3.1 Request Type
+### 4.1 Request Type
 
 ```rust
 /// Zero-copy HTTP request
@@ -168,7 +424,7 @@ pub enum Body<'a> {
 }
 ```
 
-### 3.2 Response Type
+### 4.2 Response Type
 
 ```rust
 pub struct Response {
@@ -195,7 +451,7 @@ impl Response {
 }
 ```
 
-### 3.3 Status Codes
+### 4.3 Status Codes
 
 ```rust
 pub struct StatusCode(u16);
@@ -238,9 +494,9 @@ impl StatusCode {
 
 ---
 
-## 4. Router Design
+## 5. Router Design
 
-### 4.1 Radix Trie Router
+### 5.1 Radix Trie Router
 
 ```rust
 /// Compile-time route table
@@ -277,7 +533,7 @@ enum Converter {
 }
 ```
 
-### 4.2 Route Matching
+### 5.2 Route Matching
 
 ```rust
 pub struct RouteMatch<'a> {
@@ -317,7 +573,7 @@ impl Router {
 }
 ```
 
-### 4.3 Route Registration Macro
+### 5.3 Route Registration Macro
 
 ```rust
 /// Generated at compile time
@@ -351,9 +607,9 @@ fn __route_get_item() -> Route {
 
 ---
 
-## 5. Extractor System
+## 6. Extractor System
 
-### 5.1 FromRequest Trait
+### 6.1 FromRequest Trait
 
 ```rust
 /// Extract a value from an HTTP request
@@ -372,7 +628,7 @@ pub trait FromRequest: Sized {
 }
 ```
 
-### 5.2 Path Extractor
+### 6.2 Path Extractor
 
 ```rust
 /// Extract path parameters
@@ -401,7 +657,7 @@ impl<T: DeserializeOwned> FromRequest for Path<T> {
 }
 ```
 
-### 5.3 Query Extractor
+### 6.3 Query Extractor
 
 ```rust
 /// Extract query parameters
@@ -434,7 +690,7 @@ struct ListParams {
 }
 ```
 
-### 5.4 Header Extractor
+### 6.4 Header Extractor
 
 ```rust
 /// Extract a single header
@@ -476,7 +732,7 @@ fn convert_header_name(rust_name: &str) -> String {
 }
 ```
 
-### 5.5 Cookie Extractor
+### 6.5 Cookie Extractor
 
 ```rust
 /// Extract a cookie value
@@ -498,7 +754,7 @@ impl<T: DeserializeOwned> FromRequest for Cookie<T> {
 }
 ```
 
-### 5.6 JSON Body Extractor
+### 6.6 JSON Body Extractor
 
 ```rust
 /// Extract JSON body
@@ -539,9 +795,9 @@ impl<T: Serialize> IntoResponse for Json<T> {
 
 ---
 
-## 6. Validation
+## 7. Validation
 
-### 6.1 Validate Derive Macro
+### 7.1 Validate Derive Macro
 
 ```rust
 /// Compile-time validation code generation
@@ -561,7 +817,7 @@ pub struct CreateItem {
 }
 ```
 
-### 6.2 Validation Constraints
+### 7.2 Validation Constraints
 
 ```rust
 /// Validation constraint trait
@@ -619,7 +875,7 @@ impl Validate for CreateItem {
 }
 ```
 
-### 6.3 Validating Extractor
+### 7.3 Validating Extractor
 
 ```rust
 /// JSON body with validation
@@ -638,9 +894,9 @@ impl<T: DeserializeOwned + Validate> FromRequest for ValidJson<T> {
 
 ---
 
-## 7. Dependency Injection
+## 8. Dependency Injection
 
-### 7.1 Depends Pattern via Cx
+### 8.1 Depends Pattern via Cx
 
 ```rust
 /// Request-scoped dependency storage in Cx
@@ -664,7 +920,7 @@ impl Cx {
 }
 ```
 
-### 7.2 Dependency Extractor
+### 8.2 Dependency Extractor
 
 ```rust
 /// Dependency injection extractor
@@ -697,7 +953,7 @@ pub trait FromDependency: Clone + Send + Sync + 'static {
 }
 ```
 
-### 7.3 Database Connection Example
+### 8.3 Database Connection Example
 
 ```rust
 /// Database connection pool (app-level state)
@@ -730,7 +986,7 @@ async fn get_user(
 }
 ```
 
-### 7.4 Chained Dependencies
+### 8.4 Chained Dependencies
 
 ```rust
 /// Current user (depends on auth token)
@@ -760,9 +1016,9 @@ impl FromDependency for CurrentUser {
 
 ---
 
-## 8. Security Extractors
+## 9. Security Extractors
 
-### 8.1 Bearer Token
+### 9.1 Bearer Token
 
 ```rust
 /// Extract bearer token from Authorization header
@@ -789,7 +1045,7 @@ impl FromRequest for BearerToken {
 }
 ```
 
-### 8.2 HTTP Basic Auth
+### 9.2 HTTP Basic Auth
 
 ```rust
 /// HTTP Basic authentication credentials
@@ -827,7 +1083,7 @@ impl FromRequest for BasicAuth {
 }
 ```
 
-### 8.3 API Key
+### 9.3 API Key
 
 ```rust
 /// API key from query parameter
@@ -872,7 +1128,7 @@ async fn protected(
 }
 ```
 
-### 8.4 Optional Authentication
+### 9.4 Optional Authentication
 
 ```rust
 /// Make any auth extractor optional
@@ -899,9 +1155,9 @@ async fn maybe_auth(
 
 ---
 
-## 9. OpenAPI Generation
+## 10. OpenAPI Generation
 
-### 9.1 Schema Trait
+### 10.1 Schema Trait
 
 ```rust
 /// Generate JSON Schema for a type
@@ -938,7 +1194,7 @@ impl JsonSchema for Item {
 }
 ```
 
-### 9.2 OpenAPI Document Builder
+### 10.2 OpenAPI Document Builder
 
 ```rust
 pub struct OpenApiBuilder {
@@ -990,7 +1246,7 @@ impl OpenApiBuilder {
 }
 ```
 
-### 9.3 Route Metadata from Macros
+### 10.3 Route Metadata from Macros
 
 ```rust
 /// Metadata extracted at compile time
@@ -1024,9 +1280,9 @@ pub struct Route {
 
 ---
 
-## 10. Error Handling
+## 11. Error Handling
 
-### 10.1 Error Types
+### 11.1 Error Types
 
 ```rust
 /// HTTP error that produces a response
@@ -1079,7 +1335,7 @@ impl IntoResponse for HttpError {
 }
 ```
 
-### 10.2 Validation Error Response
+### 11.2 Validation Error Response
 
 ```rust
 /// Validation error (422 Unprocessable Entity)
@@ -1107,7 +1363,7 @@ impl IntoResponse for ValidationErrors {
 }
 ```
 
-### 10.3 Result Return Type
+### 11.3 Result Return Type
 
 ```rust
 /// Handler can return Result<T, E> where both T and E implement IntoResponse
@@ -1135,9 +1391,9 @@ async fn get_item(
 
 ---
 
-## 11. Application Builder
+## 12. Application Builder
 
-### 11.1 App Configuration
+### 12.1 App Configuration
 
 ```rust
 pub struct App {
@@ -1220,7 +1476,7 @@ impl App {
 }
 ```
 
-### 11.2 Router Builder
+### 12.2 Router Builder
 
 ```rust
 pub struct RouterBuilder {
