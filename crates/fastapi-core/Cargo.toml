@@ -11,5 +11,8 @@ asupersync = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Testing utilities (used by TestClient for sync execution)
+futures-executor = "0.3"
+
 [lints]
 workspace = true
