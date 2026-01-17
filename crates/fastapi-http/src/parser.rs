@@ -534,7 +534,7 @@ impl<'a> HeadersParser<'a> {
     }
 
     /// Returns all headers matching a name (case-insensitive).
-    pub fn get_all(&self, name: &str) -> impl Iterator<Item = Header<'a>> + '_ {
+    pub fn get_all<'b>(&'b self, name: &'b str) -> impl Iterator<Item = Header<'a>> + 'b {
         self.iter()
             .filter_map(Result::ok)
             .filter(move |h| h.name_eq_ignore_case(name))
