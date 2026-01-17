@@ -1,0 +1,15 @@
+[package]
+name = "fastapi-openapi"
+description = "OpenAPI 3.1 types and schema generation for fastapi_rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fastapi-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

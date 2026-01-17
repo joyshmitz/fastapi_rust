@@ -1,0 +1,18 @@
+[package]
+name = "fastapi-macros"
+description = "Procedural macros for fastapi_rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
+
+[lints]
+workspace = true

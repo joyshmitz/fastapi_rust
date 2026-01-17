@@ -1,0 +1,19 @@
+[package]
+name = "fastapi"
+description = "Ultra-optimized Rust web framework inspired by FastAPI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fastapi-core = { workspace = true }
+fastapi-http = { workspace = true }
+fastapi-router = { workspace = true }
+fastapi-macros = { workspace = true }
+fastapi-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

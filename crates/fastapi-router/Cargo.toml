@@ -1,0 +1,13 @@
+[package]
+name = "fastapi-router"
+description = "Trie-based router for fastapi_rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fastapi-core = { workspace = true }
+
+[lints]
+workspace = true

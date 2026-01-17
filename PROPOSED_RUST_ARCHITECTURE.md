@@ -1529,15 +1529,46 @@ impl RouterBuilder {
 
 ## Implementation Phases
 
+### Phase 0: Asupersync Foundation ✅ COMPLETE
+- [x] Add asupersync workspace dependency (`fastapi_rust-i5m`)
+- [x] Design RequestContext wrapping Cx (`fastapi_rust-qhc`)
+- [x] Implement RequestContext with Cx integration (`fastapi_rust-dsb`)
+
+**Implemented in `crates/fastapi-core/src/context.rs`:**
+```rust
+pub struct RequestContext {
+    cx: Cx,
+    request_id: u64,
+}
+
+impl RequestContext {
+    pub fn checkpoint(&self) -> Result<(), CancelledError>;
+    pub fn masked<F, R>(&self, f: F) -> R;
+    pub fn budget(&self) -> Budget;
+    pub fn is_cancelled(&self) -> bool;
+    pub fn cx(&self) -> &Cx;
+}
+```
+
+**Re-exports in `lib.rs`:**
+```rust
+pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
+```
+
 ### Phase 1: Core Infrastructure
-- [ ] fastapi-core types (Request, Response, Error)
-- [ ] fastapi-http zero-copy parser
-- [ ] Basic server loop with asupersync
+- [x] fastapi-core types (Request, Response, Error) - **implemented**
+- [ ] Zero-copy HTTP request line parser (`fastapi_rust-5be`)
+- [ ] Zero-copy HTTP header parser (`fastapi_rust-d6d`)
+- [ ] HTTP response builder (`fastapi_rust-0qv`)
+- [ ] TCP server with asupersync (`fastapi_rust-9ik`)
+- [ ] Error handling with Outcome (`fastapi_rust-3f1`)
+- [ ] Request timeout via Budget (`fastapi_rust-k9h`)
 
 ### Phase 2: Routing & Extractors
-- [ ] Radix trie router
-- [ ] FromRequest trait and basic extractors (Path, Query, Json)
-- [ ] Route macros (#[get], #[post], etc.)
+- [ ] Design trie-based router (`fastapi_rust-9ll`)
+- [ ] Implement route trie (`fastapi_rust-hfk`)
+- [ ] Route macros #[get], #[post] (`fastapi_rust-o6k`)
+- [ ] FromRequest trait and extractors (`fastapi_rust-940`)
 
 ### Phase 3: Validation
 - [ ] Validate derive macro
@@ -1560,5 +1591,28 @@ impl RouterBuilder {
 
 ---
 
-*Document version: 1.0*
+## Asupersync Co-Development Coordination
+
+### What fastapi_rust Needs from Asupersync
+
+| Feature | Asupersync Status | fastapi_rust Dependency |
+|---------|-------------------|-------------------------|
+| Cx (capability context) | ✅ Implemented | Phase 0 - Used in RequestContext |
+| Outcome (4-valued result) | ✅ Implemented | Phase 1 - Error handling |
+| Budget (time/poll quota) | ✅ Implemented | Phase 1 - Request timeouts |
+| Combinators (join, race) | ✅ Implemented | Phase 2+ - Concurrent handlers |
+| Lab runtime | ✅ Implemented | Phase 2 - Deterministic testing |
+| TcpListener/TcpStream | 🔜 Phase 2 | Phase 1 - HTTP server |
+| Graceful shutdown | 🔜 | Phase 6 - Server shutdown |
+
+### Cross-Project Beads
+
+When asupersync implements TCP I/O, create corresponding fastapi_rust beads:
+- `fastapi_rust-tcp-server` depends on asupersync TCP implementation
+- Test utilities depend on asupersync Lab runtime being complete
+
+---
+
+*Document version: 1.1*
 *Created: 2026-01-17*
+*Updated: 2026-01-17 - Added Phase 0 completion, bead references*

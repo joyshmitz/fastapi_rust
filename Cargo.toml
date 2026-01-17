@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fastapi",
+    "crates/fastapi-core",
+    "crates/fastapi-http",
+    "crates/fastapi-router",
+    "crates/fastapi-macros",
+    "crates/fastapi-openapi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Runtime (our own)
+asupersync = { path = "../asupersync" }
+
+# Serialization (only these)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Internal crates
+fastapi = { path = "crates/fastapi" }
+fastapi-core = { path = "crates/fastapi-core" }
+fastapi-http = { path = "crates/fastapi-http" }
+fastapi-router = { path = "crates/fastapi-router" }
+fastapi-macros = { path = "crates/fastapi-macros" }
+fastapi-openapi = { path = "crates/fastapi-openapi" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+# Allow these during early development
+doc_markdown = "allow"
+missing_const_for_fn = "allow"
+doc_link_with_quotes = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
