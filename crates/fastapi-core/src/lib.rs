@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod context;
+mod dependency;
 mod error;
 mod extract;
 pub mod logging;
@@ -35,14 +36,22 @@ mod response;
 pub mod testing;
 
 pub use context::{CancelledError, IntoOutcome, RequestContext};
+pub use dependency::{
+    DefaultConfig, DefaultDependencyConfig, DependencyCache, DependencyOverrides, DependencyScope,
+    Depends, DependsConfig, FromDependency, NoCache,
+};
 pub use error::{HttpError, ValidationError, ValidationErrors};
-pub use extract::FromRequest;
+pub use extract::{
+    DEFAULT_JSON_LIMIT, FromRequest, Json, JsonConfig, JsonExtractError, Path, PathExtractError,
+    PathParams,
+};
 pub use middleware::{
-    AddResponseHeader, BoxFuture, ControlFlow, Handler, Layer, Layered, Middleware,
-    MiddlewareStack, NoopMiddleware, PathPrefixFilter, RequireHeader,
+    AddResponseHeader, BoxFuture, ControlFlow, Cors, CorsConfig, Handler, Layer, Layered,
+    Middleware, MiddlewareStack, NoopMiddleware, OriginPattern, PathPrefixFilter,
+    RequestResponseLogger, RequireHeader,
 };
 pub use request::{Body, Headers, Method, Request};
-pub use response::{IntoResponse, Response, ResponseBody, StatusCode};
+pub use response::{BodyStream, IntoResponse, Response, ResponseBody, StatusCode};
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
