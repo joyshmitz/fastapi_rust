@@ -2169,8 +2169,49 @@ mod tests {
     }
 
     /// Simple test handler that returns 200 OK
-    async fn ok_handler(_ctx: &RequestContext, _req: &mut Request) -> Response {
-        Response::ok().body(ResponseBody::Bytes(b"handler".to_vec()))
+    struct OkHandler;
+
+    impl Handler for OkHandler {
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            Box::pin(async move { Response::ok().body(ResponseBody::Bytes(b"handler".to_vec())) })
+        }
+    }
+
+    /// Handler that checks for a header injected by middleware.
+    struct CheckHeaderHandler;
+
+    impl Handler for CheckHeaderHandler {
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            let has_header = req.headers().get("X-Modified-By").is_some();
+            Box::pin(async move {
+                if has_header {
+                    Response::ok().body(ResponseBody::Bytes(b"header-present".to_vec()))
+                } else {
+                    Response::with_status(StatusCode::BAD_REQUEST)
+                }
+            })
+        }
+    }
+
+    /// Handler that returns an error status.
+    struct ErrorHandler;
+
+    impl Handler for ErrorHandler {
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            Box::pin(async move { Response::with_status(StatusCode::INTERNAL_SERVER_ERROR) })
+        }
     }
 
     #[test]
@@ -2187,7 +2228,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         let calls = log.lock().unwrap().clone();
         assert_eq!(
@@ -2217,7 +2258,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         // Should get 403 from the break
         assert_eq!(response.status().as_u16(), 403);
@@ -2247,7 +2288,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 403);
 
@@ -2269,7 +2310,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 403);
 
@@ -2293,7 +2334,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 200);
     }
@@ -2510,7 +2551,7 @@ mod tests {
     #[test]
     fn layer_wraps_handler() {
         let layer = Layer::new(LayerTestMiddleware::new("wrapped"));
-        let wrapped = layer.wrap(ok_handler);
+        let wrapped = layer.wrap(OkHandler);
 
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
@@ -2551,7 +2592,7 @@ mod tests {
         }
 
         let layer = Layer::new(BreakingMiddleware);
-        let wrapped = layer.wrap(ok_handler);
+        let wrapped = layer.wrap(OkHandler);
 
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
@@ -2620,15 +2661,6 @@ mod tests {
             }
         }
 
-        async fn check_header_handler(_ctx: &RequestContext, req: &mut Request) -> Response {
-            let has_header = req.headers().get("X-Modified-By").is_some();
-            if has_header {
-                Response::ok().body(ResponseBody::Bytes(b"header-present".to_vec()))
-            } else {
-                Response::with_status(StatusCode::BAD_REQUEST)
-            }
-        }
-
         let mut stack = MiddlewareStack::new();
         stack.push(RequestModifier);
 
@@ -2636,7 +2668,7 @@ mod tests {
         let mut req = Request::new(crate::request::Method::Get, "/");
 
         let response =
-            futures_executor::block_on(stack.execute(&check_header_handler, &ctx, &mut req));
+            futures_executor::block_on(stack.execute(&CheckHeaderHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 200);
     }
@@ -2651,7 +2683,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         // All headers should be present (after hooks run in reverse)
         assert_eq!(header_value(&response, "X-First"), Some("1".to_string()));
@@ -2672,7 +2704,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 403);
         // Body should be from the breaking middleware, not the handler
@@ -2707,7 +2739,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&OkHandler, &ctx, &mut req));
 
         // Should be changed by after hook
         assert_eq!(response.status().as_u16(), 503);
@@ -2715,10 +2747,6 @@ mod tests {
 
     #[test]
     fn middleware_after_runs_even_on_error_status() {
-        async fn error_handler(_ctx: &RequestContext, _req: &mut Request) -> Response {
-            Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut stack = MiddlewareStack::new();
         stack.push(OrderTrackingMiddleware::new("mw1", log.clone()));
@@ -2726,7 +2754,7 @@ mod tests {
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
-        let response = futures_executor::block_on(stack.execute(&error_handler, &ctx, &mut req));
+        let response = futures_executor::block_on(stack.execute(&ErrorHandler, &ctx, &mut req));
 
         assert_eq!(response.status().as_u16(), 500);
 

@@ -1383,6 +1383,7 @@ mod tests {
     use crate::app::App;
     use crate::dependency::{Depends, FromDependency};
     use crate::error::HttpError;
+    use crate::extract::FromRequest;
     use crate::middleware::BoxFuture;
 
     // Simple test handler
@@ -1455,11 +1456,29 @@ mod tests {
         }
     }
 
-    async fn override_dep_handler(ctx: &RequestContext, req: &mut Request) -> Response {
-        let dep = Depends::<OverrideDep>::from_request(ctx, req)
-            .await
+    struct OverrideDepHandler;
+
+    impl Handler for OverrideDepHandler {
+        fn call<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            Box::pin(async move {
+                let dep = Depends::<OverrideDep>::from_request(ctx, req)
+                    .await
+                    .expect("dependency extraction failed");
+                Response::ok().body(ResponseBody::Bytes(dep.value.to_string().into_bytes()))
+            })
+        }
+    }
+
+    fn override_dep_route(ctx: &RequestContext, req: &mut Request) -> std::future::Ready<Response> {
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(ctx, req))
             .expect("dependency extraction failed");
-        Response::ok().body(ResponseBody::Bytes(dep.value.to_string().into_bytes()))
+        std::future::ready(
+            Response::ok().body(ResponseBody::Bytes(dep.value.to_string().into_bytes())),
+        )
     }
 
     #[test]
@@ -1483,7 +1502,7 @@ mod tests {
     #[test]
     fn test_app_dependency_override_used_by_test_client() {
         let app = App::builder()
-            .route("/", Method::Get, override_dep_handler)
+            .route("/", Method::Get, override_dep_route)
             .build();
 
         app.override_dependency_value(OverrideDep { value: 42 });
@@ -1496,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_test_client_override_clear() {
-        let client = TestClient::new(override_dep_handler);
+        let client = TestClient::new(OverrideDepHandler);
 
         client.override_dependency_value(OverrideDep { value: 9 });
         let response = client.get("/").send();
@@ -1975,5 +1994,192 @@ mod tests {
             "Should have text content type"
         );
         crate::assert_body_contains!(response, "Get", "Should contain HTTP method");
+    }
+
+    // =========================================================================
+    // DI Integration Tests (fastapi_rust-zf4)
+    // =========================================================================
+
+    // Test complex nested dependency graph with App and TestClient
+    #[derive(Clone)]
+    struct DatabasePool {
+        connection_string: String,
+    }
+
+    impl FromDependency for DatabasePool {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(DatabasePool {
+                connection_string: "postgres://localhost/test".to_string(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UserRepository {
+        pool_conn_str: String,
+    }
+
+    impl FromDependency for UserRepository {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let pool = Depends::<DatabasePool>::from_request(ctx, req).await?;
+            Ok(UserRepository {
+                pool_conn_str: pool.connection_string.clone(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct AuthService {
+        user_repo_pool: String,
+    }
+
+    impl FromDependency for AuthService {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let repo = Depends::<UserRepository>::from_request(ctx, req).await?;
+            Ok(AuthService {
+                user_repo_pool: repo.pool_conn_str.clone(),
+            })
+        }
+    }
+
+    struct ComplexDepHandler;
+
+    impl Handler for ComplexDepHandler {
+        fn call<'a>(
+            &'a self,
+            ctx: &'a RequestContext,
+            req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            Box::pin(async move {
+                let auth = Depends::<AuthService>::from_request(ctx, req)
+                    .await
+                    .expect("dependency resolution failed");
+                let body = format!("AuthService.pool={}", auth.user_repo_pool);
+                Response::ok().body(ResponseBody::Bytes(body.into_bytes()))
+            })
+        }
+    }
+
+    #[test]
+    fn test_full_request_with_complex_deps() {
+        // Test a realistic handler with nested dependencies:
+        // Handler -> AuthService -> UserRepository -> DatabasePool
+        let client = TestClient::new(ComplexDepHandler);
+        let response = client.get("/auth/check").send();
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("postgres://localhost/test"));
+    }
+
+    #[test]
+    fn test_complex_deps_with_override_at_leaf() {
+        // Override the leaf dependency (DatabasePool) and verify it propagates
+        let client = TestClient::new(ComplexDepHandler);
+        client.override_dependency_value(DatabasePool {
+            connection_string: "mysql://prod/users".to_string(),
+        });
+
+        let response = client.get("/auth/check").send();
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("mysql://prod/users"),
+            "Override at leaf should propagate through dependency chain"
+        );
+    }
+
+    #[test]
+    fn test_complex_deps_with_override_at_middle() {
+        // Override the middle dependency (UserRepository)
+        let client = TestClient::new(ComplexDepHandler);
+        client.override_dependency_value(UserRepository {
+            pool_conn_str: "overridden-repo-connection".to_string(),
+        });
+
+        let response = client.get("/auth/check").send();
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("overridden-repo-connection"),
+            "Override at middle level should be used"
+        );
+    }
+
+    #[test]
+    fn test_dependency_caching_across_handler() {
+        // Test that dependencies are cached within a single request
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone)]
+        struct TrackedDep {
+            call_number: usize,
+        }
+
+        impl FromDependency for TrackedDep {
+            type Error = HttpError;
+            async fn from_dependency(
+                _ctx: &RequestContext,
+                _req: &mut Request,
+            ) -> Result<Self, Self::Error> {
+                let call_number = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                Ok(TrackedDep { call_number })
+            }
+        }
+
+        struct MultiDepHandler;
+
+        impl Handler for MultiDepHandler {
+            fn call<'a>(
+                &'a self,
+                ctx: &'a RequestContext,
+                req: &'a mut Request,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async move {
+                    // Request the same dependency twice
+                    let dep1 = Depends::<TrackedDep>::from_request(ctx, req)
+                        .await
+                        .expect("first resolution failed");
+                    let dep2 = Depends::<TrackedDep>::from_request(ctx, req)
+                        .await
+                        .expect("second resolution failed");
+
+                    // Both should be the same (cached)
+                    let body = format!("dep1={} dep2={}", dep1.call_number, dep2.call_number);
+                    Response::ok().body(ResponseBody::Bytes(body.into_bytes()))
+                })
+            }
+        }
+
+        // Reset counter
+        CALL_COUNT.store(0, Ordering::SeqCst);
+
+        let client = TestClient::new(MultiDepHandler);
+        let response = client.get("/").send();
+
+        let text = response.text();
+        // Both deps should have the same call number (cached)
+        assert!(
+            text.contains("dep1=0 dep2=0"),
+            "Dependencies should be cached within request. Got: {}",
+            text
+        );
+
+        // Counter should only have been incremented once
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
     }
 }

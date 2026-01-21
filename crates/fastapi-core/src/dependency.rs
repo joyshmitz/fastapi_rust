@@ -969,4 +969,332 @@ mod tests {
         assert_eq!(top.left_id, 42);
         assert_eq!(top.right_id, 42);
     }
+
+    // ========================================================================
+    // Additional DI Tests for Coverage (fastapi_rust-zf4)
+    // ========================================================================
+
+    // Test: Override affects nested dependencies
+    #[derive(Clone)]
+    struct NestedInnerDep {
+        value: String,
+    }
+
+    impl FromDependency for NestedInnerDep {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(NestedInnerDep {
+                value: "original".to_string(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct NestedOuterDep {
+        inner_value: String,
+    }
+
+    impl FromDependency for NestedOuterDep {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let inner = Depends::<NestedInnerDep>::from_request(ctx, req).await?;
+            Ok(NestedOuterDep {
+                inner_value: inner.value.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn override_affects_nested_dependencies() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(NestedInnerDep {
+            value: "overridden".to_string(),
+        });
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+
+        let result =
+            futures_executor::block_on(Depends::<NestedOuterDep>::from_request(&ctx, &mut req))
+                .expect("nested override resolution failed");
+
+        assert_eq!(
+            result.inner_value, "overridden",
+            "Override should propagate to nested dependencies"
+        );
+    }
+
+    // Test: Clear overrides works
+    #[test]
+    fn clear_overrides_restores_original() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 99 });
+        assert_eq!(overrides.len(), 1);
+
+        overrides.clear();
+        assert_eq!(overrides.len(), 0);
+        assert!(overrides.is_empty());
+
+        // After clear, should return None (no override)
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+        let result =
+            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+                .expect("resolution after clear failed");
+
+        // Should get original value (1) not overridden value (99)
+        assert_eq!(result.value, 1, "After clear, should resolve to original");
+    }
+
+    // Test: Multiple dependencies in handler simulation
+    #[derive(Clone)]
+    struct DepX {
+        x: i32,
+    }
+    #[derive(Clone)]
+    struct DepY {
+        y: i32,
+    }
+    #[derive(Clone)]
+    struct DepZ {
+        z: i32,
+    }
+
+    impl FromDependency for DepX {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(DepX { x: 10 })
+        }
+    }
+
+    impl FromDependency for DepY {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(DepY { y: 20 })
+        }
+    }
+
+    impl FromDependency for DepZ {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(DepZ { z: 30 })
+        }
+    }
+
+    #[test]
+    fn multiple_independent_dependencies() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        // Simulate a handler that needs X, Y, and Z
+        let dep_x =
+            futures_executor::block_on(Depends::<DepX>::from_request(&ctx, &mut req)).unwrap();
+        let dep_y =
+            futures_executor::block_on(Depends::<DepY>::from_request(&ctx, &mut req)).unwrap();
+        let dep_z =
+            futures_executor::block_on(Depends::<DepZ>::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(dep_x.x, 10);
+        assert_eq!(dep_y.y, 20);
+        assert_eq!(dep_z.z, 30);
+    }
+
+    // Test: Request scope isolation (different contexts have independent caches)
+    #[test]
+    fn request_scope_isolation() {
+        // Request 1
+        let ctx1 = test_context(None);
+        let mut req1 = empty_request();
+
+        let _ = futures_executor::block_on(Depends::<CountingDep>::from_request(&ctx1, &mut req1))
+            .unwrap();
+        let counter1 = ctx1.dependency_cache().get::<Arc<AtomicUsize>>().unwrap();
+
+        // Request 2 - fresh context, fresh cache
+        let ctx2 = test_context(None);
+        let mut req2 = empty_request();
+
+        let _ = futures_executor::block_on(Depends::<CountingDep>::from_request(&ctx2, &mut req2))
+            .unwrap();
+        let counter2 = ctx2.dependency_cache().get::<Arc<AtomicUsize>>().unwrap();
+
+        // Each request should have its own counter
+        assert_eq!(counter1.load(Ordering::SeqCst), 1);
+        assert_eq!(counter2.load(Ordering::SeqCst), 1);
+
+        // They should be different Arc instances
+        assert!(!Arc::ptr_eq(&counter1, &counter2));
+    }
+
+    // Test: Function scope (NoCache) creates fresh instance each time
+    #[test]
+    fn function_scope_no_caching() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        // First call with NoCache
+        let _ = futures_executor::block_on(Depends::<CountingDep, NoCache>::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
+
+        // Second call with NoCache - should create new instance
+        let _ = futures_executor::block_on(Depends::<CountingDep, NoCache>::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
+
+        // Third call with NoCache
+        let _ = futures_executor::block_on(Depends::<CountingDep, NoCache>::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
+
+        let counter = ctx.dependency_cache().get::<Arc<AtomicUsize>>().unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "NoCache should resolve 3 times"
+        );
+    }
+
+    // Test: Async dependency execution (verifies async works correctly)
+    #[derive(Clone)]
+    struct AsyncDep {
+        computed: u64,
+    }
+
+    impl FromDependency for AsyncDep {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            // Simulate some async computation
+            let result = async {
+                let a = 21u64;
+                let b = 21u64;
+                a + b
+            }
+            .await;
+            Ok(AsyncDep { computed: result })
+        }
+    }
+
+    #[test]
+    fn async_dependency_resolution() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        let dep = futures_executor::block_on(Depends::<AsyncDep>::from_request(&ctx, &mut req))
+            .expect("async dependency resolution failed");
+
+        assert_eq!(dep.computed, 42);
+    }
+
+    // Test: Error in nested dependency propagates correctly
+    #[derive(Clone)]
+    struct DepThatDependsOnError;
+
+    impl FromDependency for DepThatDependsOnError {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            // This will fail because ErrorDep always returns an error
+            let _ = Depends::<ErrorDep>::from_request(ctx, req).await?;
+            Ok(DepThatDependsOnError)
+        }
+    }
+
+    #[test]
+    fn nested_error_propagation() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        let result = futures_executor::block_on(Depends::<DepThatDependsOnError>::from_request(
+            &ctx, &mut req,
+        ));
+
+        assert!(result.is_err(), "Nested error should propagate");
+        let err = result.unwrap_err();
+        assert_eq!(err.status.as_u16(), 400);
+    }
+
+    // Test: DependencyCache clear and len methods
+    #[test]
+    fn dependency_cache_operations() {
+        let cache = DependencyCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        cache.insert::<String>("test".to_string());
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+
+        cache.insert::<i32>(42);
+        assert_eq!(cache.len(), 2);
+
+        let retrieved = cache.get::<String>().unwrap();
+        assert_eq!(retrieved, "test");
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(cache.get::<String>().is_none());
+    }
+
+    // Test: DependencyOverrides dynamic resolver
+    #[test]
+    fn dynamic_override_resolver() {
+        let overrides = Arc::new(DependencyOverrides::new());
+
+        // Register a dynamic resolver that computes value based on context
+        overrides.insert::<OverrideDep, _, _>(|_ctx, _req| async move {
+            // Could use ctx/req to compute different values
+            Ok(OverrideDep { value: 100 })
+        });
+
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("dynamic override failed");
+
+        assert_eq!(dep.value, 100);
+    }
+
+    // Test: ResolutionGuard properly cleans up on drop
+    #[test]
+    fn resolution_guard_cleanup() {
+        let stack = ResolutionStack::new();
+        stack.push::<CounterDep>("CounterDep");
+        assert_eq!(stack.depth(), 1);
+
+        {
+            // Create guard within a scope
+            let _guard = ResolutionGuard::new(&stack);
+            stack.push::<ErrorDep>("ErrorDep");
+            assert_eq!(stack.depth(), 2);
+            // _guard will pop when dropped
+        }
+
+        // After guard drops, one item should be popped
+        // Note: guard pops, but we still have CounterDep
+        assert_eq!(stack.depth(), 1);
+    }
 }
