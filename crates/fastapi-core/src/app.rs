@@ -688,6 +688,35 @@ impl AppBuilder {
         self
     }
 
+    /// Registers a dependency override for this application (useful in tests).
+    #[must_use]
+    pub fn override_dependency<T, F, Fut>(self, f: F) -> Self
+    where
+        T: FromDependency,
+        F: Fn(&RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, T::Error>> + Send + 'static,
+    {
+        self.dependency_overrides.insert::<T, F, Fut>(f);
+        self
+    }
+
+    /// Registers a fixed dependency override value.
+    #[must_use]
+    pub fn override_dependency_value<T>(self, value: T) -> Self
+    where
+        T: FromDependency,
+    {
+        self.dependency_overrides.insert_value(value);
+        self
+    }
+
+    /// Clears all registered dependency overrides.
+    #[must_use]
+    pub fn clear_dependency_overrides(self) -> Self {
+        self.dependency_overrides.clear();
+        self
+    }
+
     /// Registers a custom exception handler for a specific error type.
     ///
     /// When an error of type `E` occurs during request handling, the registered
@@ -896,6 +925,7 @@ impl std::fmt::Debug for AppBuilder {
             .field("routes", &self.routes.len())
             .field("middleware", &self.middleware.len())
             .field("state", &self.state)
+            .field("dependency_overrides", &self.dependency_overrides)
             .field("exception_handlers", &self.exception_handlers)
             .field("startup_hooks", &self.startup_hooks.len())
             .field("shutdown_hooks", &self.shutdown_hook_count())
@@ -949,6 +979,35 @@ impl App {
     /// Gets a reference to shared state of type T.
     pub fn get_state<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.state.get::<T>()
+    }
+
+    /// Returns the dependency overrides registry.
+    #[must_use]
+    pub fn dependency_overrides(&self) -> &Arc<DependencyOverrides> {
+        &self.dependency_overrides
+    }
+
+    /// Registers a dependency override for this application (useful in tests).
+    pub fn override_dependency<T, F, Fut>(&self, f: F)
+    where
+        T: FromDependency,
+        F: Fn(&RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, T::Error>> + Send + 'static,
+    {
+        self.dependency_overrides.insert::<T, F, Fut>(f);
+    }
+
+    /// Registers a fixed dependency override value.
+    pub fn override_dependency_value<T>(&self, value: T)
+    where
+        T: FromDependency,
+    {
+        self.dependency_overrides.insert_value(value);
+    }
+
+    /// Clears all registered dependency overrides.
+    pub fn clear_dependency_overrides(&self) {
+        self.dependency_overrides.clear();
     }
 
     /// Returns the exception handlers registry.
@@ -1132,10 +1191,25 @@ impl std::fmt::Debug for App {
             .field("routes", &self.routes.len())
             .field("middleware", &self.middleware.len())
             .field("state", &self.state)
+            .field("dependency_overrides", &self.dependency_overrides)
             .field("exception_handlers", &self.exception_handlers)
             .field("startup_hooks", &self.startup_hooks.lock().len())
             .field("shutdown_hooks", &self.pending_shutdown_hooks())
             .finish()
+    }
+}
+
+impl Handler for App {
+    fn call<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move { self.handle(ctx, req).await })
+    }
+
+    fn dependency_overrides(&self) -> Option<Arc<DependencyOverrides>> {
+        Some(Arc::clone(&self.dependency_overrides))
     }
 }
 

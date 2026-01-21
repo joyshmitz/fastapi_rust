@@ -75,7 +75,7 @@ impl RichOutput {
     /// Print a success message.
     ///
     /// In rich mode: Green checkmark with styled text.
-    /// In plain mode: "[OK] message"
+    /// In plain mode: `[OK] message`
     pub fn success(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
@@ -91,7 +91,7 @@ impl RichOutput {
     /// Print an error message.
     ///
     /// In rich mode: Red X with styled text.
-    /// In plain mode: "[ERROR] message"
+    /// In plain mode: `[ERROR] message`
     pub fn error(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
@@ -106,7 +106,7 @@ impl RichOutput {
     /// Print a warning message.
     ///
     /// In rich mode: Yellow warning symbol with styled text.
-    /// In plain mode: "[WARN] message"
+    /// In plain mode: `[WARN] message`
     pub fn warning(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
@@ -121,7 +121,7 @@ impl RichOutput {
     /// Print an info message.
     ///
     /// In rich mode: Blue info symbol with styled text.
-    /// In plain mode: "[INFO] message"
+    /// In plain mode: `[INFO] message`
     pub fn info(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
@@ -136,7 +136,7 @@ impl RichOutput {
     /// Print a debug message (only in non-minimal modes).
     ///
     /// In rich mode: Gray text.
-    /// In plain mode: "[DEBUG] message"
+    /// In plain mode: `[DEBUG] message`
     /// In minimal mode: Nothing printed.
     pub fn debug(&self, message: &str) {
         match self.mode {
