@@ -2070,4 +2070,743 @@ mod tests {
         let middleware = RequestIdMiddleware::new();
         assert_eq!(middleware.name(), "RequestId");
     }
+
+    // =========================================================================
+    // Middleware Stack Execution Order Tests
+    // =========================================================================
+
+    /// Test middleware that records when its before/after hooks run
+    struct OrderTrackingMiddleware {
+        id: &'static str,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl OrderTrackingMiddleware {
+        fn new(id: &'static str, log: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { id, log }
+        }
+    }
+
+    impl Middleware for OrderTrackingMiddleware {
+        fn before<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, ControlFlow> {
+            self.log.lock().unwrap().push(format!("{}.before", self.id));
+            Box::pin(async { ControlFlow::Continue })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            self.log.lock().unwrap().push(format!("{}.after", self.id));
+            Box::pin(async move { response })
+        }
+    }
+
+    /// Test middleware that short-circuits with a configurable condition
+    struct ConditionalBreakMiddleware {
+        id: &'static str,
+        should_break: bool,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ConditionalBreakMiddleware {
+        fn new(
+            id: &'static str,
+            should_break: bool,
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                id,
+                should_break,
+                log,
+            }
+        }
+    }
+
+    impl Middleware for ConditionalBreakMiddleware {
+        fn before<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, ControlFlow> {
+            self.log.lock().unwrap().push(format!("{}.before", self.id));
+            let should_break = self.should_break;
+            Box::pin(async move {
+                if should_break {
+                    ControlFlow::Break(
+                        Response::with_status(StatusCode::FORBIDDEN)
+                            .body(ResponseBody::Bytes(b"blocked".to_vec())),
+                    )
+                } else {
+                    ControlFlow::Continue
+                }
+            })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            self.log.lock().unwrap().push(format!("{}.after", self.id));
+            Box::pin(async move { response })
+        }
+    }
+
+    /// Simple test handler that returns 200 OK
+    async fn ok_handler(_ctx: &RequestContext, _req: &mut Request) -> Response {
+        Response::ok().body(ResponseBody::Bytes(b"handler".to_vec()))
+    }
+
+    #[test]
+    fn middleware_stack_executes_in_correct_order() {
+        // Verify the "onion" model: before hooks run first-to-last,
+        // after hooks run last-to-first
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderTrackingMiddleware::new("mw1", log.clone()));
+        stack.push(OrderTrackingMiddleware::new("mw2", log.clone()));
+        stack.push(OrderTrackingMiddleware::new("mw3", log.clone()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "mw1.before",
+                "mw2.before",
+                "mw3.before",
+                "mw3.after",
+                "mw2.after",
+                "mw1.after",
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_short_circuit_skips_later_middleware() {
+        // When middleware 2 breaks, middleware 3's before should NOT run
+        // But middleware 1 and 2's after hooks should still run
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderTrackingMiddleware::new("mw1", log.clone()));
+        stack.push(ConditionalBreakMiddleware::new("mw2", true, log.clone()));
+        stack.push(OrderTrackingMiddleware::new("mw3", log.clone()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        // Should get 403 from the break
+        assert_eq!(response.status().as_u16(), 403);
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "mw1.before",
+                "mw2.before",
+                // mw3.before NOT called because mw2 broke
+                // mw2.after NOT called because it was the one that broke (ran_before_count = 1)
+                "mw1.after",
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_first_middleware_breaks() {
+        // When the first middleware breaks, no other middleware should run
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(ConditionalBreakMiddleware::new("mw1", true, log.clone()));
+        stack.push(OrderTrackingMiddleware::new("mw2", log.clone()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 403);
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls, vec!["mw1.before"]);
+        // No after hooks because ran_before_count = 0
+    }
+
+    #[test]
+    fn middleware_stack_last_middleware_breaks() {
+        // When the last middleware breaks, all previous after hooks should run
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderTrackingMiddleware::new("mw1", log.clone()));
+        stack.push(OrderTrackingMiddleware::new("mw2", log.clone()));
+        stack.push(ConditionalBreakMiddleware::new("mw3", true, log.clone()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 403);
+
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "mw1.before",
+                "mw2.before",
+                "mw3.before",
+                // mw3 broke, so only mw1 and mw2 after hooks run
+                "mw2.after",
+                "mw1.after",
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_empty_executes_handler_directly() {
+        let stack = MiddlewareStack::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn middleware_stack_with_capacity() {
+        let stack = MiddlewareStack::with_capacity(10);
+        assert!(stack.is_empty());
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn middleware_stack_push_arc() {
+        let mut stack = MiddlewareStack::new();
+        let mw: Arc<dyn Middleware> = Arc::new(NoopMiddleware);
+        stack.push_arc(mw);
+        assert_eq!(stack.len(), 1);
+    }
+
+    // =========================================================================
+    // AddResponseHeader Middleware Tests
+    // =========================================================================
+
+    #[test]
+    fn add_response_header_adds_header() {
+        let mw = AddResponseHeader::new("X-Custom", b"custom-value".to_vec());
+        let ctx = test_context();
+        let req = Request::new(crate::request::Method::Get, "/");
+
+        let response = Response::ok();
+        let response = futures_executor::block_on(mw.after(&ctx, &req, response));
+
+        assert_eq!(
+            header_value(&response, "X-Custom"),
+            Some("custom-value".to_string())
+        );
+    }
+
+    #[test]
+    fn add_response_header_preserves_existing_headers() {
+        let mw = AddResponseHeader::new("X-New", b"new".to_vec());
+        let ctx = test_context();
+        let req = Request::new(crate::request::Method::Get, "/");
+
+        let response = Response::ok().header("X-Existing", b"existing".to_vec());
+        let response = futures_executor::block_on(mw.after(&ctx, &req, response));
+
+        assert_eq!(
+            header_value(&response, "X-Existing"),
+            Some("existing".to_string())
+        );
+        assert_eq!(header_value(&response, "X-New"), Some("new".to_string()));
+    }
+
+    #[test]
+    fn add_response_header_name() {
+        let mw = AddResponseHeader::new("X-Test", b"test".to_vec());
+        assert_eq!(mw.name(), "AddResponseHeader");
+    }
+
+    // =========================================================================
+    // RequireHeader Middleware Tests
+    // =========================================================================
+
+    #[test]
+    fn require_header_allows_with_header() {
+        let mw = RequireHeader::new("X-Api-Key");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("X-Api-Key", b"secret-key".to_vec());
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+    }
+
+    #[test]
+    fn require_header_blocks_without_header() {
+        let mw = RequireHeader::new("X-Api-Key");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+
+        match result {
+            ControlFlow::Break(response) => {
+                assert_eq!(response.status().as_u16(), 400);
+            }
+            ControlFlow::Continue => panic!("Expected Break, got Continue"),
+        }
+    }
+
+    #[test]
+    fn require_header_name() {
+        let mw = RequireHeader::new("X-Test");
+        assert_eq!(mw.name(), "RequireHeader");
+    }
+
+    // =========================================================================
+    // PathPrefixFilter Middleware Tests
+    // =========================================================================
+
+    #[test]
+    fn path_prefix_filter_allows_matching_path() {
+        let mw = PathPrefixFilter::new("/api");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/api/users");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+    }
+
+    #[test]
+    fn path_prefix_filter_allows_exact_prefix() {
+        let mw = PathPrefixFilter::new("/api");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/api");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+    }
+
+    #[test]
+    fn path_prefix_filter_blocks_non_matching_path() {
+        let mw = PathPrefixFilter::new("/api");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/admin/users");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+
+        match result {
+            ControlFlow::Break(response) => {
+                assert_eq!(response.status().as_u16(), 404);
+            }
+            ControlFlow::Continue => panic!("Expected Break, got Continue"),
+        }
+    }
+
+    #[test]
+    fn path_prefix_filter_name() {
+        let mw = PathPrefixFilter::new("/api");
+        assert_eq!(mw.name(), "PathPrefixFilter");
+    }
+
+    // =========================================================================
+    // ConditionalStatus Middleware Tests
+    // =========================================================================
+
+    #[test]
+    fn conditional_status_applies_true_status() {
+        let mw = ConditionalStatus::new(
+            |req| req.path() == "/health",
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+        );
+        let ctx = test_context();
+        let req = Request::new(crate::request::Method::Get, "/health");
+        let response = Response::with_status(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let response = futures_executor::block_on(mw.after(&ctx, &req, response));
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn conditional_status_applies_false_status() {
+        let mw = ConditionalStatus::new(
+            |req| req.path() == "/health",
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+        );
+        let ctx = test_context();
+        let req = Request::new(crate::request::Method::Get, "/other");
+        let response = Response::with_status(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let response = futures_executor::block_on(mw.after(&ctx, &req, response));
+        assert_eq!(response.status().as_u16(), 404);
+    }
+
+    #[test]
+    fn conditional_status_name() {
+        let mw = ConditionalStatus::new(|_| true, StatusCode::OK, StatusCode::NOT_FOUND);
+        assert_eq!(mw.name(), "ConditionalStatus");
+    }
+
+    // =========================================================================
+    // Layer and Layered Tests
+    // =========================================================================
+
+    #[derive(Clone)]
+    struct LayerTestMiddleware {
+        prefix: String,
+    }
+
+    impl LayerTestMiddleware {
+        fn new(prefix: impl Into<String>) -> Self {
+            Self {
+                prefix: prefix.into(),
+            }
+        }
+    }
+
+    impl Middleware for LayerTestMiddleware {
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            let prefix = self.prefix.clone();
+            Box::pin(async move { response.header("X-Layer", prefix.into_bytes()) })
+        }
+    }
+
+    #[test]
+    fn layer_wraps_handler() {
+        let layer = Layer::new(LayerTestMiddleware::new("wrapped"));
+        let wrapped = layer.wrap(ok_handler);
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(wrapped.call(&ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            header_value(&response, "X-Layer"),
+            Some("wrapped".to_string())
+        );
+    }
+
+    #[test]
+    fn layered_handles_break() {
+        #[derive(Clone)]
+        struct BreakingMiddleware;
+
+        impl Middleware for BreakingMiddleware {
+            fn before<'a>(
+                &'a self,
+                _ctx: &'a RequestContext,
+                _req: &'a mut Request,
+            ) -> BoxFuture<'a, ControlFlow> {
+                Box::pin(async {
+                    ControlFlow::Break(Response::with_status(StatusCode::UNAUTHORIZED))
+                })
+            }
+
+            fn after<'a>(
+                &'a self,
+                _ctx: &'a RequestContext,
+                _req: &'a Request,
+                response: Response,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async move { response.header("X-After", b"ran".to_vec()) })
+            }
+        }
+
+        let layer = Layer::new(BreakingMiddleware);
+        let wrapped = layer.wrap(ok_handler);
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(wrapped.call(&ctx, &mut req));
+
+        // Should get 401 from break
+        assert_eq!(response.status().as_u16(), 401);
+        // After hook should still run
+        assert_eq!(header_value(&response, "X-After"), Some("ran".to_string()));
+    }
+
+    // =========================================================================
+    // RequestResponseLogger Tests
+    // =========================================================================
+
+    #[test]
+    fn request_response_logger_default() {
+        let logger = RequestResponseLogger::default();
+        assert!(logger.log_request_headers);
+        assert!(logger.log_response_headers);
+        assert!(!logger.log_body);
+        assert_eq!(logger.max_body_bytes, 1024);
+    }
+
+    #[test]
+    fn request_response_logger_builder() {
+        let logger = RequestResponseLogger::new()
+            .log_request_headers(false)
+            .log_response_headers(false)
+            .log_body(true)
+            .max_body_bytes(2048)
+            .redact_header("x-secret");
+
+        assert!(!logger.log_request_headers);
+        assert!(!logger.log_response_headers);
+        assert!(logger.log_body);
+        assert_eq!(logger.max_body_bytes, 2048);
+        assert!(logger.redact_headers.contains("x-secret"));
+    }
+
+    #[test]
+    fn request_response_logger_name() {
+        let logger = RequestResponseLogger::new();
+        assert_eq!(logger.name(), "RequestResponseLogger");
+    }
+
+    // =========================================================================
+    // Integration Tests with Handlers
+    // =========================================================================
+
+    #[test]
+    fn middleware_stack_modifies_request_for_handler() {
+        /// Middleware that adds a header that the handler can see
+        struct RequestModifier;
+
+        impl Middleware for RequestModifier {
+            fn before<'a>(
+                &'a self,
+                _ctx: &'a RequestContext,
+                req: &'a mut Request,
+            ) -> BoxFuture<'a, ControlFlow> {
+                req.headers_mut()
+                    .insert("X-Modified-By", b"middleware".to_vec());
+                Box::pin(async { ControlFlow::Continue })
+            }
+        }
+
+        async fn check_header_handler(_ctx: &RequestContext, req: &mut Request) -> Response {
+            let has_header = req.headers().get("X-Modified-By").is_some();
+            if has_header {
+                Response::ok().body(ResponseBody::Bytes(b"header-present".to_vec()))
+            } else {
+                Response::with_status(StatusCode::BAD_REQUEST)
+            }
+        }
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(RequestModifier);
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response =
+            futures_executor::block_on(stack.execute(&check_header_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn middleware_stack_multiple_response_modifications() {
+        let mut stack = MiddlewareStack::new();
+        stack.push(AddResponseHeader::new("X-First", b"1".to_vec()));
+        stack.push(AddResponseHeader::new("X-Second", b"2".to_vec()));
+        stack.push(AddResponseHeader::new("X-Third", b"3".to_vec()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        // All headers should be present (after hooks run in reverse)
+        assert_eq!(header_value(&response, "X-First"), Some("1".to_string()));
+        assert_eq!(header_value(&response, "X-Second"), Some("2".to_string()));
+        assert_eq!(header_value(&response, "X-Third"), Some("3".to_string()));
+    }
+
+    #[test]
+    fn middleware_stack_handler_receives_response_after_break() {
+        // Verify that when middleware breaks, the response body is from the break
+        let mut stack = MiddlewareStack::new();
+        stack.push(ConditionalBreakMiddleware::new(
+            "breaker",
+            true,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 403);
+        // Body should be from the breaking middleware, not the handler
+        match response.body_ref() {
+            ResponseBody::Bytes(b) => assert_eq!(b, b"blocked"),
+            _ => panic!("Expected Bytes body"),
+        }
+    }
+
+    // =========================================================================
+    // Error Propagation Tests
+    // =========================================================================
+
+    #[test]
+    fn middleware_after_can_change_status() {
+        struct StatusChanger;
+
+        impl Middleware for StatusChanger {
+            fn after<'a>(
+                &'a self,
+                _ctx: &'a RequestContext,
+                _req: &'a Request,
+                _response: Response,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async { Response::with_status(StatusCode::SERVICE_UNAVAILABLE) })
+            }
+        }
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(StatusChanger);
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&ok_handler, &ctx, &mut req));
+
+        // Should be changed by after hook
+        assert_eq!(response.status().as_u16(), 503);
+    }
+
+    #[test]
+    fn middleware_after_runs_even_on_error_status() {
+        async fn error_handler(_ctx: &RequestContext, _req: &mut Request) -> Response {
+            Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderTrackingMiddleware::new("mw1", log.clone()));
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&error_handler, &ctx, &mut req));
+
+        assert_eq!(response.status().as_u16(), 500);
+
+        let calls = log.lock().unwrap().clone();
+        // After should run even when handler returns error status
+        assert_eq!(calls, vec!["mw1.before", "mw1.after"]);
+    }
+
+    // =========================================================================
+    // Wildcard and Regex Matching Tests
+    // =========================================================================
+
+    #[test]
+    fn wildcard_match_simple() {
+        assert!(super::wildcard_match("*.example.com", "api.example.com"));
+        assert!(super::wildcard_match("*.example.com", "www.example.com"));
+        assert!(!super::wildcard_match("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn wildcard_match_multiple_wildcards() {
+        assert!(super::wildcard_match("*.*.*", "a.b.c"));
+        assert!(!super::wildcard_match("*.*.*", "a.b"));
+    }
+
+    #[test]
+    fn wildcard_match_no_wildcard() {
+        assert!(super::wildcard_match("exact", "exact"));
+        assert!(!super::wildcard_match("exact", "different"));
+    }
+
+    #[test]
+    fn regex_match_anchored() {
+        assert!(super::regex_match("^hello$", "hello"));
+        assert!(!super::regex_match("^hello$", "hello world"));
+        assert!(!super::regex_match("^hello$", "say hello"));
+    }
+
+    #[test]
+    fn regex_match_dot_wildcard() {
+        assert!(super::regex_match("h.llo", "hello"));
+        assert!(super::regex_match("h.llo", "hallo"));
+    }
+
+    #[test]
+    fn regex_match_star() {
+        assert!(super::regex_match("hel*o", "hello"));
+        assert!(super::regex_match("hel*o", "helo"));
+        assert!(super::regex_match("hel*o", "hellllllo"));
+    }
+
+    // =========================================================================
+    // Middleware Trait Default Implementation Tests
+    // =========================================================================
+
+    #[test]
+    fn middleware_default_before_continues() {
+        struct DefaultBefore;
+        impl Middleware for DefaultBefore {}
+
+        let mw = DefaultBefore;
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+    }
+
+    #[test]
+    fn middleware_default_after_passes_through() {
+        struct DefaultAfter;
+        impl Middleware for DefaultAfter {}
+
+        let mw = DefaultAfter;
+        let ctx = test_context();
+        let req = Request::new(crate::request::Method::Get, "/");
+        let response = Response::with_status(StatusCode::CREATED);
+
+        let result = futures_executor::block_on(mw.after(&ctx, &req, response));
+        assert_eq!(result.status().as_u16(), 201);
+    }
+
+    #[test]
+    fn middleware_default_name_is_type_name() {
+        struct MyCustomMiddleware;
+        impl Middleware for MyCustomMiddleware {}
+
+        let mw = MyCustomMiddleware;
+        assert!(mw.name().contains("MyCustomMiddleware"));
+    }
 }

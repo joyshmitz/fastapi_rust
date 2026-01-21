@@ -7,6 +7,7 @@ members = [
     "crates/fastapi-router",
     "crates/fastapi-macros",
     "crates/fastapi-openapi",
+    "crates/fastapi-output",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ fastapi-http = { path = "crates/fastapi-http" }
 fastapi-router = { path = "crates/fastapi-router" }
 fastapi-macros = { path = "crates/fastapi-macros" }
 fastapi-openapi = { path = "crates/fastapi-openapi" }
+fastapi-output = { path = "crates/fastapi-output" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

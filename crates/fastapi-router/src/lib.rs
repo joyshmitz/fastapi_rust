@@ -38,4 +38,6 @@ mod trie;
 
 pub use r#match::{AllowedMethods, RouteLookup, RouteMatch};
 pub use registry::{RouteRegistration, registered_routes};
-pub use trie::{Converter, ParamInfo, Route, Router};
+pub use trie::{
+    Converter, InvalidRouteError, ParamInfo, Route, RouteAddError, RouteConflictError, Router,
+};

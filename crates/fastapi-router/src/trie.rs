@@ -98,6 +98,73 @@ impl fmt::Display for RouteConflictError {
 
 impl std::error::Error for RouteConflictError {}
 
+/// Error returned when a route path is invalid.
+#[derive(Debug, Clone)]
+pub struct InvalidRouteError {
+    /// The invalid route path.
+    pub path: String,
+    /// Description of the validation failure.
+    pub message: String,
+}
+
+impl InvalidRouteError {
+    /// Create a new invalid route error.
+    #[must_use]
+    pub fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for InvalidRouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid route path '{}': {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for InvalidRouteError {}
+
+/// Error returned when adding a route fails.
+#[derive(Debug, Clone)]
+pub enum RouteAddError {
+    /// Route conflicts with an existing route.
+    Conflict(RouteConflictError),
+    /// Route path is invalid.
+    InvalidPath(InvalidRouteError),
+}
+
+impl fmt::Display for RouteAddError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict(err) => err.fmt(f),
+            Self::InvalidPath(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RouteAddError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Conflict(err) => Some(err),
+            Self::InvalidPath(err) => Some(err),
+        }
+    }
+}
+
+impl From<RouteConflictError> for RouteAddError {
+    fn from(err: RouteConflictError) -> Self {
+        Self::Conflict(err)
+    }
+}
+
+impl From<InvalidRouteError> for RouteAddError {
+    fn from(err: InvalidRouteError) -> Self {
+        Self::InvalidPath(err)
+    }
+}
+
 impl Route {
     /// Create a new route.
     #[must_use]
@@ -157,15 +224,17 @@ impl Router {
         }
     }
 
-    /// Add a route, returning an error if it conflicts with existing routes.
+    /// Add a route, returning an error if it conflicts with existing routes
+    /// or the path pattern is invalid.
     ///
     /// Conflict rules:
     /// - Same HTTP method + structurally identical path patterns conflict
     /// - Static segments take priority over parameter segments (no conflict)
     /// - Parameter names/converters do not disambiguate conflicts (one param slot per segment)
-    pub fn add(&mut self, route: Route) -> Result<(), RouteConflictError> {
+    /// - `{param:path}` converters are only valid as the final segment
+    pub fn add(&mut self, route: Route) -> Result<(), RouteAddError> {
         if let Some(conflict) = self.find_conflict(&route) {
-            return Err(conflict);
+            return Err(RouteAddError::Conflict(conflict));
         }
 
         let route_idx = self.routes.len();
@@ -174,6 +243,7 @@ impl Router {
         self.routes.push(route);
 
         let segments = parse_path(&path);
+        validate_path_segments(&path, &segments)?;
         let mut node = &mut self.root;
 
         for seg in segments {
@@ -272,23 +342,40 @@ impl Router {
     }
 
     fn match_node<'a>(&'a self, path: &'a str) -> Option<(&'a Node, Vec<(&'a str, &'a str)>)> {
-        let segments: Vec<_> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let ranges = segment_ranges(path);
+        let mut segments: Vec<&'a str> = Vec::with_capacity(ranges.len());
+        for (start, end) in &ranges {
+            segments.push(&path[*start..*end]);
+        }
+        let last_end = ranges.last().map(|(_, end)| *end).unwrap_or(0);
         let mut params = Vec::new();
         let mut node = &self.root;
+        let mut idx = 0;
 
-        for segment in segments {
+        while idx < segments.len() {
+            let segment = segments[idx];
             // Try static match first
             if let Some(child) = node.find_static(segment) {
                 node = child;
+                idx += 1;
                 continue;
             }
 
             // Try parameter match
             if let Some(child) = node.find_param() {
                 if let Some(ref info) = child.param {
+                    if info.converter == Converter::Path {
+                        let start = ranges[idx].0;
+                        let value = &path[start..last_end];
+                        params.push((info.name.as_str(), value));
+                        node = child;
+                        idx = segments.len();
+                        break;
+                    }
                     if info.converter.matches(segment) {
                         params.push((info.name.as_str(), segment));
                         node = child;
+                        idx += 1;
                         continue;
                     }
                 }
@@ -338,15 +425,70 @@ fn parse_path(path: &str) -> Vec<PathSegment<'_>> {
         .collect()
 }
 
+fn validate_path_segments(
+    path: &str,
+    segments: &[PathSegment<'_>],
+) -> Result<(), InvalidRouteError> {
+    for (idx, segment) in segments.iter().enumerate() {
+        if let PathSegment::Param {
+            name,
+            converter: Converter::Path,
+        } = segment
+        {
+            if idx + 1 != segments.len() {
+                return Err(InvalidRouteError::new(
+                    path,
+                    format!("path converter '{{{name}:path}}' must be the final segment"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn segment_ranges(path: &str) -> Vec<(usize, usize)> {
+    let bytes = path.as_bytes();
+    let mut ranges = Vec::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        while idx < bytes.len() && bytes[idx] == b'/' {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            break;
+        }
+        let start = idx;
+        while idx < bytes.len() && bytes[idx] != b'/' {
+            idx += 1;
+        }
+        let end = idx;
+        ranges.push((start, end));
+    }
+    ranges
+}
+
 fn paths_conflict(a: &str, b: &str) -> bool {
     let a_segments = parse_path(a);
     let b_segments = parse_path(b);
 
-    if a_segments.len() != b_segments.len() {
-        return false;
-    }
+    let a_has_path = matches!(
+        a_segments.last(),
+        Some(PathSegment::Param {
+            converter: Converter::Path,
+            ..
+        })
+    );
+    let b_has_path = matches!(
+        b_segments.last(),
+        Some(PathSegment::Param {
+            converter: Converter::Path,
+            ..
+        })
+    );
+    let min_len = a_segments.len().min(b_segments.len());
+    let mut param_mismatch = false;
 
-    for (left, right) in a_segments.iter().zip(b_segments.iter()) {
+    for (left, right) in a_segments.iter().take(min_len).zip(b_segments.iter()) {
         match (left, right) {
             (PathSegment::Static(a), PathSegment::Static(b)) => {
                 if a != b {
@@ -358,11 +500,40 @@ fn paths_conflict(a: &str, b: &str) -> bool {
                 // Static segments take priority over params, so this is not a conflict.
                 return false;
             }
-            (PathSegment::Param { .. }, PathSegment::Param { .. }) => {}
+            (
+                PathSegment::Param {
+                    name: left_name,
+                    converter: left_conv,
+                },
+                PathSegment::Param {
+                    name: right_name,
+                    converter: right_conv,
+                },
+            ) => {
+                if left_name != right_name || left_conv != right_conv {
+                    param_mismatch = true;
+                }
+            }
         }
     }
 
-    true
+    if a_segments.len() == b_segments.len() {
+        return true;
+    }
+
+    if param_mismatch {
+        return true;
+    }
+
+    if a_has_path && a_segments.len() == min_len {
+        return true;
+    }
+
+    if b_has_path && b_segments.len() == min_len {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -499,6 +670,24 @@ mod tests {
                 .is_none()
         );
         assert!(router.match_path("/objects/123", Method::Get).is_none());
+    }
+
+    #[test]
+    fn path_converter_captures_slashes() {
+        let mut router = Router::new();
+        router
+            .add(Route::new(Method::Get, "/files/{path:path}"))
+            .unwrap();
+
+        let m = router.match_path("/files/a/b/c.txt", Method::Get).unwrap();
+        assert_eq!(m.params[0], ("path", "a/b/c.txt"));
+    }
+
+    #[test]
+    fn path_converter_must_be_terminal() {
+        let mut router = Router::new();
+        let result = router.add(Route::new(Method::Get, "/files/{path:path}/edit"));
+        assert!(matches!(result, Err(RouteAddError::InvalidPath(_))));
     }
 
     #[test]
@@ -704,7 +893,12 @@ mod tests {
 
         let result = router.add(Route::new(Method::Get, "/users"));
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = match result.unwrap_err() {
+            RouteAddError::Conflict(err) => err,
+            RouteAddError::InvalidPath(err) => {
+                panic!("unexpected invalid path error: {err}")
+            }
+        };
         assert_eq!(err.method, Method::Get);
         assert_eq!(err.new_path, "/users");
         assert_eq!(err.existing_path, "/users");
@@ -718,9 +912,25 @@ mod tests {
         // Same structure, different param name - still conflicts
         let result = router.add(Route::new(Method::Get, "/users/{user_id}"));
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = match result.unwrap_err() {
+            RouteAddError::Conflict(err) => err,
+            RouteAddError::InvalidPath(err) => {
+                panic!("unexpected invalid path error: {err}")
+            }
+        };
         assert_eq!(err.existing_path, "/users/{id}");
         assert_eq!(err.new_path, "/users/{user_id}");
+    }
+
+    #[test]
+    fn conflict_param_name_mismatch_across_lengths() {
+        let mut router = Router::new();
+        router
+            .add(Route::new(Method::Get, "/users/{id}/posts"))
+            .unwrap();
+
+        let result = router.add(Route::new(Method::Get, "/users/{user_id}"));
+        assert!(matches!(result, Err(RouteAddError::Conflict(_))));
     }
 
     #[test]
@@ -732,7 +942,7 @@ mod tests {
 
         // Different converter but same structural position - conflicts
         let result = router.add(Route::new(Method::Get, "/items/{id:uuid}"));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(RouteAddError::Conflict(_))));
     }
 
     #[test]

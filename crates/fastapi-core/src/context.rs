@@ -7,7 +7,7 @@ use asupersync::types::CancelReason;
 use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 use std::sync::Arc;
 
-use crate::dependency::{DependencyCache, DependencyOverrides};
+use crate::dependency::{DependencyCache, DependencyOverrides, ResolutionStack};
 
 /// Request context that wraps asupersync's capability context.
 ///
@@ -41,6 +41,8 @@ pub struct RequestContext {
     dependency_cache: Arc<DependencyCache>,
     /// Dependency overrides (primarily for testing).
     dependency_overrides: Arc<DependencyOverrides>,
+    /// Stack tracking dependencies currently being resolved (for cycle detection).
+    resolution_stack: Arc<ResolutionStack>,
 }
 
 impl RequestContext {
@@ -55,6 +57,7 @@ impl RequestContext {
             request_id,
             dependency_cache: Arc::new(DependencyCache::new()),
             dependency_overrides: Arc::new(DependencyOverrides::new()),
+            resolution_stack: Arc::new(ResolutionStack::new()),
         }
     }
 
@@ -66,6 +69,7 @@ impl RequestContext {
             request_id,
             dependency_cache: Arc::new(DependencyCache::new()),
             dependency_overrides: overrides,
+            resolution_stack: Arc::new(ResolutionStack::new()),
         }
     }
 
@@ -87,6 +91,12 @@ impl RequestContext {
     #[must_use]
     pub fn dependency_overrides(&self) -> &DependencyOverrides {
         &self.dependency_overrides
+    }
+
+    /// Returns the resolution stack for cycle detection.
+    #[must_use]
+    pub fn resolution_stack(&self) -> &ResolutionStack {
+        &self.resolution_stack
     }
 
     /// Returns the underlying region ID from asupersync.

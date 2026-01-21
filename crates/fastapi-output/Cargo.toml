@@ -22,6 +22,7 @@ rich = ["dep:rich_rust"]
 
 [dev-dependencies]
 # For testing
+serial_test = "3.2"
 
 [lints]
 workspace = true

@@ -24,7 +24,11 @@
 //! output.error("Failed to bind to port 8000");
 //! ```
 
-#![forbid(unsafe_code)]
+// SAFETY: We use deny instead of forbid to allow unsafe in test modules.
+// The only unsafe code is for env::set_var/remove_var in tests, which
+// became unsafe in Rust 2024 edition due to thread-safety concerns.
+// Our tests use serial_test to ensure sequential execution.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod detection;
@@ -33,14 +37,20 @@ pub mod mode;
 pub mod themes;
 
 // Re-exports for convenience
-pub use detection::is_agent_environment;
+pub use detection::{
+    DetectionResult, OutputPreference, OverrideMode, detect_environment, detected_preference,
+    detection_diagnostics, is_agent_environment,
+};
 pub use facade::RichOutput;
 pub use mode::OutputMode;
 pub use themes::{FastApiTheme, ThemePreset};
 
 /// Prelude module for convenient imports.
 pub mod prelude {
-    pub use crate::detection::is_agent_environment;
+    pub use crate::detection::{
+        DetectionResult, OutputPreference, OverrideMode, detect_environment, detected_preference,
+        is_agent_environment,
+    };
     pub use crate::facade::RichOutput;
     pub use crate::mode::OutputMode;
     pub use crate::themes::{FastApiTheme, ThemePreset};
