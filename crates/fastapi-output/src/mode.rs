@@ -176,6 +176,7 @@ mod tests {
             env::remove_var("FASTAPI_AGENT_MODE");
             env::remove_var("FASTAPI_HUMAN_MODE");
             env::remove_var("CLAUDE_CODE");
+            env::remove_var("FORCE_COLOR");
             env::remove_var("NO_COLOR");
             env::remove_var("CI");
         }

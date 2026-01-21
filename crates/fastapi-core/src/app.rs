@@ -679,6 +679,33 @@ impl AppBuilder {
         self
     }
 
+    /// Includes routes from an [`APIRouter`](crate::api_router::APIRouter).
+    ///
+    /// This adds all routes from the router to the application, applying
+    /// the router's prefix, tags, and dependencies.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_core::api_router::APIRouter;
+    ///
+    /// let users_router = APIRouter::new()
+    ///     .prefix("/users")
+    ///     .get("", list_users)
+    ///     .get("/{id}", get_user);
+    ///
+    /// let app = App::builder()
+    ///     .include_router(users_router)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn include_router(mut self, router: crate::api_router::APIRouter) -> Self {
+        for entry in router.into_route_entries() {
+            self.routes.push(entry);
+        }
+        self
+    }
+
     /// Adds shared state to the application.
     ///
     /// State can be accessed by handlers through the `State<T>` extractor.
