@@ -51,10 +51,6 @@ jobs:
             asset: fastapi-windows-amd64.exe
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: ../asupersync
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}

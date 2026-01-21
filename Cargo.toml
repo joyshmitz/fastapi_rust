@@ -16,8 +16,8 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Runtime (our own)
-asupersync = { path = "../asupersync" }
+# Runtime (our own) - uses git for CI; override with path in .cargo/config.toml for local dev
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git" }
 
 # Serialization (only these)
 serde = { version = "1", features = ["derive"] }

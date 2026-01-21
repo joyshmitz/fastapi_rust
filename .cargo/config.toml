@@ -1,0 +1,6 @@
+# Local development overrides
+# This file overrides git dependencies with local paths for faster iteration
+# CI uses the git dependencies from Cargo.toml
+
+[patch."https://github.com/Dicklesworthstone/asupersync.git"]
+asupersync = { path = "../asupersync" }
