@@ -185,14 +185,10 @@ impl StartupOutcome {
 
 /// A boxed handler function.
 ///
-/// Note: The lifetime parameter allows the future to borrow from the context/request.
+/// The handler may return a future that borrows from the context/request for
+/// the duration of the call.
 pub type BoxHandler = Box<
-    dyn Fn(
-            &RequestContext,
-            &mut Request,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Response> + Send>>
-        + Send
-        + Sync,
+    dyn for<'a> Fn(&'a RequestContext, &'a mut Request) -> BoxFuture<'a, Response> + Send + Sync,
 >;
 
 /// A registered route with its handler.
@@ -209,18 +205,16 @@ pub struct RouteEntry {
 impl RouteEntry {
     /// Creates a new route entry.
     ///
-    /// Note: The handler's returned future must be `'static`, meaning it should not
-    /// hold references to the context or request beyond the call. If you need to
-    /// borrow from them, clone the data you need first.
-    pub fn new<H, Fut>(method: Method, path: impl Into<String>, handler: H) -> Self
+    /// Note: The handler's future must not outlive the borrow of the
+    /// context/request passed to it.
+    pub fn new<H>(method: Method, path: impl Into<String>, handler: H) -> Self
     where
-        H: Fn(&RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Response> + Send + 'static,
+        H: for<'a> Fn(&'a RequestContext, &'a mut Request) -> BoxFuture<'a, Response>
+            + Send
+            + Sync
+            + 'static,
     {
-        let handler: BoxHandler = Box::new(move |ctx, req| {
-            let fut = handler(ctx, req);
-            Box::pin(fut)
-        });
+        let handler: BoxHandler = Box::new(move |ctx, req| handler(ctx, req));
         Self {
             method,
             path: path.into(),
@@ -614,7 +608,10 @@ impl AppBuilder {
         H: Fn(&RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
     {
-        self.routes.push(RouteEntry::new(method, path, handler));
+        self.routes
+            .push(RouteEntry::new(method, path, move |ctx, req| {
+                Box::pin(handler(ctx, req))
+            }));
         self
     }
 
@@ -1402,7 +1399,9 @@ mod tests {
 
     #[test]
     fn route_entry_debug() {
-        let entry = RouteEntry::new(Method::Get, "/test", test_handler);
+        let entry = RouteEntry::new(Method::Get, "/test", |ctx, req| {
+            Box::pin(test_handler(ctx, req))
+        });
         let debug = format!("{:?}", entry);
         assert!(debug.contains("RouteEntry"));
         assert!(debug.contains("Get"));

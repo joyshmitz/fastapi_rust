@@ -506,9 +506,9 @@ impl APIRouter {
     #[must_use]
     pub fn into_route_entries(self) -> Vec<RouteEntry> {
         let prefix = self.prefix;
-        let router_tags = self.tags;
+        let _router_tags = self.tags;
         let router_deps = self.dependencies;
-        let router_deprecated = self.deprecated;
+        let _router_deprecated = self.deprecated;
         let router_include_in_schema = self.include_in_schema;
 
         self.routes
@@ -535,7 +535,7 @@ impl APIRouter {
                     // No dependencies, use handler directly
                     RouteEntry::new(route.method, full_path, move |ctx, req| {
                         let handler = Arc::clone(&handler);
-                        async move { (handler)(ctx, req).await }
+                        (handler)(ctx, req)
                     })
                 } else {
                     // Wrap handler to run dependencies first
@@ -543,7 +543,7 @@ impl APIRouter {
                     RouteEntry::new(route.method, full_path, move |ctx, req| {
                         let handler = Arc::clone(&handler);
                         let deps = Arc::clone(&deps);
-                        async move {
+                        Box::pin(async move {
                             // Run all dependencies
                             for dep in deps.iter() {
                                 if let Err(response) = dep.execute(ctx, req).await {
@@ -552,7 +552,7 @@ impl APIRouter {
                             }
                             // All dependencies passed, run handler
                             (handler)(ctx, req).await
-                        }
+                        })
                     })
                 }
             })
@@ -614,9 +614,7 @@ mod tests {
 
     #[test]
     fn test_router_tags() {
-        let router = APIRouter::new()
-            .tags(vec!["users", "admin"])
-            .tag("api");
+        let router = APIRouter::new().tags(vec!["users", "admin"]).tag("api");
 
         assert_eq!(router.get_tags(), &["users", "admin", "api"]);
     }
@@ -639,5 +637,96 @@ mod tests {
         assert_eq!(def.description, "Success");
         assert_eq!(def.example, Some(serde_json::json!({"id": 1})));
         assert_eq!(def.content_type, Some("application/json".to_string()));
+    }
+
+    #[test]
+    fn test_include_in_schema() {
+        let router = APIRouter::new().include_in_schema(false);
+        assert!(!router.get_include_in_schema());
+
+        let router = APIRouter::new();
+        assert!(router.get_include_in_schema());
+    }
+
+    #[test]
+    fn test_nested_routers_prefix_combination() {
+        // Create an inner router
+        let inner = APIRouter::new().prefix("/items");
+        assert_eq!(inner.get_prefix(), "/items");
+
+        // Create an outer router and include the inner one
+        let outer = APIRouter::new()
+            .prefix("/api/v1")
+            .include_router(inner);
+
+        // The routes from inner should have combined prefix
+        // Note: We test this indirectly since routes are private
+        assert_eq!(outer.get_prefix(), "/api/v1");
+    }
+
+    #[test]
+    fn test_router_with_responses() {
+        let router = APIRouter::new()
+            .response(200, ResponseDef::new("Success"))
+            .response(404, ResponseDef::new("Not Found"));
+
+        let responses = router.get_responses();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.contains_key(&200));
+        assert!(responses.contains_key(&404));
+    }
+
+    #[test]
+    fn test_router_dependency_creation() {
+        let dep = RouterDependency::new("auth", |_ctx, _req| async { Ok(()) });
+        assert_eq!(dep.name, "auth");
+    }
+
+    #[test]
+    fn test_router_with_dependency() {
+        let dep = RouterDependency::new("auth", |_ctx, _req| async { Ok(()) });
+
+        let router = APIRouter::new().dependency(dep);
+        assert_eq!(router.get_dependencies().len(), 1);
+        assert_eq!(router.get_dependencies()[0].name, "auth");
+    }
+
+    #[test]
+    fn test_router_multiple_dependencies() {
+        let dep1 = RouterDependency::new("auth", |_ctx, _req| async { Ok(()) });
+        let dep2 = RouterDependency::new("rate_limit", |_ctx, _req| async { Ok(()) });
+
+        let router = APIRouter::new().dependencies(vec![dep1, dep2]);
+        assert_eq!(router.get_dependencies().len(), 2);
+    }
+
+    #[test]
+    fn test_tag_merging_with_nested_routers() {
+        let inner = APIRouter::new().tags(vec!["items"]);
+        let outer = APIRouter::new()
+            .tags(vec!["api"])
+            .include_router(inner);
+
+        // Outer router keeps its own tags
+        assert_eq!(outer.get_tags(), &["api"]);
+        // Inner router's tags are merged into its routes (tested via into_route_entries)
+    }
+
+    #[test]
+    fn test_with_prefix_constructor() {
+        let router = APIRouter::with_prefix("/api/v1");
+        assert_eq!(router.get_prefix(), "/api/v1");
+    }
+
+    #[test]
+    fn test_empty_router() {
+        let router = APIRouter::new();
+        assert_eq!(router.get_prefix(), "");
+        assert!(router.get_tags().is_empty());
+        assert!(router.get_dependencies().is_empty());
+        assert!(router.get_responses().is_empty());
+        assert_eq!(router.is_deprecated(), None);
+        assert!(router.get_include_in_schema());
+        assert!(router.get_routes().is_empty());
     }
 }

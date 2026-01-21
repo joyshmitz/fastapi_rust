@@ -2493,7 +2493,13 @@ impl MockServer {
                     let default_response = Arc::clone(&default_response);
 
                     // Handle connection in the same thread (simple mock server)
-                    Self::handle_connection(stream, requests, responses, default_response, read_timeout);
+                    Self::handle_connection(
+                        stream,
+                        requests,
+                        responses,
+                        default_response,
+                        read_timeout,
+                    );
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No connection available, sleep briefly and try again
@@ -2672,7 +2678,11 @@ impl MockServer {
     /// Returns a URL for the given path.
     #[must_use]
     pub fn url_for(&self, path: &str) -> String {
-        let path = if path.starts_with('/') { path } else { &format!("/{}", path) };
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            &format!("/{}", path)
+        };
         format!("http://{}{}", self.addr, path)
     }
 
@@ -2876,7 +2886,9 @@ mod mock_server_tests {
 
         // Make a simple HTTP request
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
 
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
@@ -2891,7 +2903,9 @@ mod mock_server_tests {
 
         // Make a request
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nX-Custom: value\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nX-Custom: value\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
 
@@ -2908,7 +2922,10 @@ mod mock_server_tests {
     #[test]
     fn mock_server_handles_post_with_body() {
         let server = MockServer::start();
-        server.mock_response("/api/create", MockResponse::with_status(201).body_str("Created"));
+        server.mock_response(
+            "/api/create",
+            MockResponse::with_status(201).body_str("Created"),
+        );
 
         let body = r#"{"name":"test"}"#;
         let request = format!(
@@ -2937,7 +2954,9 @@ mod mock_server_tests {
         server.mock_response("/api/*", MockResponse::ok().body_str("API Response"));
 
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /api/users/123 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /api/users/123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
 
@@ -2949,7 +2968,9 @@ mod mock_server_tests {
         let server = MockServer::start();
 
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
 
@@ -2973,7 +2994,9 @@ mod mock_server_tests {
 
         // Make a request
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
 
@@ -2993,7 +3016,9 @@ mod mock_server_tests {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             let mut stream = StdTcpStream::connect(addr).expect("Failed to connect");
-            stream.write_all(b"GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            stream
+                .write_all(b"GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
         });
 
         let received = server.wait_for_requests(1, Duration::from_millis(500));
@@ -3006,7 +3031,9 @@ mod mock_server_tests {
         let server = MockServer::start();
 
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /expected HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /expected HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
 
@@ -3022,7 +3049,9 @@ mod mock_server_tests {
         let server = MockServer::start();
 
         let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
-        stream.write_all(b"GET /search?q=rust&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /search?q=rust&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
 
@@ -3038,9 +3067,13 @@ mod mock_server_tests {
     #[test]
     fn mock_response_json() {
         #[derive(serde::Serialize)]
-        struct User { name: String }
+        struct User {
+            name: String,
+        }
 
-        let response = MockResponse::ok().json(&User { name: "Alice".to_string() });
+        let response = MockResponse::ok().json(&User {
+            name: "Alice".to_string(),
+        });
         let bytes = response.to_http_response();
         let http = String::from_utf8_lossy(&bytes);
 
