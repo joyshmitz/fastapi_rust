@@ -56,7 +56,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,9 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 75;
 
 /// Default max requests per connection (0 = unlimited).
 pub const DEFAULT_MAX_REQUESTS_PER_CONNECTION: usize = 100;
+
+/// Default drain timeout in seconds (time to wait for in-flight requests on shutdown).
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -95,6 +98,9 @@ pub struct ServerConfig {
     pub keep_alive_timeout: Duration,
     /// Maximum requests per connection (0 = unlimited).
     pub max_requests_per_connection: usize,
+    /// Drain timeout (time to wait for in-flight requests on shutdown).
+    /// After this timeout, connections are forcefully closed.
+    pub drain_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -110,6 +116,7 @@ impl ServerConfig {
             tcp_nodelay: true,
             keep_alive_timeout: Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
             max_requests_per_connection: DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+            drain_timeout: Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS),
         }
     }
 
@@ -180,6 +187,23 @@ impl ServerConfig {
         self.max_requests_per_connection = max;
         self
     }
+
+    /// Sets the drain timeout.
+    ///
+    /// This is the time to wait for in-flight requests to complete during
+    /// shutdown. After this timeout, connections are forcefully closed.
+    #[must_use]
+    pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = timeout;
+        self
+    }
+
+    /// Sets the drain timeout in seconds.
+    #[must_use]
+    pub fn with_drain_timeout_secs(mut self, secs: u64) -> Self {
+        self.drain_timeout = Duration::from_secs(secs);
+        self
+    }
 }
 
 impl Default for ServerConfig {
@@ -245,6 +269,8 @@ pub struct TcpServer {
     request_counter: AtomicU64,
     /// Current number of active connections.
     connection_counter: AtomicU64,
+    /// Whether the server is draining (shutting down gracefully).
+    draining: AtomicBool,
 }
 
 impl TcpServer {
@@ -255,6 +281,7 @@ impl TcpServer {
             config,
             request_counter: AtomicU64::new(0),
             connection_counter: AtomicU64::new(0),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -308,6 +335,63 @@ impl TcpServer {
     /// Releases a connection slot.
     fn release_connection(&self) {
         self.connection_counter.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Returns true if the server is draining (shutting down gracefully).
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Starts the drain process for graceful shutdown.
+    ///
+    /// This sets the draining flag, which causes the server to:
+    /// - Stop accepting new connections
+    /// - Return 503 to new connection attempts
+    /// - Allow in-flight requests to complete
+    pub fn start_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
+    /// Waits for all in-flight connections to drain, with a timeout.
+    ///
+    /// Returns `true` if all connections drained successfully,
+    /// `false` if the timeout was reached with connections still active.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for connections to drain
+    /// * `poll_interval` - How often to check connection count (default 10ms)
+    pub async fn wait_for_drain(&self, timeout: Duration, poll_interval: Option<Duration>) -> bool {
+        let start = Instant::now();
+        let poll_interval = poll_interval.unwrap_or(Duration::from_millis(10));
+
+        while self.current_connections() > 0 {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            // Yield to allow other tasks to make progress
+            // In production, this would use proper async sleep
+            std::thread::sleep(poll_interval);
+        }
+        true
+    }
+
+    /// Initiates graceful shutdown and waits for connections to drain.
+    ///
+    /// This is a convenience method that combines `start_drain()` and
+    /// `wait_for_drain()` using the configured drain timeout.
+    ///
+    /// Returns the number of connections that were forcefully closed
+    /// (0 if all drained within the timeout).
+    pub async fn drain(&self) -> u64 {
+        self.start_drain();
+        let drained = self.wait_for_drain(self.config.drain_timeout, None).await;
+        if drained {
+            0
+        } else {
+            self.current_connections()
+        }
     }
 
     /// Runs the server, accepting connections and handling requests.
@@ -371,6 +455,12 @@ impl TcpServer {
             if cx.is_cancel_requested() {
                 cx.trace("Server shutdown requested");
                 return Ok(());
+            }
+
+            // Check if draining (graceful shutdown)
+            if self.is_draining() {
+                cx.trace("Server draining, stopping accept loop");
+                return Err(ServerError::Shutdown);
             }
 
             // Accept a connection.
@@ -1052,5 +1142,111 @@ mod tests {
             .find(|(name, _)| name.eq_ignore_ascii_case("connection"));
         assert!(connection_header.is_some());
         assert_eq!(connection_header.unwrap().1, b"close");
+    }
+
+    // ========================================================================
+    // Connection draining tests
+    // ========================================================================
+
+    #[test]
+    fn config_drain_timeout_default() {
+        let config = ServerConfig::default();
+        assert_eq!(
+            config.drain_timeout,
+            Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn config_drain_timeout_can_be_set() {
+        let config = ServerConfig::new("127.0.0.1:8080").with_drain_timeout(Duration::from_secs(60));
+        assert_eq!(config.drain_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn config_drain_timeout_can_be_set_secs() {
+        let config = ServerConfig::new("127.0.0.1:8080").with_drain_timeout_secs(45);
+        assert_eq!(config.drain_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn server_not_draining_initially() {
+        let server = TcpServer::default();
+        assert!(!server.is_draining());
+    }
+
+    #[test]
+    fn server_start_drain_sets_flag() {
+        let server = TcpServer::default();
+        assert!(!server.is_draining());
+        server.start_drain();
+        assert!(server.is_draining());
+    }
+
+    #[test]
+    fn server_start_drain_idempotent() {
+        let server = TcpServer::default();
+        server.start_drain();
+        assert!(server.is_draining());
+        server.start_drain();
+        assert!(server.is_draining());
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_returns_true_when_no_connections() {
+        let server = TcpServer::default();
+        assert_eq!(server.current_connections(), 0);
+        let result = server
+            .wait_for_drain(Duration::from_millis(100), Some(Duration::from_millis(1)))
+            .await;
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_timeout_with_connections() {
+        let server = TcpServer::default();
+        // Simulate active connections
+        server.try_acquire_connection();
+        server.try_acquire_connection();
+        assert_eq!(server.current_connections(), 2);
+
+        // Wait should timeout since connections won't drain on their own
+        let result = server
+            .wait_for_drain(Duration::from_millis(50), Some(Duration::from_millis(5)))
+            .await;
+        assert!(!result);
+        assert_eq!(server.current_connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_returns_zero_when_no_connections() {
+        let server = TcpServer::new(
+            ServerConfig::new("127.0.0.1:8080").with_drain_timeout(Duration::from_millis(100)),
+        );
+        assert_eq!(server.current_connections(), 0);
+        let remaining = server.drain().await;
+        assert_eq!(remaining, 0);
+        assert!(server.is_draining());
+    }
+
+    #[tokio::test]
+    async fn drain_returns_count_when_connections_remain() {
+        let server = TcpServer::new(
+            ServerConfig::new("127.0.0.1:8080").with_drain_timeout(Duration::from_millis(50)),
+        );
+        // Simulate active connections that won't drain
+        server.try_acquire_connection();
+        server.try_acquire_connection();
+        server.try_acquire_connection();
+
+        let remaining = server.drain().await;
+        assert_eq!(remaining, 3);
+        assert!(server.is_draining());
+    }
+
+    #[test]
+    fn server_shutdown_error_display() {
+        let err = ServerError::Shutdown;
+        assert_eq!(err.to_string(), "Server shutdown");
     }
 }

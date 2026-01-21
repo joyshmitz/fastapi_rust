@@ -10,5 +10,8 @@ rust-version.workspace = true
 fastapi-core = { workspace = true }
 asupersync = { workspace = true }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
 [lints]
 workspace = true

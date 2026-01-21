@@ -2188,3 +2188,879 @@ mod tests {
         assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
     }
 }
+
+// =============================================================================
+// MockServer for Integration Testing
+// =============================================================================
+
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+use std::sync::atomic::AtomicBool;
+use std::thread;
+use std::time::Duration;
+
+/// A recorded request from the mock server.
+///
+/// Contains all information about a request that was made to the mock server,
+/// useful for asserting that expected requests were made.
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    /// The HTTP method (GET, POST, etc.)
+    pub method: String,
+    /// The request path (e.g., "/api/users")
+    pub path: String,
+    /// Query string if present (without the leading '?')
+    pub query: Option<String>,
+    /// Request headers as name-value pairs
+    pub headers: Vec<(String, String)>,
+    /// Request body as bytes
+    pub body: Vec<u8>,
+    /// Timestamp when the request was received
+    pub timestamp: std::time::Instant,
+}
+
+impl RecordedRequest {
+    /// Returns the request body as a UTF-8 string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the body is not valid UTF-8.
+    #[must_use]
+    pub fn body_text(&self) -> &str {
+        std::str::from_utf8(&self.body).expect("body is not valid UTF-8")
+    }
+
+    /// Returns a header value by name (case-insensitive).
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name_lower = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(n, _)| n.to_ascii_lowercase() == name_lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Returns the full URL including query string.
+    #[must_use]
+    pub fn url(&self) -> String {
+        match &self.query {
+            Some(q) => format!("{}?{}", self.path, q),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// Configuration for a canned response.
+#[derive(Debug, Clone)]
+pub struct MockResponse {
+    /// HTTP status code
+    pub status: u16,
+    /// Response headers
+    pub headers: Vec<(String, String)>,
+    /// Response body
+    pub body: Vec<u8>,
+    /// Optional delay before sending response
+    pub delay: Option<Duration>,
+}
+
+impl Default for MockResponse {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: b"OK".to_vec(),
+            delay: None,
+        }
+    }
+}
+
+impl MockResponse {
+    /// Creates a new mock response with 200 OK status.
+    #[must_use]
+    pub fn ok() -> Self {
+        Self::default()
+    }
+
+    /// Creates a mock response with the given status code.
+    #[must_use]
+    pub fn with_status(status: u16) -> Self {
+        Self {
+            status,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the response status code.
+    #[must_use]
+    pub fn status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Adds a header to the response.
+    #[must_use]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Sets the response body.
+    #[must_use]
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Sets the response body as a string.
+    #[must_use]
+    pub fn body_str(self, body: &str) -> Self {
+        self.body(body.as_bytes().to_vec())
+    }
+
+    /// Sets the response body as JSON.
+    #[must_use]
+    pub fn json<T: serde::Serialize>(mut self, value: &T) -> Self {
+        self.body = serde_json::to_vec(value).expect("JSON serialization failed");
+        self.headers
+            .push(("content-type".to_string(), "application/json".to_string()));
+        self
+    }
+
+    /// Sets a delay before sending the response.
+    #[must_use]
+    pub fn delay(mut self, duration: Duration) -> Self {
+        self.delay = Some(duration);
+        self
+    }
+
+    /// Formats the response as an HTTP response string.
+    fn to_http_response(&self) -> Vec<u8> {
+        let status_text = match self.status {
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "Unknown",
+        };
+
+        let mut response = format!("HTTP/1.1 {} {}\r\n", self.status, status_text);
+
+        // Add content-length header
+        response.push_str(&format!("content-length: {}\r\n", self.body.len()));
+
+        // Add other headers
+        for (name, value) in &self.headers {
+            response.push_str(&format!("{}: {}\r\n", name, value));
+        }
+
+        response.push_str("\r\n");
+
+        let mut bytes = response.into_bytes();
+        bytes.extend_from_slice(&self.body);
+        bytes
+    }
+}
+
+/// A mock HTTP server for integration testing.
+///
+/// `MockServer` spawns an actual TCP server on a random port, allowing you to
+/// test HTTP client code against a real server. It records all incoming requests
+/// and allows you to configure canned responses.
+///
+/// # Features
+///
+/// - **Real TCP server**: Listens on an actual port for real HTTP connections
+/// - **Request recording**: Records all requests for later assertions
+/// - **Canned responses**: Configure responses for specific paths
+/// - **Clean shutdown**: Server shuts down when dropped
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::{MockServer, MockResponse};
+///
+/// // Start a mock server
+/// let server = MockServer::start();
+///
+/// // Configure a response
+/// server.mock_response("/api/users", MockResponse::ok().json(&vec!["Alice", "Bob"]));
+///
+/// // Make requests with your HTTP client
+/// let url = format!("http://{}/api/users", server.addr());
+/// // ... make request ...
+///
+/// // Assert requests were made
+/// let requests = server.requests();
+/// assert_eq!(requests.len(), 1);
+/// assert_eq!(requests[0].path, "/api/users");
+/// ```
+pub struct MockServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    responses: Arc<Mutex<HashMap<String, MockResponse>>>,
+    default_response: Arc<Mutex<MockResponse>>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockServer {
+    /// Starts a new mock server on a random available port.
+    ///
+    /// The server begins listening immediately and runs in a background thread.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let server = MockServer::start();
+    /// println!("Server listening on {}", server.addr());
+    /// ```
+    #[must_use]
+    pub fn start() -> Self {
+        Self::start_with_options(MockServerOptions::default())
+    }
+
+    /// Starts a mock server with custom options.
+    #[must_use]
+    pub fn start_with_options(options: MockServerOptions) -> Self {
+        // Bind to a random port
+        let listener =
+            StdTcpListener::bind("127.0.0.1:0").expect("Failed to bind mock server to port");
+        let addr = listener.local_addr().expect("Failed to get local address");
+
+        // Set non-blocking for clean shutdown
+        listener
+            .set_nonblocking(true)
+            .expect("Failed to set non-blocking");
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(HashMap::new()));
+        let default_response = Arc::new(Mutex::new(options.default_response));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let requests_clone = Arc::clone(&requests);
+        let responses_clone = Arc::clone(&responses);
+        let default_response_clone = Arc::clone(&default_response);
+        let shutdown_clone = Arc::clone(&shutdown);
+        let read_timeout = options.read_timeout;
+
+        let handle = thread::spawn(move || {
+            Self::server_loop(
+                listener,
+                requests_clone,
+                responses_clone,
+                default_response_clone,
+                shutdown_clone,
+                read_timeout,
+            );
+        });
+
+        Self {
+            addr,
+            requests,
+            responses,
+            default_response,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    /// The main server loop.
+    fn server_loop(
+        listener: StdTcpListener,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        responses: Arc<Mutex<HashMap<String, MockResponse>>>,
+        default_response: Arc<Mutex<MockResponse>>,
+        shutdown: Arc<AtomicBool>,
+        read_timeout: Duration,
+    ) {
+        loop {
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    // Handle the connection
+                    let requests = Arc::clone(&requests);
+                    let responses = Arc::clone(&responses);
+                    let default_response = Arc::clone(&default_response);
+
+                    // Handle connection in the same thread (simple mock server)
+                    Self::handle_connection(stream, requests, responses, default_response, read_timeout);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No connection available, sleep briefly and try again
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    eprintln!("MockServer accept error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Handles a single connection.
+    fn handle_connection(
+        mut stream: StdTcpStream,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        responses: Arc<Mutex<HashMap<String, MockResponse>>>,
+        default_response: Arc<Mutex<MockResponse>>,
+        read_timeout: Duration,
+    ) {
+        // Set read timeout
+        let _ = stream.set_read_timeout(Some(read_timeout));
+
+        // Read the request
+        let mut buffer = vec![0u8; 8192];
+        let bytes_read = match stream.read(&mut buffer) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+
+        if bytes_read == 0 {
+            return;
+        }
+
+        buffer.truncate(bytes_read);
+
+        // Parse the request
+        let recorded = match Self::parse_request(&buffer) {
+            Some(req) => req,
+            None => return,
+        };
+
+        // Record the request
+        {
+            let mut reqs = requests.lock().expect("requests mutex poisoned");
+            reqs.push(recorded.clone());
+        }
+
+        // Find matching response
+        let response = {
+            let resps = responses.lock().expect("responses mutex poisoned");
+            match resps.get(&recorded.path) {
+                Some(r) => r.clone(),
+                None => {
+                    // Check for pattern matches
+                    let mut matched = None;
+                    for (pattern, resp) in resps.iter() {
+                        if pattern.ends_with('*') {
+                            let prefix = &pattern[..pattern.len() - 1];
+                            if recorded.path.starts_with(prefix) {
+                                matched = Some(resp.clone());
+                                break;
+                            }
+                        }
+                    }
+                    matched.unwrap_or_else(|| {
+                        default_response
+                            .lock()
+                            .expect("default_response mutex poisoned")
+                            .clone()
+                    })
+                }
+            }
+        };
+
+        // Apply delay if configured
+        if let Some(delay) = response.delay {
+            thread::sleep(delay);
+        }
+
+        // Send response
+        let response_bytes = response.to_http_response();
+        let _ = stream.write_all(&response_bytes);
+        let _ = stream.flush();
+    }
+
+    /// Parses an HTTP request from raw bytes.
+    fn parse_request(data: &[u8]) -> Option<RecordedRequest> {
+        let text = std::str::from_utf8(data).ok()?;
+        let mut lines = text.lines();
+
+        // Parse request line
+        let request_line = lines.next()?;
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let method = parts[0].to_string();
+        let full_path = parts[1];
+
+        // Split path and query
+        let (path, query) = if let Some(idx) = full_path.find('?') {
+            (
+                full_path[..idx].to_string(),
+                Some(full_path[idx + 1..].to_string()),
+            )
+        } else {
+            (full_path.to_string(), None)
+        };
+
+        // Parse headers
+        let mut headers = Vec::new();
+        let mut content_length = 0usize;
+        for line in lines.by_ref() {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_string();
+                let value = value.trim().to_string();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.parse().unwrap_or(0);
+                }
+                headers.push((name, value));
+            }
+        }
+
+        // Parse body
+        let body = if content_length > 0 {
+            // Find the body start in the original data
+            if let Some(body_start) = text.find("\r\n\r\n") {
+                let body_start = body_start + 4;
+                if body_start < data.len() {
+                    data[body_start..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            } else if let Some(body_start) = text.find("\n\n") {
+                let body_start = body_start + 2;
+                if body_start < data.len() {
+                    data[body_start..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        Some(RecordedRequest {
+            method,
+            path,
+            query,
+            headers,
+            body,
+            timestamp: std::time::Instant::now(),
+        })
+    }
+
+    /// Returns the socket address the server is listening on.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Returns the base URL for the server (e.g., "http://127.0.0.1:12345").
+    #[must_use]
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Returns a URL for the given path.
+    #[must_use]
+    pub fn url_for(&self, path: &str) -> String {
+        let path = if path.starts_with('/') { path } else { &format!("/{}", path) };
+        format!("http://{}{}", self.addr, path)
+    }
+
+    /// Configures a canned response for a specific path.
+    ///
+    /// Use `*` at the end of the path for prefix matching.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// server.mock_response("/api/users", MockResponse::ok().json(&users));
+    /// server.mock_response("/api/*", MockResponse::with_status(404));
+    /// ```
+    pub fn mock_response(&self, path: impl Into<String>, response: MockResponse) {
+        let mut responses = self.responses.lock().expect("responses mutex poisoned");
+        responses.insert(path.into(), response);
+    }
+
+    /// Sets the default response for unmatched paths.
+    pub fn set_default_response(&self, response: MockResponse) {
+        let mut default = self
+            .default_response
+            .lock()
+            .expect("default_response mutex poisoned");
+        *default = response;
+    }
+
+    /// Returns all recorded requests.
+    #[must_use]
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        let requests = self.requests.lock().expect("requests mutex poisoned");
+        requests.clone()
+    }
+
+    /// Returns the number of recorded requests.
+    #[must_use]
+    pub fn request_count(&self) -> usize {
+        let requests = self.requests.lock().expect("requests mutex poisoned");
+        requests.len()
+    }
+
+    /// Returns requests matching the given path.
+    #[must_use]
+    pub fn requests_for(&self, path: &str) -> Vec<RecordedRequest> {
+        let requests = self.requests.lock().expect("requests mutex poisoned");
+        requests
+            .iter()
+            .filter(|r| r.path == path)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the last recorded request.
+    #[must_use]
+    pub fn last_request(&self) -> Option<RecordedRequest> {
+        let requests = self.requests.lock().expect("requests mutex poisoned");
+        requests.last().cloned()
+    }
+
+    /// Clears all recorded requests.
+    pub fn clear_requests(&self) {
+        let mut requests = self.requests.lock().expect("requests mutex poisoned");
+        requests.clear();
+    }
+
+    /// Clears all configured responses.
+    pub fn clear_responses(&self) {
+        let mut responses = self.responses.lock().expect("responses mutex poisoned");
+        responses.clear();
+    }
+
+    /// Resets the server (clears requests and responses).
+    pub fn reset(&self) {
+        self.clear_requests();
+        self.clear_responses();
+    }
+
+    /// Waits for a specific number of requests, with timeout.
+    ///
+    /// Returns `true` if the expected number of requests were received,
+    /// `false` if the timeout was reached.
+    pub fn wait_for_requests(&self, count: usize, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if self.request_count() >= count {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts that a request was made to the given path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no request was made to the path.
+    pub fn assert_received(&self, path: &str) {
+        let requests = self.requests_for(path);
+        assert!(
+            !requests.is_empty(),
+            "Expected request to path '{}', but none was received. Received paths: {:?}",
+            path,
+            self.requests().iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// Asserts that no request was made to the given path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a request was made to the path.
+    pub fn assert_not_received(&self, path: &str) {
+        let requests = self.requests_for(path);
+        assert!(
+            requests.is_empty(),
+            "Expected no request to path '{}', but {} were received",
+            path,
+            requests.len()
+        );
+    }
+
+    /// Asserts the total number of requests received.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the count doesn't match.
+    pub fn assert_request_count(&self, expected: usize) {
+        let actual = self.request_count();
+        assert_eq!(
+            actual, expected,
+            "Expected {} requests, but received {}",
+            expected, actual
+        );
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        // Signal shutdown
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Wait for the server thread to finish
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Options for configuring a MockServer.
+#[derive(Debug, Clone)]
+pub struct MockServerOptions {
+    /// Default response for unmatched paths.
+    pub default_response: MockResponse,
+    /// Read timeout for connections.
+    pub read_timeout: Duration,
+}
+
+impl Default for MockServerOptions {
+    fn default() -> Self {
+        Self {
+            default_response: MockResponse::with_status(404).body_str("Not Found"),
+            read_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+impl MockServerOptions {
+    /// Creates new options with default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the default response.
+    #[must_use]
+    pub fn default_response(mut self, response: MockResponse) -> Self {
+        self.default_response = response;
+        self
+    }
+
+    /// Sets the read timeout.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
+        self
+    }
+}
+
+#[cfg(test)]
+mod mock_server_tests {
+    use super::*;
+
+    #[test]
+    fn mock_server_starts_and_responds() {
+        let server = MockServer::start();
+        server.mock_response("/hello", MockResponse::ok().body_str("Hello, World!"));
+
+        // Make a simple HTTP request
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn mock_server_records_requests() {
+        let server = MockServer::start();
+
+        // Make a request
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nX-Custom: value\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        // Give the server time to process
+        thread::sleep(Duration::from_millis(50));
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/users");
+        assert_eq!(requests[0].header("x-custom"), Some("value"));
+    }
+
+    #[test]
+    fn mock_server_handles_post_with_body() {
+        let server = MockServer::start();
+        server.mock_response("/api/create", MockResponse::with_status(201).body_str("Created"));
+
+        let body = r#"{"name":"test"}"#;
+        let request = format!(
+            "POST /api/create HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("201 Created"));
+
+        thread::sleep(Duration::from_millis(50));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].body_text(), body);
+    }
+
+    #[test]
+    fn mock_server_pattern_matching() {
+        let server = MockServer::start();
+        server.mock_response("/api/*", MockResponse::ok().body_str("API Response"));
+
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /api/users/123 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("API Response"));
+    }
+
+    #[test]
+    fn mock_server_default_response() {
+        let server = MockServer::start();
+
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("404"));
+    }
+
+    #[test]
+    fn mock_server_url_helpers() {
+        let server = MockServer::start();
+
+        let url = server.url();
+        assert!(url.starts_with("http://127.0.0.1:"));
+
+        let api_url = server.url_for("/api/users");
+        assert!(api_url.contains("/api/users"));
+    }
+
+    #[test]
+    fn mock_server_clear_requests() {
+        let server = MockServer::start();
+
+        // Make a request
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(server.request_count(), 1);
+
+        server.clear_requests();
+        assert_eq!(server.request_count(), 0);
+    }
+
+    #[test]
+    fn mock_server_wait_for_requests() {
+        let server = MockServer::start();
+
+        // Spawn a thread that will make a request after a delay
+        let addr = server.addr();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut stream = StdTcpStream::connect(addr).expect("Failed to connect");
+            stream.write_all(b"GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        });
+
+        let received = server.wait_for_requests(1, Duration::from_millis(500));
+        assert!(received);
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn mock_server_assert_helpers() {
+        let server = MockServer::start();
+
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /expected HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        thread::sleep(Duration::from_millis(50));
+
+        server.assert_received("/expected");
+        server.assert_not_received("/not-expected");
+        server.assert_request_count(1);
+    }
+
+    #[test]
+    fn mock_server_query_string_parsing() {
+        let server = MockServer::start();
+
+        let mut stream = StdTcpStream::connect(server.addr()).expect("Failed to connect");
+        stream.write_all(b"GET /search?q=rust&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        thread::sleep(Duration::from_millis(50));
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/search");
+        assert_eq!(requests[0].query, Some("q=rust&limit=10".to_string()));
+        assert_eq!(requests[0].url(), "/search?q=rust&limit=10");
+    }
+
+    #[test]
+    fn mock_response_json() {
+        #[derive(serde::Serialize)]
+        struct User { name: String }
+
+        let response = MockResponse::ok().json(&User { name: "Alice".to_string() });
+        let bytes = response.to_http_response();
+        let http = String::from_utf8_lossy(&bytes);
+
+        assert!(http.contains("application/json"));
+        assert!(http.contains("Alice"));
+    }
+
+    #[test]
+    fn recorded_request_helpers() {
+        let request = RecordedRequest {
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            query: Some("page=1".to_string()),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: b"test body".to_vec(),
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert_eq!(request.body_text(), "test body");
+        assert_eq!(request.header("content-type"), Some("application/json"));
+        assert_eq!(request.url(), "/api/users?page=1");
+    }
+}
