@@ -40,9 +40,11 @@ use std::sync::Arc;
 
 use crate::context::RequestContext;
 use crate::dependency::{DependencyOverrides, FromDependency};
+use crate::extract::PathParams;
 use crate::middleware::{BoxFuture, Handler, Middleware, MiddlewareStack};
 use crate::request::{Method, Request};
 use crate::response::{Response, StatusCode};
+use crate::routing::{RouteLookup, RouteTable, format_allow_header};
 use crate::shutdown::ShutdownController;
 
 // ============================================================================
@@ -304,6 +306,14 @@ pub type BoxExceptionHandler = Box<
     dyn Fn(&RequestContext, Box<dyn std::error::Error + Send + Sync>) -> Response + Send + Sync,
 >;
 
+/// A boxed panic handler function.
+///
+/// The handler receives the RequestContext (if available) and panic info string,
+/// and returns a Response. This is called by the HTTP server layer when a panic
+/// is caught via `catch_unwind`.
+pub type BoxPanicHandler =
+    Box<dyn Fn(Option<&RequestContext>, &str) -> Response + Send + Sync>;
+
 /// Registry for custom exception handlers.
 ///
 /// This allows applications to register handlers for specific error types,
@@ -314,6 +324,14 @@ pub type BoxExceptionHandler = Box<
 /// The registry comes with default handlers for common error types:
 /// - [`HttpError`](crate::HttpError) → JSON response with status/detail
 /// - [`ValidationErrors`](crate::ValidationErrors) → 422 with error list
+/// - [`CancelledError`](crate::CancelledError) → 499 Client Closed Request
+///
+/// # Panic Handler
+///
+/// The registry also supports a panic handler that is invoked when a panic
+/// is caught during request handling. This is typically used by the HTTP
+/// server layer via `catch_unwind`. The default panic handler returns a
+/// 500 Internal Server Error.
 ///
 /// # Example
 ///
@@ -338,9 +356,15 @@ pub type BoxExceptionHandler = Box<
 ///             .body_json(&serde_json::json!({"error": err.0}))
 ///     });
 /// ```
-#[derive(Default)]
 pub struct ExceptionHandlers {
     handlers: HashMap<TypeId, BoxExceptionHandler>,
+    panic_handler: Option<BoxPanicHandler>,
+}
+
+impl Default for ExceptionHandlers {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExceptionHandlers {
@@ -349,6 +373,7 @@ impl ExceptionHandlers {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+            panic_handler: None,
         }
     }
 
@@ -367,6 +392,11 @@ impl ExceptionHandlers {
         handlers.register::<crate::ValidationErrors>(|_ctx, err| {
             use crate::IntoResponse;
             err.into_response()
+        });
+
+        // Default handler for CancelledError -> 499 Client Closed Request
+        handlers.register::<crate::CancelledError>(|_ctx, _err| {
+            Response::with_status(StatusCode::CLIENT_CLOSED_REQUEST)
         });
 
         handlers
@@ -451,6 +481,98 @@ impl ExceptionHandlers {
     /// Handlers from `other` will override handlers in `self` for the same error types.
     pub fn merge(&mut self, other: ExceptionHandlers) {
         self.handlers.extend(other.handlers);
+        // Prefer other's panic handler if set
+        if other.panic_handler.is_some() {
+            self.panic_handler = other.panic_handler;
+        }
+    }
+
+    // =========================================================================
+    // Panic Handler
+    // =========================================================================
+
+    /// Sets a custom panic handler.
+    ///
+    /// The panic handler is called by the HTTP server layer when a panic is caught
+    /// during request handling via `catch_unwind`. The handler receives the
+    /// `RequestContext` (if available) and a panic message string.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handlers = ExceptionHandlers::with_defaults()
+    ///     .panic_handler(|ctx, panic_msg| {
+    ///         // Log the panic
+    ///         eprintln!("Request panicked: {}", panic_msg);
+    ///
+    ///         // Return a custom error response
+    ///         Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    ///             .body_json(&serde_json::json!({
+    ///                 "error": "internal_server_error",
+    ///                 "message": "An unexpected error occurred"
+    ///             }))
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn panic_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Option<&RequestContext>, &str) -> Response + Send + Sync + 'static,
+    {
+        self.panic_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Sets a custom panic handler (mutable reference version).
+    pub fn set_panic_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(Option<&RequestContext>, &str) -> Response + Send + Sync + 'static,
+    {
+        self.panic_handler = Some(Box::new(handler));
+    }
+
+    /// Handles a panic by invoking the configured panic handler.
+    ///
+    /// If no panic handler is configured, returns a default 500 Internal Server Error.
+    ///
+    /// This method is intended to be called by the HTTP server layer after catching
+    /// a panic via `catch_unwind`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The request context, if available when the panic occurred
+    /// * `panic_info` - A string describing the panic (extracted from the panic payload)
+    pub fn handle_panic(&self, ctx: Option<&RequestContext>, panic_info: &str) -> Response {
+        if let Some(handler) = &self.panic_handler {
+            handler(ctx, panic_info)
+        } else {
+            Self::default_panic_response()
+        }
+    }
+
+    /// Returns the default response for panics: 500 Internal Server Error.
+    #[must_use]
+    pub fn default_panic_response() -> Response {
+        Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    /// Returns true if a custom panic handler is registered.
+    #[must_use]
+    pub fn has_panic_handler(&self) -> bool {
+        self.panic_handler.is_some()
+    }
+
+    /// Extracts a message string from a panic payload.
+    ///
+    /// This is a helper for use with `catch_unwind` results.
+    #[must_use]
+    pub fn extract_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        }
     }
 }
 
@@ -458,6 +580,7 @@ impl std::fmt::Debug for ExceptionHandlers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExceptionHandlers")
             .field("count", &self.handlers.len())
+            .field("has_panic_handler", &self.panic_handler.is_some())
             .finish()
     }
 }
@@ -965,9 +1088,17 @@ impl AppBuilder {
             middleware_stack.push_arc(mw);
         }
 
+        // Build the route table from route entries
+        // Each route stores its index into the routes vec
+        let mut route_table = RouteTable::new();
+        for (idx, route) in self.routes.iter().enumerate() {
+            route_table.add(route.method, &route.path, idx);
+        }
+
         App {
             config: self.config,
             routes: self.routes,
+            route_table,
             middleware: middleware_stack,
             state: Arc::new(self.state),
             dependency_overrides: Arc::clone(&self.dependency_overrides),
@@ -1001,6 +1132,8 @@ impl std::fmt::Debug for AppBuilder {
 pub struct App {
     config: AppConfig,
     routes: Vec<RouteEntry>,
+    /// Route table for path matching with parameter extraction.
+    route_table: RouteTable<usize>,
     middleware: MiddlewareStack,
     state: Arc<StateContainer>,
     dependency_overrides: Arc<DependencyOverrides>,
@@ -1099,43 +1232,68 @@ impl App {
     /// Handles an incoming request.
     ///
     /// This matches the request against registered routes, runs middleware,
-    /// and returns the response.
+    /// and returns the response. Path parameters are extracted and stored
+    /// in request extensions for use by the `Path` extractor.
+    ///
+    /// # Special Parameter Injection
+    ///
+    /// - **ResponseMutations**: Headers and cookies set by handlers are automatically
+    ///   applied to the final response.
+    /// - **BackgroundTasks**: Tasks are stored in request extensions via
+    ///   `BackgroundTasksInner`. The HTTP server should retrieve and execute these
+    ///   after sending the response using `take_background_tasks()`.
     pub async fn handle(&self, ctx: &RequestContext, req: &mut Request) -> Response {
-        // Find matching route
-        let route = self.find_route(req.method(), req.path());
+        // Use the route table for path matching with converter validation
+        match self.route_table.lookup(req.path(), req.method()) {
+            RouteLookup::Match { route: idx, params } => {
+                // Store path parameters in request extensions for the Path extractor
+                req.insert_extension(PathParams::from_pairs(params));
 
-        match route {
-            Some(entry) => {
-                // Create a handler that wraps the route
+                // Initialize response mutations container for handlers to use
+                req.insert_extension(crate::extract::ResponseMutations::new());
+
+                // Initialize background tasks container for handlers to use
+                req.insert_extension(crate::extract::BackgroundTasksInner::new());
+
+                // Get the route entry by index
+                let entry = &self.routes[*idx];
                 let handler = RouteHandler { entry };
-                self.middleware.execute(&handler, ctx, req).await
-            }
-            None => {
-                // Check if any route matches the path (for 405)
-                let has_path_match = self.routes.iter().any(|r| r.path == req.path());
-                if has_path_match {
-                    Response::with_status(StatusCode::METHOD_NOT_ALLOWED)
+                let response = self.middleware.execute(&handler, ctx, req).await;
+
+                // Apply any response mutations set by the handler
+                if let Some(mutations) = req.get_extension::<crate::extract::ResponseMutations>() {
+                    mutations.clone().apply(response)
                 } else {
-                    Response::with_status(StatusCode::NOT_FOUND)
+                    response
                 }
             }
+            RouteLookup::MethodNotAllowed { allowed } => {
+                Response::with_status(StatusCode::METHOD_NOT_ALLOWED)
+                    .header("Allow", format_allow_header(&allowed).into_bytes())
+            }
+            RouteLookup::NotFound => Response::with_status(StatusCode::NOT_FOUND),
         }
     }
 
-    /// Finds a route matching the given method and path.
-    fn find_route(&self, method: Method, path: &str) -> Option<&RouteEntry> {
-        // Simple linear search for now
-        // TODO: Use fastapi_router's trie for efficient matching
-        self.routes
-            .iter()
-            .find(|r| r.method == method && self.path_matches(&r.path, path))
-    }
-
-    /// Checks if a route pattern matches a path.
-    fn path_matches(&self, pattern: &str, path: &str) -> bool {
-        // Simple exact match for now
-        // TODO: Support path parameters like /items/{id}
-        pattern == path
+    /// Take background tasks from a request after handling.
+    ///
+    /// This should be called by the HTTP server after `handle()` returns
+    /// and the response has been sent to the client. The returned tasks
+    /// should be executed asynchronously.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = app.handle(&ctx, &mut request).await;
+    /// // Send response to client...
+    /// if let Some(tasks) = App::take_background_tasks(&mut request) {
+    ///     tasks.execute_all().await;
+    /// }
+    /// ```
+    #[must_use]
+    pub fn take_background_tasks(req: &mut Request) -> Option<crate::extract::BackgroundTasks> {
+        req.get_extension::<crate::extract::BackgroundTasksInner>()
+            .map(|inner| crate::extract::BackgroundTasks::from_inner(inner.clone()))
     }
 
     // =========================================================================
@@ -1547,7 +1705,8 @@ mod tests {
 
         assert!(handlers.has_handler::<crate::HttpError>());
         assert!(handlers.has_handler::<crate::ValidationErrors>());
-        assert_eq!(handlers.len(), 2);
+        assert!(handlers.has_handler::<crate::CancelledError>());
+        assert_eq!(handlers.len(), 3);
     }
 
     #[test]
@@ -1694,6 +1853,10 @@ mod tests {
             app.exception_handlers()
                 .has_handler::<crate::ValidationErrors>()
         );
+        assert!(
+            app.exception_handlers()
+                .has_handler::<crate::CancelledError>()
+        );
     }
 
     #[test]
@@ -1826,8 +1989,8 @@ mod tests {
                 .body(ResponseBody::Bytes(detail.as_bytes().to_vec()))
         });
 
-        // Still has 2 handlers (HttpError and ValidationErrors)
-        assert_eq!(handlers.len(), 2);
+        // Still has 3 handlers (HttpError, ValidationErrors, CancelledError)
+        assert_eq!(handlers.len(), 3);
 
         let ctx = test_context();
         let err = crate::HttpError::bad_request().with_detail("test error");
@@ -1885,6 +2048,50 @@ mod tests {
     }
 
     #[test]
+    fn exception_handlers_default_cancelled_error() {
+        let handlers = ExceptionHandlers::with_defaults();
+
+        let ctx = test_context();
+        let err = crate::CancelledError;
+
+        let response = handlers.handle(&ctx, err);
+        assert!(response.is_some());
+
+        let response = response.unwrap();
+        // CancelledError should return 499 Client Closed Request
+        assert_eq!(response.status().as_u16(), 499);
+    }
+
+    #[test]
+    fn exception_handlers_override_cancelled_error() {
+        let mut handlers = ExceptionHandlers::with_defaults();
+
+        // Override CancelledError handler to return 504 Gateway Timeout
+        handlers.register::<crate::CancelledError>(|_ctx, _err| {
+            Response::with_status(StatusCode::GATEWAY_TIMEOUT)
+                .header("x-cancelled", b"true".to_vec())
+        });
+
+        let ctx = test_context();
+        let err = crate::CancelledError;
+
+        let response = handlers.handle(&ctx, err);
+        assert!(response.is_some());
+
+        let response = response.unwrap();
+        // Custom handler returns 504 instead of 499
+        assert_eq!(response.status().as_u16(), 504);
+
+        // Check custom header
+        let cancelled_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-cancelled"))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(cancelled_header, Some(b"true".as_slice()));
+    }
+
+    #[test]
     fn exception_handlers_debug_format() {
         let handlers = ExceptionHandlers::new()
             .handler::<TestError>(|_ctx, _err| Response::with_status(StatusCode::BAD_REQUEST));
@@ -1893,6 +2100,135 @@ mod tests {
         assert!(debug.contains("ExceptionHandlers"));
         assert!(debug.contains("count"));
         assert!(debug.contains("1"));
+        assert!(debug.contains("has_panic_handler"));
+    }
+
+    // =========================================================================
+    // Panic Handler Tests
+    // =========================================================================
+
+    #[test]
+    fn panic_handler_default_response() {
+        let handlers = ExceptionHandlers::new();
+        assert!(!handlers.has_panic_handler());
+
+        let response = handlers.handle_panic(None, "test panic");
+        assert_eq!(response.status().as_u16(), 500);
+    }
+
+    #[test]
+    fn panic_handler_custom_handler() {
+        let handlers = ExceptionHandlers::new().panic_handler(|_ctx, msg| {
+            Response::with_status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("x-panic", msg.as_bytes().to_vec())
+        });
+
+        assert!(handlers.has_panic_handler());
+
+        let response = handlers.handle_panic(None, "custom panic");
+        assert_eq!(response.status().as_u16(), 503);
+
+        let panic_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-panic"))
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string());
+        assert_eq!(panic_header, Some("custom panic".to_string()));
+    }
+
+    #[test]
+    fn panic_handler_with_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctx_received = Arc::new(AtomicBool::new(false));
+        let ctx_received_clone = ctx_received.clone();
+
+        let handlers = ExceptionHandlers::new().panic_handler(move |ctx, _msg| {
+            ctx_received_clone.store(ctx.is_some(), Ordering::SeqCst);
+            Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        });
+
+        let ctx = test_context();
+        let _ = handlers.handle_panic(Some(&ctx), "panic with context");
+
+        assert!(ctx_received.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn panic_handler_set_panic_handler() {
+        let mut handlers = ExceptionHandlers::new();
+        assert!(!handlers.has_panic_handler());
+
+        handlers.set_panic_handler(|_ctx, _msg| {
+            Response::with_status(StatusCode::GATEWAY_TIMEOUT)
+        });
+
+        assert!(handlers.has_panic_handler());
+
+        let response = handlers.handle_panic(None, "test");
+        assert_eq!(response.status().as_u16(), 504);
+    }
+
+    #[test]
+    fn panic_handler_extract_panic_message_str() {
+        // Simulate a panic payload with &str
+        let payload: Box<dyn std::any::Any + Send> = Box::new("test panic");
+        let msg = ExceptionHandlers::extract_panic_message(&*payload);
+        assert_eq!(msg, "test panic");
+    }
+
+    #[test]
+    fn panic_handler_extract_panic_message_string() {
+        // Simulate a panic payload with String
+        let payload: Box<dyn std::any::Any + Send> = Box::new("test string panic".to_string());
+        let msg = ExceptionHandlers::extract_panic_message(&*payload);
+        assert_eq!(msg, "test string panic");
+    }
+
+    #[test]
+    fn panic_handler_extract_panic_message_unknown() {
+        // Simulate a panic payload with unknown type
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        let msg = ExceptionHandlers::extract_panic_message(&*payload);
+        assert_eq!(msg, "unknown panic");
+    }
+
+    #[test]
+    fn panic_handler_merge_prefers_other() {
+        let mut handlers1 = ExceptionHandlers::new().panic_handler(|_ctx, _msg| {
+            Response::with_status(StatusCode::BAD_REQUEST)
+        });
+
+        let handlers2 = ExceptionHandlers::new().panic_handler(|_ctx, _msg| {
+            Response::with_status(StatusCode::SERVICE_UNAVAILABLE)
+        });
+
+        handlers1.merge(handlers2);
+
+        let response = handlers1.handle_panic(None, "test");
+        // Should use handlers2's panic handler (503) after merge
+        assert_eq!(response.status().as_u16(), 503);
+    }
+
+    #[test]
+    fn panic_handler_merge_keeps_existing_if_other_empty() {
+        let mut handlers1 = ExceptionHandlers::new().panic_handler(|_ctx, _msg| {
+            Response::with_status(StatusCode::BAD_REQUEST)
+        });
+
+        let handlers2 = ExceptionHandlers::new(); // No panic handler
+
+        handlers1.merge(handlers2);
+
+        let response = handlers1.handle_panic(None, "test");
+        // Should keep handlers1's panic handler (400)
+        assert_eq!(response.status().as_u16(), 400);
+    }
+
+    #[test]
+    fn panic_handler_default_panic_response() {
+        let response = ExceptionHandlers::default_panic_response();
+        assert_eq!(response.status().as_u16(), 500);
     }
 
     #[test]

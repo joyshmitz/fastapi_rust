@@ -61,6 +61,7 @@ pub mod logging;
 pub mod middleware;
 mod request;
 mod response;
+pub mod routing;
 pub mod shutdown;
 pub mod testing;
 
@@ -71,11 +72,12 @@ pub use dependency::{
 };
 pub use error::{HttpError, LocItem, ValidationError, ValidationErrors};
 pub use extract::{
-    Accept, AppState, Authorization, ContentType, DEFAULT_JSON_LIMIT, FromHeaderValue, FromRequest,
-    Header, HeaderExtractError, HeaderName, HeaderValues, Host, Json, JsonConfig, JsonExtractError,
-    NamedHeader, OAuth2BearerError, OAuth2BearerErrorKind, OAuth2PasswordBearer,
-    OAuth2PasswordBearerConfig, Path, PathExtractError, PathParams, Query, QueryExtractError,
-    QueryParams, State, StateExtractError, UserAgent, XRequestId, snake_to_header_case,
+    Accept, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, ContentType, Cookie,
+    DEFAULT_JSON_LIMIT, FromHeaderValue, FromRequest, Header, HeaderExtractError, HeaderName,
+    HeaderValues, Host, Json, JsonConfig, JsonExtractError, NamedHeader, OAuth2BearerError,
+    OAuth2BearerErrorKind, OAuth2PasswordBearer, OAuth2PasswordBearerConfig, Path, PathExtractError,
+    PathParams, Query, QueryExtractError, QueryParams, RequestRef, ResponseMut, ResponseMutations,
+    SameSite, State, StateExtractError, UserAgent, XRequestId, snake_to_header_case,
 };
 pub use middleware::{
     AddResponseHeader, BoxFuture, ControlFlow, Cors, CorsConfig, Handler, Layer, Layered,
@@ -93,7 +95,13 @@ pub use response::{
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 
 // Re-export testing utilities
-pub use testing::{CookieJar, RequestBuilder, TestClient, TestResponse, json_contains};
+pub use testing::{
+    CapturedLog, CookieJar, E2ECapture, E2EReport, E2EScenario, E2EStep, E2EStepResult,
+    LogCapture, RequestBuilder, ResponseDiff, TestClient, TestLogger, TestResponse, TestTimings,
+    json_contains,
+};
+// Note: e2e_test!, assert_with_logs!, assert_eq_with_logs! macros are automatically exported
+// at crate root via #[macro_export]
 
 // Re-export assertion macros (defined via #[macro_export] in testing module)
 // Note: The macros assert_status!, assert_header!, assert_body_contains!,
@@ -117,4 +125,9 @@ pub use shutdown::{
     GracefulConfig, GracefulShutdown, InFlightGuard, ShutdownAware, ShutdownController,
     ShutdownHook, ShutdownOutcome, ShutdownPhase, ShutdownReceiver, grace_expired_cancel_reason,
     shutdown_cancel_reason, subdivide_grace_budget,
+};
+
+// Re-export routing utilities
+pub use routing::{
+    Converter, ParamInfo, PathSegment, RoutePattern, RouteLookup, RouteTable, format_allow_header,
 };

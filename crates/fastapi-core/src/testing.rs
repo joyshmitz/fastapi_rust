@@ -2873,6 +2873,1278 @@ impl MockServerOptions {
     }
 }
 
+// =============================================================================
+// E2E Testing Framework
+// =============================================================================
+
+/// Result of executing an E2E step.
+#[derive(Debug, Clone)]
+pub enum E2EStepResult {
+    /// Step passed successfully.
+    Passed,
+    /// Step failed with an error message.
+    Failed(String),
+    /// Step was skipped (e.g., due to prior failure).
+    Skipped,
+}
+
+impl E2EStepResult {
+    /// Returns `true` if the step passed.
+    #[must_use]
+    pub fn is_passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// Returns `true` if the step failed.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// A captured HTTP request/response pair from an E2E step.
+#[derive(Debug, Clone)]
+pub struct E2ECapture {
+    /// The request method.
+    pub method: String,
+    /// The request path.
+    pub path: String,
+    /// Request headers.
+    pub request_headers: Vec<(String, String)>,
+    /// Request body (if any).
+    pub request_body: Option<String>,
+    /// Response status code.
+    pub response_status: u16,
+    /// Response headers.
+    pub response_headers: Vec<(String, String)>,
+    /// Response body.
+    pub response_body: String,
+}
+
+/// A single step in an E2E test scenario.
+#[derive(Debug, Clone)]
+pub struct E2EStep {
+    /// Step name/description.
+    pub name: String,
+    /// When the step started.
+    pub started_at: std::time::Instant,
+    /// Step duration.
+    pub duration: std::time::Duration,
+    /// Step result.
+    pub result: E2EStepResult,
+    /// Captured request/response (if applicable).
+    pub capture: Option<E2ECapture>,
+}
+
+impl E2EStep {
+    /// Creates a new step record.
+    fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            started_at: std::time::Instant::now(),
+            duration: std::time::Duration::ZERO,
+            result: E2EStepResult::Skipped,
+            capture: None,
+        }
+    }
+
+    /// Marks the step as complete with a result.
+    fn complete(&mut self, result: E2EStepResult) {
+        self.duration = self.started_at.elapsed();
+        self.result = result;
+    }
+}
+
+/// E2E test scenario builder and executor.
+///
+/// Provides structured E2E testing with step logging, timing, and detailed
+/// failure reporting. Automatically captures request/response data on failures.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::{E2EScenario, TestClient};
+///
+/// let client = TestClient::new(app);
+/// let mut scenario = E2EScenario::new("User Registration Flow", client);
+///
+/// scenario.step("Visit registration page", |client| {
+///     let response = client.get("/register").send();
+///     assert_eq!(response.status().as_u16(), 200);
+/// });
+///
+/// scenario.step("Submit registration form", |client| {
+///     let response = client
+///         .post("/register")
+///         .json(&serde_json::json!({"email": "test@example.com", "password": "secret123"}))
+///         .send();
+///     assert_eq!(response.status().as_u16(), 201);
+/// });
+///
+/// // Generate report
+/// let report = scenario.report();
+/// println!("{}", report.to_text());
+/// ```
+pub struct E2EScenario<H> {
+    /// Scenario name.
+    name: String,
+    /// Description of what this scenario tests.
+    description: Option<String>,
+    /// The test client.
+    client: TestClient<H>,
+    /// Recorded steps.
+    steps: Vec<E2EStep>,
+    /// Whether to stop on first failure.
+    stop_on_failure: bool,
+    /// Whether a failure has occurred.
+    has_failure: bool,
+    /// Captured output for logging.
+    log_buffer: Vec<String>,
+}
+
+impl<H: Handler + 'static> E2EScenario<H> {
+    /// Creates a new E2E scenario.
+    pub fn new(name: impl Into<String>, client: TestClient<H>) -> Self {
+        let name = name.into();
+        Self {
+            name,
+            description: None,
+            client,
+            steps: Vec::new(),
+            stop_on_failure: true,
+            has_failure: false,
+            log_buffer: Vec::new(),
+        }
+    }
+
+    /// Sets the scenario description.
+    #[must_use]
+    pub fn description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+
+    /// Configures whether to stop on first failure (default: true).
+    #[must_use]
+    pub fn stop_on_failure(mut self, stop: bool) -> Self {
+        self.stop_on_failure = stop;
+        self
+    }
+
+    /// Returns a reference to the test client.
+    pub fn client(&self) -> &TestClient<H> {
+        &self.client
+    }
+
+    /// Returns a mutable reference to the test client.
+    pub fn client_mut(&mut self) -> &mut TestClient<H> {
+        &mut self.client
+    }
+
+    /// Logs a message to the scenario log.
+    pub fn log(&mut self, message: impl Into<String>) {
+        let msg = message.into();
+        self.log_buffer.push(format!(
+            "[{:?}] {}",
+            std::time::Instant::now().elapsed(),
+            msg
+        ));
+    }
+
+    /// Executes a step in the scenario.
+    ///
+    /// The step function receives a reference to the test client and should
+    /// perform assertions. Panics are caught and recorded as failures.
+    pub fn step<F>(&mut self, name: impl Into<String>, f: F)
+    where
+        F: FnOnce(&TestClient<H>) + std::panic::UnwindSafe,
+    {
+        let name = name.into();
+        let mut step = E2EStep::new(&name);
+
+        // Skip if we've already failed and stop_on_failure is enabled
+        if self.has_failure && self.stop_on_failure {
+            step.complete(E2EStepResult::Skipped);
+            self.log_buffer.push(format!("[SKIP] {}", name));
+            self.steps.push(step);
+            return;
+        }
+
+        self.log_buffer.push(format!("[START] {}", name));
+
+        // Wrap client in AssertUnwindSafe for panic catching
+        let client_ref = std::panic::AssertUnwindSafe(&self.client);
+
+        // Execute the step and catch any panics
+        let result = std::panic::catch_unwind(|| {
+            f(&client_ref);
+        });
+
+        match result {
+            Ok(()) => {
+                step.complete(E2EStepResult::Passed);
+                self.log_buffer
+                    .push(format!("[PASS] {} ({:?})", name, step.duration));
+            }
+            Err(panic_info) => {
+                let error_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+
+                step.complete(E2EStepResult::Failed(error_msg.clone()));
+                self.has_failure = true;
+                self.log_buffer
+                    .push(format!("[FAIL] {} - {}", name, error_msg));
+            }
+        }
+
+        self.steps.push(step);
+    }
+
+    /// Executes a step that returns a result (for more control over error handling).
+    pub fn try_step<F, E>(&mut self, name: impl Into<String>, f: F) -> Result<(), E>
+    where
+        F: FnOnce(&TestClient<H>) -> Result<(), E>,
+        E: std::fmt::Display,
+    {
+        let name = name.into();
+        let mut step = E2EStep::new(&name);
+
+        if self.has_failure && self.stop_on_failure {
+            step.complete(E2EStepResult::Skipped);
+            self.steps.push(step);
+            return Ok(());
+        }
+
+        self.log_buffer.push(format!("[START] {}", name));
+
+        match f(&self.client) {
+            Ok(()) => {
+                step.complete(E2EStepResult::Passed);
+                self.log_buffer
+                    .push(format!("[PASS] {} ({:?})", name, step.duration));
+                self.steps.push(step);
+                Ok(())
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                step.complete(E2EStepResult::Failed(error_msg.clone()));
+                self.has_failure = true;
+                self.log_buffer
+                    .push(format!("[FAIL] {} - {}", name, error_msg));
+                self.steps.push(step);
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns whether the scenario passed (no failures).
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        !self.has_failure
+    }
+
+    /// Returns the steps executed so far.
+    #[must_use]
+    pub fn steps(&self) -> &[E2EStep] {
+        &self.steps
+    }
+
+    /// Returns the log buffer.
+    #[must_use]
+    pub fn logs(&self) -> &[String] {
+        &self.log_buffer
+    }
+
+    /// Generates a test report.
+    #[must_use]
+    pub fn report(&self) -> E2EReport {
+        let passed = self.steps.iter().filter(|s| s.result.is_passed()).count();
+        let failed = self.steps.iter().filter(|s| s.result.is_failed()).count();
+        let skipped = self
+            .steps
+            .iter()
+            .filter(|s| matches!(s.result, E2EStepResult::Skipped))
+            .count();
+        let total_duration: std::time::Duration = self.steps.iter().map(|s| s.duration).sum();
+
+        E2EReport {
+            scenario_name: self.name.clone(),
+            description: self.description.clone(),
+            passed,
+            failed,
+            skipped,
+            total_duration,
+            steps: self.steps.clone(),
+            logs: self.log_buffer.clone(),
+        }
+    }
+
+    /// Asserts that the scenario passed, panicking with a detailed report if not.
+    ///
+    /// Call this at the end of your test to ensure all steps passed.
+    pub fn assert_passed(&self) {
+        if !self.passed() {
+            let report = self.report();
+            panic!(
+                "E2E Scenario '{}' failed!\n\n{}",
+                self.name,
+                report.to_text()
+            );
+        }
+    }
+}
+
+/// E2E test report with multiple output formats.
+#[derive(Debug, Clone)]
+pub struct E2EReport {
+    /// Scenario name.
+    pub scenario_name: String,
+    /// Scenario description.
+    pub description: Option<String>,
+    /// Number of passed steps.
+    pub passed: usize,
+    /// Number of failed steps.
+    pub failed: usize,
+    /// Number of skipped steps.
+    pub skipped: usize,
+    /// Total duration.
+    pub total_duration: std::time::Duration,
+    /// Step details.
+    pub steps: Vec<E2EStep>,
+    /// Log messages.
+    pub logs: Vec<String>,
+}
+
+impl E2EReport {
+    /// Renders the report as plain text.
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        let mut output = String::new();
+
+        // Header
+        output.push_str(&format!("E2E Test Report: {}\n", self.scenario_name));
+        output.push_str(&"=".repeat(60));
+        output.push('\n');
+
+        if let Some(desc) = &self.description {
+            output.push_str(&format!("Description: {}\n", desc));
+        }
+
+        // Summary
+        output.push_str(&format!(
+            "\nSummary: {} passed, {} failed, {} skipped\n",
+            self.passed, self.failed, self.skipped
+        ));
+        output.push_str(&format!("Total Duration: {:?}\n", self.total_duration));
+        output.push_str(&"-".repeat(60));
+        output.push('\n');
+
+        // Steps
+        output.push_str("\nSteps:\n");
+        for (i, step) in self.steps.iter().enumerate() {
+            let status = match &step.result {
+                E2EStepResult::Passed => "[PASS]",
+                E2EStepResult::Failed(_) => "[FAIL]",
+                E2EStepResult::Skipped => "[SKIP]",
+            };
+            output.push_str(&format!(
+                "  {}. {} {} ({:?})\n",
+                i + 1,
+                status,
+                step.name,
+                step.duration
+            ));
+            if let E2EStepResult::Failed(msg) = &step.result {
+                output.push_str(&format!("     Error: {}\n", msg));
+            }
+        }
+
+        // Logs
+        if !self.logs.is_empty() {
+            output.push_str(&"-".repeat(60));
+            output.push_str("\n\nLogs:\n");
+            for log in &self.logs {
+                output.push_str(&format!("  {}\n", log));
+            }
+        }
+
+        output
+    }
+
+    /// Renders the report as JSON.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let steps_json: Vec<String> = self
+            .steps
+            .iter()
+            .map(|step| {
+                let status = match &step.result {
+                    E2EStepResult::Passed => "passed",
+                    E2EStepResult::Failed(_) => "failed",
+                    E2EStepResult::Skipped => "skipped",
+                };
+                let error = match &step.result {
+                    E2EStepResult::Failed(msg) => format!(r#", "error": "{}""#, escape_json(msg)),
+                    _ => String::new(),
+                };
+                format!(
+                    r#"    {{ "name": "{}", "status": "{}", "duration_ms": {}{} }}"#,
+                    escape_json(&step.name),
+                    status,
+                    step.duration.as_millis(),
+                    error
+                )
+            })
+            .collect();
+
+        format!(
+            r#"{{
+  "scenario": "{}",
+  "description": {},
+  "summary": {{
+    "passed": {},
+    "failed": {},
+    "skipped": {},
+    "total_duration_ms": {}
+  }},
+  "steps": [
+{}
+  ]
+}}"#,
+            escape_json(&self.scenario_name),
+            self.description
+                .as_ref()
+                .map_or("null".to_string(), |d| format!(r#""{}""#, escape_json(d))),
+            self.passed,
+            self.failed,
+            self.skipped,
+            self.total_duration.as_millis(),
+            steps_json.join(",\n")
+        )
+    }
+
+    /// Renders the report as HTML.
+    #[must_use]
+    pub fn to_html(&self) -> String {
+        let status_class = if self.failed > 0 { "failed" } else { "passed" };
+
+        use std::fmt::Write;
+        let steps_html = self
+            .steps
+            .iter()
+            .enumerate()
+            .fold(String::new(), |mut output, (i, step)| {
+                let (status, class) = match &step.result {
+                    E2EStepResult::Passed => ("✓", "pass"),
+                    E2EStepResult::Failed(_) => ("✗", "fail"),
+                    E2EStepResult::Skipped => ("○", "skip"),
+                };
+                let error_html = match &step.result {
+                    E2EStepResult::Failed(msg) => {
+                        format!(r#"<div class="error">{}</div>"#, escape_html(msg))
+                    }
+                    _ => String::new(),
+                };
+                let _ = write!(
+                    output,
+                    r#"    <tr class="{}">
+      <td>{}</td>
+      <td><span class="status">{}</span></td>
+      <td>{}</td>
+      <td>{:?}</td>
+    </tr>
+    {}"#,
+                    class,
+                    i + 1,
+                    status,
+                    escape_html(&step.name),
+                    step.duration,
+                    error_html
+                );
+                output
+            });
+
+        format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <title>E2E Report: {}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 2rem; }}
+    h1 {{ color: #333; }}
+    .summary {{ padding: 1rem; border-radius: 8px; margin: 1rem 0; }}
+    .summary.passed {{ background: #d4edda; }}
+    .summary.failed {{ background: #f8d7da; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 1rem; }}
+    th, td {{ padding: 0.75rem; text-align: left; border-bottom: 1px solid #dee2e6; }}
+    th {{ background: #f8f9fa; }}
+    .pass {{ color: #28a745; }}
+    .fail {{ color: #dc3545; }}
+    .skip {{ color: #6c757d; }}
+    .status {{ font-size: 1.2rem; }}
+    .error {{ color: #dc3545; font-size: 0.9rem; padding: 0.5rem; background: #fff; margin-top: 0.25rem; }}
+  </style>
+</head>
+<body>
+  <h1>E2E Report: {}</h1>
+  {}
+  <div class="summary {}">
+    <strong>Summary:</strong> {} passed, {} failed, {} skipped<br>
+    <strong>Duration:</strong> {:?}
+  </div>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Status</th><th>Step</th><th>Duration</th></tr>
+    </thead>
+    <tbody>
+{}
+    </tbody>
+  </table>
+</body>
+</html>"#,
+            escape_html(&self.scenario_name),
+            escape_html(&self.scenario_name),
+            self.description
+                .as_ref()
+                .map_or(String::new(), |d| format!("<p>{}</p>", escape_html(d))),
+            status_class,
+            self.passed,
+            self.failed,
+            self.skipped,
+            self.total_duration,
+            steps_html
+        )
+    }
+}
+
+/// Helper function to escape JSON strings.
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Helper function to escape HTML.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Macro for defining E2E test scenarios with a declarative syntax.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::{e2e_test, TestClient};
+///
+/// e2e_test! {
+///     name: "User Login Flow",
+///     description: "Tests the complete user login process",
+///     client: TestClient::new(app),
+///
+///     step "Navigate to login page" => |client| {
+///         let response = client.get("/login").send();
+///         assert_eq!(response.status().as_u16(), 200);
+///     },
+///
+///     step "Submit credentials" => |client| {
+///         let response = client
+///             .post("/login")
+///             .json(&serde_json::json!({"username": "test", "password": "secret"}))
+///             .send();
+///         assert_eq!(response.status().as_u16(), 302);
+///     },
+///
+///     step "Access dashboard" => |client| {
+///         let response = client.get("/dashboard").send();
+///         assert_eq!(response.status().as_u16(), 200);
+///         assert!(response.text().contains("Welcome"));
+///     },
+/// }
+/// ```
+#[macro_export]
+macro_rules! e2e_test {
+    (
+        name: $name:expr,
+        $(description: $desc:expr,)?
+        client: $client:expr,
+        $(step $step_name:literal => |$client_param:ident| $step_body:block),+ $(,)?
+    ) => {{
+        let client = $client;
+        let mut scenario = $crate::testing::E2EScenario::new($name, client);
+        $(
+            scenario = scenario.description($desc);
+        )?
+        $(
+            scenario.step($step_name, |$client_param| $step_body);
+        )+
+        scenario.assert_passed();
+        scenario.report()
+    }};
+}
+
+pub use e2e_test;
+
+// =============================================================================
+// Test Logging Utilities
+// =============================================================================
+
+use crate::logging::{LogEntry, LogLevel};
+
+/// A captured log entry for test assertions.
+#[derive(Debug, Clone)]
+pub struct CapturedLog {
+    /// The log level.
+    pub level: LogLevel,
+    /// The log message.
+    pub message: String,
+    /// Request ID associated with this log.
+    pub request_id: u64,
+    /// Timestamp when captured.
+    pub captured_at: std::time::Instant,
+    /// Structured fields as key-value pairs.
+    pub fields: Vec<(String, String)>,
+    /// Target module path (if any).
+    pub target: Option<String>,
+}
+
+impl CapturedLog {
+    /// Creates a new captured log from a LogEntry.
+    pub fn from_entry(entry: &LogEntry) -> Self {
+        Self {
+            level: entry.level,
+            message: entry.message.clone(),
+            request_id: entry.request_id,
+            captured_at: std::time::Instant::now(),
+            fields: entry.fields.clone(),
+            target: entry.target.clone(),
+        }
+    }
+
+    /// Creates a captured log directly with specified values.
+    pub fn new(level: LogLevel, message: impl Into<String>, request_id: u64) -> Self {
+        Self {
+            level,
+            message: message.into(),
+            request_id,
+            captured_at: std::time::Instant::now(),
+            fields: Vec::new(),
+            target: None,
+        }
+    }
+
+    /// Checks if the message contains the given substring.
+    #[must_use]
+    pub fn contains(&self, text: &str) -> bool {
+        self.message.contains(text)
+    }
+
+    /// Formats for display in test output.
+    #[must_use]
+    pub fn format(&self) -> String {
+        let mut output = format!(
+            "[{}] req={} {}",
+            self.level.as_char(),
+            self.request_id,
+            self.message
+        );
+        if !self.fields.is_empty() {
+            output.push_str(" {");
+            for (i, (k, v)) in self.fields.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&format!("{k}={v}"));
+            }
+            output.push('}');
+        }
+        output
+    }
+}
+
+/// Test logger that captures logs for per-test isolation and assertions.
+///
+/// Use `TestLogger::capture` to run a test with isolated log capture,
+/// then examine captured logs for assertions.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::TestLogger;
+/// use fastapi_core::logging::LogLevel;
+///
+/// let capture = TestLogger::capture(|| {
+///     let ctx = RequestContext::for_testing();
+///     log_info!(ctx, "Hello from test");
+///     log_debug!(ctx, "Debug info");
+/// });
+///
+/// // Assert on captured logs
+/// assert!(capture.contains_message("Hello from test"));
+/// assert_eq!(capture.count_by_level(LogLevel::Info), 1);
+///
+/// // Get failure context (last N logs)
+/// let context = capture.failure_context(5);
+/// ```
+#[derive(Debug, Clone)]
+pub struct TestLogger {
+    /// Captured log entries.
+    logs: std::sync::Arc<std::sync::Mutex<Vec<CapturedLog>>>,
+    /// Test phase timings.
+    timings: std::sync::Arc<std::sync::Mutex<TestTimings>>,
+    /// Whether to echo logs to stderr (for debugging).
+    echo_logs: bool,
+}
+
+/// Timing breakdown for test phases.
+#[derive(Debug, Clone, Default)]
+pub struct TestTimings {
+    /// Setup phase duration.
+    pub setup: Option<std::time::Duration>,
+    /// Execute phase duration.
+    pub execute: Option<std::time::Duration>,
+    /// Teardown phase duration.
+    pub teardown: Option<std::time::Duration>,
+    /// Phase start time.
+    phase_start: Option<std::time::Instant>,
+}
+
+impl TestTimings {
+    /// Starts timing a phase.
+    pub fn start_phase(&mut self) {
+        self.phase_start = Some(std::time::Instant::now());
+    }
+
+    /// Ends the setup phase.
+    pub fn end_setup(&mut self) {
+        if let Some(start) = self.phase_start.take() {
+            self.setup = Some(start.elapsed());
+        }
+    }
+
+    /// Ends the execute phase.
+    pub fn end_execute(&mut self) {
+        if let Some(start) = self.phase_start.take() {
+            self.execute = Some(start.elapsed());
+        }
+    }
+
+    /// Ends the teardown phase.
+    pub fn end_teardown(&mut self) {
+        if let Some(start) = self.phase_start.take() {
+            self.teardown = Some(start.elapsed());
+        }
+    }
+
+    /// Total test duration.
+    #[must_use]
+    pub fn total(&self) -> std::time::Duration {
+        self.setup.unwrap_or_default()
+            + self.execute.unwrap_or_default()
+            + self.teardown.unwrap_or_default()
+    }
+
+    /// Formats timings for display.
+    #[must_use]
+    pub fn format(&self) -> String {
+        format!(
+            "Timings: setup={:?}, execute={:?}, teardown={:?}, total={:?}",
+            self.setup.unwrap_or_default(),
+            self.execute.unwrap_or_default(),
+            self.teardown.unwrap_or_default(),
+            self.total()
+        )
+    }
+}
+
+impl TestLogger {
+    /// Creates a new test logger.
+    pub fn new() -> Self {
+        Self {
+            logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            timings: std::sync::Arc::new(std::sync::Mutex::new(TestTimings::default())),
+            echo_logs: std::env::var("FASTAPI_TEST_ECHO_LOGS").is_ok(),
+        }
+    }
+
+    /// Creates a logger that echoes logs to stderr.
+    pub fn with_echo() -> Self {
+        let mut logger = Self::new();
+        logger.echo_logs = true;
+        logger
+    }
+
+    /// Captures a log entry.
+    pub fn log(&self, entry: CapturedLog) {
+        if self.echo_logs {
+            eprintln!("[LOG] {}", entry.format());
+        }
+        self.logs.lock().expect("log mutex poisoned").push(entry);
+    }
+
+    /// Captures a log from a LogEntry.
+    pub fn log_entry(&self, entry: &LogEntry) {
+        self.log(CapturedLog::from_entry(entry));
+    }
+
+    /// Logs a message directly (convenience method).
+    pub fn log_message(&self, level: LogLevel, message: impl Into<String>, request_id: u64) {
+        self.log(CapturedLog::new(level, message, request_id));
+    }
+
+    /// Gets all captured logs.
+    #[must_use]
+    pub fn logs(&self) -> Vec<CapturedLog> {
+        self.logs.lock().expect("log mutex poisoned").clone()
+    }
+
+    /// Gets the number of captured logs.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.logs.lock().expect("log mutex poisoned").len()
+    }
+
+    /// Clears all captured logs.
+    pub fn clear(&self) {
+        self.logs.lock().expect("log mutex poisoned").clear();
+    }
+
+    /// Checks if any log contains the given message substring.
+    #[must_use]
+    pub fn contains_message(&self, text: &str) -> bool {
+        self.logs
+            .lock()
+            .expect("log mutex poisoned")
+            .iter()
+            .any(|log| log.contains(text))
+    }
+
+    /// Counts logs by level.
+    #[must_use]
+    pub fn count_by_level(&self, level: LogLevel) -> usize {
+        self.logs
+            .lock()
+            .expect("log mutex poisoned")
+            .iter()
+            .filter(|log| log.level == level)
+            .count()
+    }
+
+    /// Gets logs at a specific level.
+    #[must_use]
+    pub fn logs_at_level(&self, level: LogLevel) -> Vec<CapturedLog> {
+        self.logs
+            .lock()
+            .expect("log mutex poisoned")
+            .iter()
+            .filter(|log| log.level == level)
+            .cloned()
+            .collect()
+    }
+
+    /// Gets the last N logs for failure context.
+    #[must_use]
+    pub fn failure_context(&self, n: usize) -> String {
+        let logs = self.logs.lock().expect("log mutex poisoned");
+        let start = logs.len().saturating_sub(n);
+        let recent: Vec<_> = logs[start..].iter().map(CapturedLog::format).collect();
+
+        if recent.is_empty() {
+            "No logs captured".to_string()
+        } else {
+            format!(
+                "Last {} log(s) before failure:\n  {}",
+                recent.len(),
+                recent.join("\n  ")
+            )
+        }
+    }
+
+    /// Gets timing breakdown.
+    #[must_use]
+    pub fn timings(&self) -> TestTimings {
+        self.timings.lock().expect("timing mutex poisoned").clone()
+    }
+
+    /// Starts timing a phase.
+    pub fn start_phase(&self) {
+        self.timings
+            .lock()
+            .expect("timing mutex poisoned")
+            .start_phase();
+    }
+
+    /// Marks end of setup phase.
+    pub fn end_setup(&self) {
+        self.timings
+            .lock()
+            .expect("timing mutex poisoned")
+            .end_setup();
+    }
+
+    /// Marks end of execute phase.
+    pub fn end_execute(&self) {
+        self.timings
+            .lock()
+            .expect("timing mutex poisoned")
+            .end_execute();
+    }
+
+    /// Marks end of teardown phase.
+    pub fn end_teardown(&self) {
+        self.timings
+            .lock()
+            .expect("timing mutex poisoned")
+            .end_teardown();
+    }
+
+    /// Runs a closure with log capture, returning a LogCapture result.
+    ///
+    /// This is the primary API for isolated test logging.
+    pub fn capture<F, T>(f: F) -> LogCapture<T>
+    where
+        F: FnOnce(&TestLogger) -> T,
+    {
+        let logger = TestLogger::new();
+
+        logger.start_phase();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            logger.end_setup();
+            logger.start_phase();
+            let result = f(&logger);
+            logger.end_execute();
+            result
+        }));
+
+        let (ok_result, panic_info) = match result {
+            Ok(v) => (Some(v), None),
+            Err(p) => {
+                let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = p.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+                (None, Some(msg))
+            }
+        };
+
+        LogCapture {
+            logs: logger.logs(),
+            timings: logger.timings(),
+            result: ok_result,
+            panic_info,
+        }
+    }
+
+    /// Runs a test with setup, execute, and teardown phases.
+    pub fn capture_phased<S, E, D, T>(setup: S, execute: E, teardown: D) -> LogCapture<T>
+    where
+        S: FnOnce(&TestLogger),
+        E: FnOnce(&TestLogger) -> T,
+        D: FnOnce(&TestLogger),
+    {
+        let logger = TestLogger::new();
+
+        // Setup phase
+        logger.start_phase();
+        let setup_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            setup(&logger);
+        }));
+        logger.end_setup();
+
+        if setup_panic.is_err() {
+            return LogCapture {
+                logs: logger.logs(),
+                timings: logger.timings(),
+                result: None,
+                panic_info: Some("Setup phase panicked".to_string()),
+            };
+        }
+
+        // Execute phase
+        logger.start_phase();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&logger)));
+        logger.end_execute();
+
+        // Teardown phase (always runs)
+        logger.start_phase();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            teardown(&logger);
+        }));
+        logger.end_teardown();
+
+        let (ok_result, panic_info) = match result {
+            Ok(v) => (Some(v), None),
+            Err(p) => {
+                let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = p.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+                (None, Some(msg))
+            }
+        };
+
+        LogCapture {
+            logs: logger.logs(),
+            timings: logger.timings(),
+            result: ok_result,
+            panic_info,
+        }
+    }
+}
+
+impl Default for TestLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of a log capture operation.
+#[derive(Debug)]
+pub struct LogCapture<T> {
+    /// Captured log entries.
+    pub logs: Vec<CapturedLog>,
+    /// Phase timings.
+    pub timings: TestTimings,
+    /// Test result (if successful).
+    pub result: Option<T>,
+    /// Panic information (if failed).
+    pub panic_info: Option<String>,
+}
+
+impl<T> LogCapture<T> {
+    /// Returns `true` if the test passed.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Returns `true` if the test failed.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.panic_info.is_some()
+    }
+
+    /// Checks if any log contains the given message substring.
+    #[must_use]
+    pub fn contains_message(&self, text: &str) -> bool {
+        self.logs.iter().any(|log| log.contains(text))
+    }
+
+    /// Counts logs by level.
+    #[must_use]
+    pub fn count_by_level(&self, level: LogLevel) -> usize {
+        self.logs.iter().filter(|log| log.level == level).count()
+    }
+
+    /// Gets the last N logs for failure context.
+    #[must_use]
+    pub fn failure_context(&self, n: usize) -> String {
+        let start = self.logs.len().saturating_sub(n);
+        let recent: Vec<_> = self.logs[start..].iter().map(CapturedLog::format).collect();
+
+        let mut output = String::new();
+
+        if let Some(ref panic) = self.panic_info {
+            output.push_str(&format!("Test failed: {}\n\n", panic));
+        }
+
+        output.push_str(&self.timings.format());
+        output.push_str("\n\n");
+
+        if recent.is_empty() {
+            output.push_str("No logs captured");
+        } else {
+            output.push_str(&format!(
+                "Last {} log(s) before failure:\n  {}",
+                recent.len(),
+                recent.join("\n  ")
+            ));
+        }
+
+        output
+    }
+
+    /// Unwraps the result, panicking with failure context if it failed.
+    pub fn unwrap(self) -> T {
+        match self.result {
+            Some(v) => v,
+            None => panic!(
+                "Test failed with log context:\n{}",
+                self.failure_context(10)
+            ),
+        }
+    }
+
+    /// Gets the result or returns a default.
+    pub fn unwrap_or(self, default: T) -> T {
+        self.result.unwrap_or(default)
+    }
+}
+
+/// Assertion helper that includes log context on failure.
+///
+/// Use this instead of `assert!` to automatically include recent logs in
+/// the failure message.
+#[macro_export]
+macro_rules! assert_with_logs {
+    ($logger:expr, $cond:expr) => {
+        if !$cond {
+            panic!(
+                "Assertion failed: {}\n\n{}",
+                stringify!($cond),
+                $logger.failure_context(10)
+            );
+        }
+    };
+    ($logger:expr, $cond:expr, $($arg:tt)+) => {
+        if !$cond {
+            panic!(
+                "Assertion failed: {}\n\n{}",
+                format!($($arg)+),
+                $logger.failure_context(10)
+            );
+        }
+    };
+}
+
+/// Assertion helper that includes log context for equality checks.
+#[macro_export]
+macro_rules! assert_eq_with_logs {
+    ($logger:expr, $left:expr, $right:expr) => {
+        if $left != $right {
+            panic!(
+                "Assertion failed: {} == {}\n  left:  {:?}\n  right: {:?}\n\n{}",
+                stringify!($left),
+                stringify!($right),
+                $left,
+                $right,
+                $logger.failure_context(10)
+            );
+        }
+    };
+    ($logger:expr, $left:expr, $right:expr, $($arg:tt)+) => {
+        if $left != $right {
+            panic!(
+                "Assertion failed: {}\n  left:  {:?}\n  right: {:?}\n\n{}",
+                format!($($arg)+),
+                $left,
+                $right,
+                $logger.failure_context(10)
+            );
+        }
+    };
+}
+
+pub use assert_eq_with_logs;
+pub use assert_with_logs;
+
+/// Request/response diff helper for test assertions.
+#[derive(Debug)]
+pub struct ResponseDiff {
+    /// Expected status code.
+    pub expected_status: u16,
+    /// Actual status code.
+    pub actual_status: u16,
+    /// Expected body substring or full content.
+    pub expected_body: Option<String>,
+    /// Actual body content.
+    pub actual_body: String,
+    /// Header differences (name, expected, actual).
+    pub header_diffs: Vec<(String, Option<String>, Option<String>)>,
+}
+
+impl ResponseDiff {
+    /// Creates a new diff from expected and actual responses.
+    pub fn new(expected_status: u16, actual: &TestResponse) -> Self {
+        Self {
+            expected_status,
+            actual_status: actual.status().as_u16(),
+            expected_body: None,
+            actual_body: actual.text().to_string(),
+            header_diffs: Vec::new(),
+        }
+    }
+
+    /// Sets expected body for comparison.
+    #[must_use]
+    pub fn expected_body(mut self, body: impl Into<String>) -> Self {
+        self.expected_body = Some(body.into());
+        self
+    }
+
+    /// Adds an expected header.
+    #[must_use]
+    pub fn expected_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.header_diffs
+            .push((name.into(), Some(value.into()), None));
+        self
+    }
+
+    /// Returns `true` if there are no differences.
+    #[must_use]
+    pub fn is_match(&self) -> bool {
+        if self.expected_status != self.actual_status {
+            return false;
+        }
+        if let Some(ref expected) = self.expected_body {
+            if !self.actual_body.contains(expected) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Formats the diff for display.
+    #[must_use]
+    pub fn format(&self) -> String {
+        let mut output = String::new();
+
+        if self.expected_status != self.actual_status {
+            output.push_str(&format!(
+                "Status mismatch:\n  expected: {}\n  actual:   {}\n",
+                self.expected_status, self.actual_status
+            ));
+        }
+
+        if let Some(ref expected) = self.expected_body {
+            if !self.actual_body.contains(expected) {
+                output.push_str(&format!(
+                    "Body mismatch:\n  expected to contain: {:?}\n  actual: {:?}\n",
+                    expected, self.actual_body
+                ));
+            }
+        }
+
+        for (name, expected, actual) in &self.header_diffs {
+            output.push_str(&format!(
+                "Header '{}' mismatch:\n  expected: {:?}\n  actual:   {:?}\n",
+                name, expected, actual
+            ));
+        }
+
+        if output.is_empty() {
+            "No differences".to_string()
+        } else {
+            output
+        }
+    }
+}
+
 #[cfg(test)]
 mod mock_server_tests {
     use super::*;
@@ -3093,5 +4365,228 @@ mod mock_server_tests {
         assert_eq!(request.body_text(), "test body");
         assert_eq!(request.header("content-type"), Some("application/json"));
         assert_eq!(request.url(), "/api/users?page=1");
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+
+    // Create a simple test handler for E2E testing
+    fn test_handler(
+        _ctx: &RequestContext,
+        req: &mut Request,
+    ) -> std::future::Ready<Response> {
+        let path = req.path();
+        let response = match path {
+            "/" => Response::ok().body(ResponseBody::Bytes(b"Home".to_vec())),
+            "/login" => Response::ok().body(ResponseBody::Bytes(b"Login Page".to_vec())),
+            "/dashboard" => Response::ok().body(ResponseBody::Bytes(b"Dashboard".to_vec())),
+            "/api/users" => Response::ok().body(ResponseBody::Bytes(b"[\"Alice\",\"Bob\"]".to_vec())),
+            "/fail" => Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(ResponseBody::Bytes(b"Error".to_vec())),
+            _ => Response::with_status(StatusCode::NOT_FOUND)
+                .body(ResponseBody::Bytes(b"Not Found".to_vec())),
+        };
+        std::future::ready(response)
+    }
+
+    #[test]
+    fn e2e_scenario_all_steps_pass() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Basic Navigation", client);
+
+        scenario.step("Visit home page", |client| {
+            let response = client.get("/").send();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(response.text(), "Home");
+        });
+
+        scenario.step("Visit login page", |client| {
+            let response = client.get("/login").send();
+            assert_eq!(response.status().as_u16(), 200);
+        });
+
+        assert!(scenario.passed());
+        assert_eq!(scenario.steps().len(), 2);
+        assert!(scenario.steps().iter().all(|s| s.result.is_passed()));
+    }
+
+    #[test]
+    fn e2e_scenario_step_failure() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Failure Test", client)
+            .stop_on_failure(true);
+
+        scenario.step("First step passes", |client| {
+            let response = client.get("/").send();
+            assert_eq!(response.status().as_u16(), 200);
+        });
+
+        scenario.step("Second step fails", |_client| {
+            panic!("Intentional failure");
+        });
+
+        scenario.step("Third step skipped", |client| {
+            let response = client.get("/dashboard").send();
+            assert_eq!(response.status().as_u16(), 200);
+        });
+
+        assert!(!scenario.passed());
+        assert_eq!(scenario.steps().len(), 3);
+        assert!(scenario.steps()[0].result.is_passed());
+        assert!(scenario.steps()[1].result.is_failed());
+        assert!(matches!(scenario.steps()[2].result, E2EStepResult::Skipped));
+    }
+
+    #[test]
+    fn e2e_scenario_continue_on_failure() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Continue Test", client)
+            .stop_on_failure(false);
+
+        scenario.step("First step fails", |_client| {
+            panic!("First failure");
+        });
+
+        scenario.step("Second step still runs", |client| {
+            let response = client.get("/").send();
+            assert_eq!(response.status().as_u16(), 200);
+        });
+
+        assert!(!scenario.passed());
+        assert_eq!(scenario.steps().len(), 2);
+        assert!(scenario.steps()[0].result.is_failed());
+        // Second step ran (not skipped) and passed
+        assert!(scenario.steps()[1].result.is_passed());
+    }
+
+    #[test]
+    fn e2e_report_text_format() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Report Test", client)
+            .description("Tests report generation");
+
+        scenario.step("Step 1", |client| {
+            let _ = client.get("/").send();
+        });
+
+        let report = scenario.report();
+        let text = report.to_text();
+
+        assert!(text.contains("E2E Test Report: Report Test"));
+        assert!(text.contains("Tests report generation"));
+        assert!(text.contains("1 passed"));
+        assert!(text.contains("Step 1"));
+    }
+
+    #[test]
+    fn e2e_report_json_format() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("JSON Test", client);
+
+        scenario.step("API call", |client| {
+            let response = client.get("/api/users").send();
+            assert_eq!(response.status().as_u16(), 200);
+        });
+
+        let report = scenario.report();
+        let json = report.to_json();
+
+        assert!(json.contains(r#""scenario": "JSON Test""#));
+        assert!(json.contains(r#""passed": 1"#));
+        assert!(json.contains(r#""name": "API call""#));
+        assert!(json.contains(r#""status": "passed""#));
+    }
+
+    #[test]
+    fn e2e_report_html_format() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("HTML Test", client);
+
+        scenario.step("Web visit", |client| {
+            let _ = client.get("/").send();
+        });
+
+        let report = scenario.report();
+        let html = report.to_html();
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("E2E Report: HTML Test"));
+        assert!(html.contains("1 passed"));
+        assert!(html.contains("Web visit"));
+    }
+
+    #[test]
+    fn e2e_step_timing() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Timing Test", client);
+
+        scenario.step("Timed step", |_client| {
+            // Small delay to ensure measurable duration
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        });
+
+        assert!(scenario.steps()[0].duration >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn e2e_logs_captured() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Log Test", client);
+
+        scenario.log("Manual log entry");
+        scenario.step("Logged step", |_client| {});
+
+        assert!(scenario.logs().iter().any(|l| l.contains("Manual log entry")));
+        assert!(scenario.logs().iter().any(|l| l.contains("[START] Logged step")));
+        assert!(scenario.logs().iter().any(|l| l.contains("[PASS] Logged step")));
+    }
+
+    #[test]
+    fn e2e_try_step_with_result() {
+        let client = TestClient::new(test_handler);
+        let mut scenario = E2EScenario::new("Try Step Test", client);
+
+        let result: Result<(), &str> = scenario.try_step("Success step", |client| {
+            let response = client.get("/").send();
+            if response.status().as_u16() == 200 {
+                Ok(())
+            } else {
+                Err("Unexpected status")
+            }
+        });
+
+        assert!(result.is_ok());
+        assert!(scenario.passed());
+    }
+
+    #[test]
+    fn e2e_escape_functions() {
+        // Test JSON escaping
+        assert_eq!(escape_json("hello"), "hello");
+        assert_eq!(escape_json("a\"b"), "a\\\"b");
+        assert_eq!(escape_json("a\nb"), "a\\nb");
+
+        // Test HTML escaping
+        assert_eq!(escape_html("hello"), "hello");
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn e2e_step_result_helpers() {
+        let passed = E2EStepResult::Passed;
+        let failed = E2EStepResult::Failed("error".to_string());
+        let skipped = E2EStepResult::Skipped;
+
+        assert!(passed.is_passed());
+        assert!(!passed.is_failed());
+
+        assert!(!failed.is_passed());
+        assert!(failed.is_failed());
+
+        assert!(!skipped.is_passed());
+        assert!(!skipped.is_failed());
     }
 }

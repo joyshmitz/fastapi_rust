@@ -3720,6 +3720,673 @@ mod state_tests {
 }
 
 // ============================================================================
+// Special Parameter Extractors (Request/Response Injection)
+// ============================================================================
+
+/// Read-only request data access.
+///
+/// Provides access to request metadata without consuming the body.
+/// For body access, use the `Json`, `Form`, or other body extractors.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::RequestRef;
+///
+/// async fn handler(req: RequestRef) -> impl IntoResponse {
+///     format!("Method: {}, Path: {}", req.method(), req.path())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct RequestRef {
+    method: crate::request::Method,
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, Vec<u8>)>,
+}
+
+impl RequestRef {
+    /// Get the HTTP method.
+    #[must_use]
+    pub fn method(&self) -> crate::request::Method {
+        self.method
+    }
+
+    /// Get the request path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Get the query string.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// Get a header value by name (case-insensitive).
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        let name_lower = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(n, _)| n.to_ascii_lowercase() == name_lower)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Iterate over all headers.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.headers.iter().map(|(n, v)| (n.as_str(), v.as_slice()))
+    }
+}
+
+impl FromRequest for RequestRef {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        Ok(RequestRef {
+            method: req.method(),
+            path: req.path().to_string(),
+            query: req.query().map(String::from),
+            headers: req
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_vec()))
+                .collect(),
+        })
+    }
+}
+
+/// Mutable response container for setting response headers and cookies.
+///
+/// This extractor allows handlers to set additional response headers and cookies
+/// that will be merged into the final response. The handler's return value
+/// determines the status code and body; `ResponseMut` adds headers on top.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::ResponseMut;
+/// use fastapi_core::response::Json;
+///
+/// async fn handler(mut resp: ResponseMut) -> Json<Data> {
+///     resp.header("X-Custom-Header", "custom-value");
+///     resp.cookie("session", "abc123");
+///     Json(data)
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ResponseMutations {
+    /// Headers to add to the response.
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// Cookies to set (name, value, attributes).
+    pub cookies: Vec<Cookie>,
+    /// Cookies to delete.
+    pub delete_cookies: Vec<String>,
+}
+
+impl ResponseMutations {
+    /// Create empty response mutations.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a header.
+    pub fn add_header(&mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) {
+        self.headers.push((name.into(), value.into()));
+    }
+
+    /// Set a cookie.
+    pub fn add_cookie(&mut self, cookie: Cookie) {
+        self.cookies.push(cookie);
+    }
+
+    /// Delete a cookie by name.
+    pub fn remove_cookie(&mut self, name: impl Into<String>) {
+        self.delete_cookies.push(name.into());
+    }
+
+    /// Apply mutations to a response.
+    #[must_use]
+    pub fn apply(self, mut response: crate::response::Response) -> crate::response::Response {
+        // Add headers
+        for (name, value) in self.headers {
+            response = response.header(name, value);
+        }
+
+        // Add Set-Cookie headers for cookies
+        for cookie in self.cookies {
+            response = response.header("Set-Cookie", cookie.to_header_value().into_bytes());
+        }
+
+        // Add Set-Cookie headers to delete cookies
+        for name in self.delete_cookies {
+            let delete_cookie = format!("{}=; Max-Age=0; Path=/", name);
+            response = response.header("Set-Cookie", delete_cookie.into_bytes());
+        }
+
+        response
+    }
+}
+
+/// A cookie to set in the response.
+#[derive(Debug, Clone)]
+pub struct Cookie {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// Max-Age in seconds (None = session cookie).
+    pub max_age: Option<i64>,
+    /// Path (defaults to /).
+    pub path: Option<String>,
+    /// Domain.
+    pub domain: Option<String>,
+    /// Secure flag.
+    pub secure: bool,
+    /// HttpOnly flag.
+    pub http_only: bool,
+    /// SameSite attribute.
+    pub same_site: Option<SameSite>,
+}
+
+impl Cookie {
+    /// Create a new cookie with name and value.
+    #[must_use]
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            max_age: None,
+            path: None,
+            domain: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+        }
+    }
+
+    /// Set the Max-Age attribute.
+    #[must_use]
+    pub fn max_age(mut self, seconds: i64) -> Self {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// Set the Path attribute.
+    #[must_use]
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Set the Domain attribute.
+    #[must_use]
+    pub fn domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set the Secure flag.
+    #[must_use]
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure = secure;
+        self
+    }
+
+    /// Set the HttpOnly flag.
+    #[must_use]
+    pub fn http_only(mut self, http_only: bool) -> Self {
+        self.http_only = http_only;
+        self
+    }
+
+    /// Set the SameSite attribute.
+    #[must_use]
+    pub fn same_site(mut self, same_site: SameSite) -> Self {
+        self.same_site = Some(same_site);
+        self
+    }
+
+    /// Convert to Set-Cookie header value.
+    #[must_use]
+    pub fn to_header_value(&self) -> String {
+        let mut parts = vec![format!("{}={}", self.name, self.value)];
+
+        if let Some(max_age) = self.max_age {
+            parts.push(format!("Max-Age={}", max_age));
+        }
+        if let Some(ref path) = self.path {
+            parts.push(format!("Path={}", path));
+        }
+        if let Some(ref domain) = self.domain {
+            parts.push(format!("Domain={}", domain));
+        }
+        if self.secure {
+            parts.push("Secure".to_string());
+        }
+        if self.http_only {
+            parts.push("HttpOnly".to_string());
+        }
+        if let Some(ref same_site) = self.same_site {
+            parts.push(format!("SameSite={}", same_site.as_str()));
+        }
+
+        parts.join("; ")
+    }
+}
+
+/// SameSite cookie attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// Strict: Cookie only sent in first-party context.
+    Strict,
+    /// Lax: Cookie sent with top-level navigations.
+    Lax,
+    /// None: Cookie sent in all contexts (requires Secure).
+    None,
+}
+
+impl SameSite {
+    /// Get the string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strict => "Strict",
+            Self::Lax => "Lax",
+            Self::None => "None",
+        }
+    }
+}
+
+/// Mutable response wrapper for setting headers and cookies.
+///
+/// This is the extractor type that handlers receive. Mutations made through
+/// this wrapper are stored in request extensions and applied after the handler
+/// returns.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::ResponseMut;
+///
+/// async fn handler(mut resp: ResponseMut) -> &'static str {
+///     resp.header("X-Powered-By", "fastapi-rust");
+///     resp.cookie("visited", "true");
+///     "Hello"
+/// }
+/// ```
+pub struct ResponseMut<'a> {
+    mutations: &'a mut ResponseMutations,
+}
+
+impl<'a> ResponseMut<'a> {
+    /// Set a response header.
+    pub fn header(&mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) {
+        self.mutations.add_header(name, value);
+    }
+
+    /// Set a cookie.
+    pub fn cookie(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.mutations.add_cookie(Cookie::new(name, value));
+    }
+
+    /// Set a cookie with full configuration.
+    pub fn set_cookie(&mut self, cookie: Cookie) {
+        self.mutations.add_cookie(cookie);
+    }
+
+    /// Delete a cookie by name.
+    pub fn delete_cookie(&mut self, name: impl Into<String>) {
+        self.mutations.remove_cookie(name);
+    }
+}
+
+impl<'a> std::fmt::Debug for ResponseMut<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseMut")
+            .field("mutations", &self.mutations)
+            .finish()
+    }
+}
+
+// Note: ResponseMut cannot implement FromRequest because it returns a borrowed
+// reference. Instead, handlers should extract ResponseMutations and get a &mut
+// reference to it. The App will apply mutations after handler execution.
+
+impl FromRequest for ResponseMutations {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get existing mutations or create new ones
+        if let Some(mutations) = req.get_extension::<ResponseMutations>() {
+            Ok(mutations.clone())
+        } else {
+            let mutations = ResponseMutations::new();
+            req.insert_extension(mutations.clone());
+            Ok(mutations)
+        }
+    }
+}
+
+// ============================================================================
+// Background Tasks Extractor
+// ============================================================================
+
+use std::sync::Arc;
+
+/// Type alias for a boxed async task function.
+pub type BackgroundTask = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// Internal storage for background tasks (thread-safe).
+///
+/// This uses `parking_lot::Mutex` for interior mutability while being Send + Sync.
+#[derive(Default, Clone)]
+pub struct BackgroundTasksInner {
+    inner: Arc<parking_lot::Mutex<Vec<BackgroundTask>>>,
+}
+
+impl BackgroundTasksInner {
+    /// Create a new empty task storage.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Add a task to the queue.
+    pub fn push(&self, task: BackgroundTask) {
+        self.inner.lock().push(task);
+    }
+
+    /// Take all tasks from the queue.
+    pub fn take(&self) -> Vec<BackgroundTask> {
+        std::mem::take(&mut *self.inner.lock())
+    }
+
+    /// Returns the number of tasks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Returns true if there are no tasks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+}
+
+impl std::fmt::Debug for BackgroundTasksInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundTasksInner")
+            .field("task_count", &self.len())
+            .finish()
+    }
+}
+
+/// Background task queue for running tasks after response is sent.
+///
+/// Tasks are executed in the order they are added, after the response
+/// has been sent to the client. This is useful for:
+/// - Sending emails
+/// - Writing to external logs
+/// - Triggering webhooks
+/// - Updating caches
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::BackgroundTasks;
+///
+/// async fn handler(mut tasks: BackgroundTasks) -> &'static str {
+///     tasks.add_task(|| async {
+///         // Send notification email
+///         send_email("user@example.com", "Welcome!").await;
+///     });
+///     "Response sent, email will be sent in background"
+/// }
+/// ```
+///
+/// # Note
+///
+/// Background tasks run after the response is sent but before the request
+/// context is fully cleaned up. They share the same cancellation context
+/// as the request, so long-running tasks should check for cancellation.
+#[derive(Clone)]
+pub struct BackgroundTasks {
+    inner: BackgroundTasksInner,
+}
+
+impl Default for BackgroundTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackgroundTasks {
+    /// Create a new empty task queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: BackgroundTasksInner::new(),
+        }
+    }
+
+    /// Create from inner storage.
+    #[must_use]
+    pub(crate) fn from_inner(inner: BackgroundTasksInner) -> Self {
+        Self { inner }
+    }
+
+    /// Add a background task.
+    ///
+    /// The task will be executed after the response is sent.
+    pub fn add_task<F, Fut>(&mut self, task: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.inner.push(Box::new(move || Box::pin(task())));
+    }
+
+    /// Add a synchronous background task.
+    ///
+    /// The task will be executed after the response is sent.
+    pub fn add_sync_task<F>(&mut self, task: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.inner.push(Box::new(move || {
+            Box::pin(async move {
+                task();
+            })
+        }));
+    }
+
+    /// Take all tasks from the queue.
+    pub fn take_tasks(&mut self) -> Vec<BackgroundTask> {
+        self.inner.take()
+    }
+
+    /// Returns true if there are no tasks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the number of tasks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Execute all tasks.
+    ///
+    /// This is called by the framework after the response is sent.
+    pub async fn execute_all(mut self) {
+        for task in self.take_tasks() {
+            task().await;
+        }
+    }
+
+    /// Get the inner storage for request extensions.
+    pub fn into_inner(self) -> BackgroundTasksInner {
+        self.inner
+    }
+}
+
+impl std::fmt::Debug for BackgroundTasks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundTasks")
+            .field("task_count", &self.len())
+            .finish()
+    }
+}
+
+impl FromRequest for BackgroundTasks {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get existing task storage or create new one
+        if let Some(inner) = req.get_extension::<BackgroundTasksInner>() {
+            Ok(BackgroundTasks::from_inner(inner.clone()))
+        } else {
+            let inner = BackgroundTasksInner::new();
+            req.insert_extension(inner.clone());
+            Ok(BackgroundTasks::from_inner(inner))
+        }
+    }
+}
+
+#[cfg(test)]
+mod special_extractor_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    #[test]
+    fn request_ref_extracts_metadata() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/users/42");
+        req.set_query(Some("page=1".to_string()));
+        req.headers_mut().insert("content-type", b"application/json".to_vec());
+
+        let result = futures_executor::block_on(RequestRef::from_request(&ctx, &mut req));
+        let req_ref = result.unwrap();
+
+        assert_eq!(req_ref.method(), Method::Get);
+        assert_eq!(req_ref.path(), "/users/42");
+        assert_eq!(req_ref.query(), Some("page=1"));
+        assert_eq!(req_ref.header("content-type"), Some(b"application/json".as_slice()));
+    }
+
+    #[test]
+    fn request_ref_header_case_insensitive() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut().insert("X-Custom-Header", b"value".to_vec());
+
+        let result = futures_executor::block_on(RequestRef::from_request(&ctx, &mut req));
+        let req_ref = result.unwrap();
+
+        assert_eq!(req_ref.header("x-custom-header"), Some(b"value".as_slice()));
+        assert_eq!(req_ref.header("X-CUSTOM-HEADER"), Some(b"value".as_slice()));
+    }
+
+    #[test]
+    fn cookie_to_header_value_simple() {
+        let cookie = Cookie::new("session", "abc123");
+        assert_eq!(cookie.to_header_value(), "session=abc123");
+    }
+
+    #[test]
+    fn cookie_to_header_value_with_attributes() {
+        let cookie = Cookie::new("session", "abc123")
+            .max_age(3600)
+            .path("/")
+            .secure(true)
+            .http_only(true)
+            .same_site(SameSite::Strict);
+
+        let header = cookie.to_header_value();
+        assert!(header.contains("session=abc123"));
+        assert!(header.contains("Max-Age=3600"));
+        assert!(header.contains("Path=/"));
+        assert!(header.contains("Secure"));
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn response_mutations_apply_headers() {
+        let mut mutations = ResponseMutations::new();
+        mutations.add_header("X-Custom", "value");
+        mutations.add_header("X-Another", "other");
+
+        let response = crate::response::Response::ok();
+        let response = mutations.apply(response);
+
+        let headers = response.headers();
+        assert!(headers.iter().any(|(n, v)| n == "X-Custom" && v == b"value"));
+        assert!(headers.iter().any(|(n, v)| n == "X-Another" && v == b"other"));
+    }
+
+    #[test]
+    fn response_mutations_apply_cookies() {
+        let mut mutations = ResponseMutations::new();
+        mutations.add_cookie(Cookie::new("session", "abc").http_only(true));
+
+        let response = crate::response::Response::ok();
+        let response = mutations.apply(response);
+
+        let headers = response.headers();
+        let set_cookie = headers
+            .iter()
+            .find(|(n, _)| n == "Set-Cookie")
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string());
+        assert!(set_cookie.is_some());
+        assert!(set_cookie.unwrap().contains("session=abc"));
+    }
+
+    #[test]
+    fn response_mutations_delete_cookie() {
+        let mut mutations = ResponseMutations::new();
+        mutations.remove_cookie("session");
+
+        let response = crate::response::Response::ok();
+        let response = mutations.apply(response);
+
+        let headers = response.headers();
+        let set_cookie = headers
+            .iter()
+            .find(|(n, _)| n == "Set-Cookie")
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string());
+        assert!(set_cookie.is_some());
+        let cookie_header = set_cookie.unwrap();
+        assert!(cookie_header.contains("session="));
+        assert!(cookie_header.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn response_mutations_extract() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+
+        let result = futures_executor::block_on(ResponseMutations::from_request(&ctx, &mut req));
+        let mutations = result.unwrap();
+        assert!(mutations.headers.is_empty());
+        assert!(mutations.cookies.is_empty());
+    }
+}
+
+// ============================================================================
 // Header Extractor
 // ============================================================================
 
