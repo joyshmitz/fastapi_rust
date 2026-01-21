@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::context::RequestContext;
+use crate::dependency::DependencyOverrides;
 use crate::logging::{LogConfig, RequestLogger};
 use crate::request::{Body, Request};
 use crate::response::Response;
@@ -207,6 +208,13 @@ pub trait Handler: Send + Sync {
     /// Process a request and return a response.
     fn call<'a>(&'a self, ctx: &'a RequestContext, req: &'a mut Request)
     -> BoxFuture<'a, Response>;
+
+    /// Optional dependency overrides to apply when building request contexts.
+    ///
+    /// Default implementation returns `None`, which means no overrides.
+    fn dependency_overrides(&self) -> Option<Arc<DependencyOverrides>> {
+        None
+    }
 }
 
 /// Implement Handler for async functions.

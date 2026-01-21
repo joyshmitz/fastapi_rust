@@ -39,6 +39,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::context::RequestContext;
+use crate::dependency::{DependencyOverrides, FromDependency};
 use crate::middleware::{BoxFuture, Handler, Middleware, MiddlewareStack};
 use crate::request::{Method, Request};
 use crate::response::{Response, StatusCode};
@@ -567,6 +568,7 @@ pub struct AppBuilder {
     routes: Vec<RouteEntry>,
     middleware: Vec<Arc<dyn Middleware>>,
     state: StateContainer,
+    dependency_overrides: Arc<DependencyOverrides>,
     exception_handlers: ExceptionHandlers,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
@@ -580,6 +582,7 @@ impl Default for AppBuilder {
             routes: Vec::new(),
             middleware: Vec::new(),
             state: StateContainer::default(),
+            dependency_overrides: Arc::new(DependencyOverrides::new()),
             exception_handlers: ExceptionHandlers::default(),
             startup_hooks: Vec::new(),
             shutdown_hooks: Vec::new(),
@@ -877,6 +880,7 @@ impl AppBuilder {
             routes: self.routes,
             middleware: middleware_stack,
             state: Arc::new(self.state),
+            dependency_overrides: Arc::clone(&self.dependency_overrides),
             exception_handlers: Arc::new(self.exception_handlers),
             startup_hooks: parking_lot::Mutex::new(self.startup_hooks),
             shutdown_hooks: parking_lot::Mutex::new(self.shutdown_hooks),
@@ -908,6 +912,7 @@ pub struct App {
     routes: Vec<RouteEntry>,
     middleware: MiddlewareStack,
     state: Arc<StateContainer>,
+    dependency_overrides: Arc<DependencyOverrides>,
     exception_handlers: Arc<ExceptionHandlers>,
     startup_hooks: parking_lot::Mutex<Vec<StartupHook>>,
     shutdown_hooks: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
