@@ -2,11 +2,21 @@
 //!
 //! This module provides the `Depends` extractor and supporting types for
 //! request-scoped dependency resolution with optional caching and overrides.
+//!
+//! # Circular Dependency Detection
+//!
+//! The DI system detects circular dependencies at runtime. If a dependency
+//! graph contains a cycle (e.g., A -> B -> C -> A), the resolution will fail
+//! with a [`CircularDependencyError`] containing the full cycle path.
+//!
+//! ```text
+//! Circular dependency detected: DbPool -> UserService -> AuthService -> DbPool
+//! ```
 
 use crate::context::RequestContext;
 use crate::extract::FromRequest;
 use crate::request::Request;
-use crate::response::IntoResponse;
+use crate::response::{IntoResponse, Response, ResponseBody, StatusCode};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -51,6 +61,175 @@ pub struct NoCache;
 impl DependsConfig for NoCache {
     const USE_CACHE: bool = false;
     const SCOPE: Option<DependencyScope> = Some(DependencyScope::Function);
+}
+
+// ============================================================================
+// Circular Dependency Detection
+// ============================================================================
+
+/// Error returned when a circular dependency is detected.
+///
+/// This error contains the full cycle path showing which types form the cycle.
+/// For example, if `DbPool` depends on `UserService` which depends on `DbPool`,
+/// the cycle would be: `["DbPool", "UserService", "DbPool"]`.
+///
+/// # Example
+///
+/// ```text
+/// Circular dependency detected: DbPool -> UserService -> DbPool
+/// ```
+#[derive(Debug, Clone)]
+pub struct CircularDependencyError {
+    /// The names of the types forming the cycle, in resolution order.
+    /// The first and last element are the same type (completing the cycle).
+    pub cycle: Vec<String>,
+}
+
+impl CircularDependencyError {
+    /// Create a new circular dependency error with the given cycle path.
+    #[must_use]
+    pub fn new(cycle: Vec<String>) -> Self {
+        Self { cycle }
+    }
+
+    /// Get a human-readable representation of the cycle.
+    #[must_use]
+    pub fn cycle_path(&self) -> String {
+        self.cycle.join(" -> ")
+    }
+}
+
+impl std::fmt::Display for CircularDependencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Circular dependency detected: {}", self.cycle_path())
+    }
+}
+
+impl std::error::Error for CircularDependencyError {}
+
+impl IntoResponse for CircularDependencyError {
+    fn into_response(self) -> Response {
+        let body = format!(
+            r#"{{"detail":"Circular dependency detected: {}"}}"#,
+            self.cycle_path()
+        );
+        Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.into_bytes()))
+    }
+}
+
+/// Tracks which types are currently being resolved to detect cycles.
+///
+/// This uses a stack-based approach: when we start resolving a type, we push
+/// its `TypeId` and name onto the stack. If we see the same `TypeId` again
+/// before finishing, we have a cycle.
+pub struct ResolutionStack {
+    /// Stack of (TypeId, type_name) pairs currently being resolved.
+    stack: RwLock<Vec<(TypeId, String)>>,
+}
+
+impl ResolutionStack {
+    /// Create an empty resolution stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stack: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Check if a type is currently being resolved (would form a cycle).
+    ///
+    /// Returns `Some(cycle_path)` if the type is already on the stack,
+    /// or `None` if it's safe to proceed.
+    pub fn check_cycle<T: 'static>(&self, type_name: &str) -> Option<Vec<String>> {
+        let type_id = TypeId::of::<T>();
+        let guard = self.stack.read().expect("resolution stack poisoned");
+
+        // Check if this type is already being resolved
+        if let Some(pos) = guard.iter().position(|(id, _)| *id == type_id) {
+            // Build the cycle path from the position where we first saw this type
+            let mut cycle: Vec<String> =
+                guard[pos..].iter().map(|(_, name)| name.clone()).collect();
+            // Add the current type to complete the cycle
+            cycle.push(type_name.to_owned());
+            return Some(cycle);
+        }
+
+        None
+    }
+
+    /// Push a type onto the resolution stack.
+    ///
+    /// Call this when starting to resolve a dependency.
+    pub fn push<T: 'static>(&self, type_name: &str) {
+        let mut guard = self.stack.write().expect("resolution stack poisoned");
+        guard.push((TypeId::of::<T>(), type_name.to_owned()));
+    }
+
+    /// Pop a type from the resolution stack.
+    ///
+    /// Call this when done resolving a dependency (success or error).
+    pub fn pop(&self) {
+        let mut guard = self.stack.write().expect("resolution stack poisoned");
+        guard.pop();
+    }
+
+    /// Get the current depth of the resolution stack.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let guard = self.stack.read().expect("resolution stack poisoned");
+        guard.len()
+    }
+
+    /// Check if the stack is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.depth() == 0
+    }
+}
+
+impl Default for ResolutionStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ResolutionStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.stack.read().expect("resolution stack poisoned");
+        f.debug_struct("ResolutionStack")
+            .field("depth", &guard.len())
+            .field(
+                "types",
+                &guard
+                    .iter()
+                    .map(|(_, name)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// RAII guard that automatically pops from the resolution stack on drop.
+///
+/// This ensures the stack is always properly maintained, even if the
+/// resolution fails or panics.
+pub struct ResolutionGuard<'a> {
+    stack: &'a ResolutionStack,
+}
+
+impl<'a> ResolutionGuard<'a> {
+    /// Create a new guard that will pop from the stack when dropped.
+    fn new(stack: &'a ResolutionStack) -> Self {
+        Self { stack }
+    }
+}
+
+impl Drop for ResolutionGuard<'_> {
+    fn drop(&mut self) {
+        self.stack.pop();
+    }
 }
 
 /// Dependency injection extractor.
@@ -105,6 +284,7 @@ where
     type Error = T::Error;
 
     async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Check overrides first (testing support)
         if let Some(result) = ctx.dependency_overrides().resolve::<T>(ctx, req).await {
             return result.map(Depends::new);
         }
@@ -112,14 +292,28 @@ where
         let scope = C::SCOPE.unwrap_or(DependencyScope::Request);
         let use_cache = C::USE_CACHE && scope == DependencyScope::Request;
 
+        // Check cache - if already resolved, no cycle possible
         if use_cache {
             if let Some(cached) = ctx.dependency_cache().get::<T>() {
                 return Ok(Depends::new(cached));
             }
         }
 
+        // Check for circular dependency before attempting resolution
+        let type_name = std::any::type_name::<T>();
+        if let Some(cycle) = ctx.resolution_stack().check_cycle::<T>(type_name) {
+            let err = CircularDependencyError::new(cycle);
+            panic!("{}", err);
+        }
+
+        // Push onto resolution stack and create guard for automatic cleanup
+        ctx.resolution_stack().push::<T>(type_name);
+        let _guard = ResolutionGuard::new(ctx.resolution_stack());
+
+        // Resolve the dependency
         let value = T::from_dependency(ctx, req).await?;
 
+        // Cache if needed (guard will pop stack when dropped)
         if use_cache {
             ctx.dependency_cache().insert::<T>(value.clone());
         }
@@ -523,5 +717,256 @@ mod tests {
         let mut req = empty_request();
         let _ = futures_executor::block_on(Depends::<DepC>::from_request(&ctx, &mut req))
             .expect("complex graph resolution failed");
+    }
+
+    // ========================================================================
+    // Circular Dependency Detection Tests
+    // ========================================================================
+    //
+    // NOTE: Testing actual runtime circular dependencies between types is
+    // difficult because Rust's async trait machinery detects type-level
+    // cycles at compile time. Instead, we test:
+    // 1. The ResolutionStack directly (the core mechanism)
+    // 2. CircularDependencyError formatting
+    // 3. Diamond patterns (no false positives)
+    // ========================================================================
+
+    // Test: ResolutionStack detects simple A -> B -> A cycle
+    #[test]
+    fn resolution_stack_detects_simple_cycle() {
+        let stack = ResolutionStack::new();
+
+        // Simulate: A starts resolving
+        stack.push::<CounterDep>("TypeA");
+        assert!(stack.check_cycle::<CounterDep>("TypeA").is_none()); // A not on stack yet
+
+        // Simulate: A resolves B
+        stack.push::<ErrorDep>("TypeB");
+        assert!(stack.check_cycle::<ErrorDep>("TypeB").is_none());
+
+        // Simulate: B tries to resolve A (cycle!)
+        let cycle = stack.check_cycle::<CounterDep>("TypeA");
+        assert!(cycle.is_some(), "Should detect A -> B -> A cycle");
+        let cycle_path = cycle.unwrap();
+        assert_eq!(cycle_path.len(), 3); // TypeA, TypeB, TypeA
+        assert_eq!(cycle_path[0], "TypeA");
+        assert_eq!(cycle_path[1], "TypeB");
+        assert_eq!(cycle_path[2], "TypeA");
+    }
+
+    // Test: ResolutionStack detects long cycle A -> B -> C -> D -> A
+    #[test]
+    fn resolution_stack_detects_long_cycle() {
+        // Create unique marker types for the test
+        struct TypeA;
+        struct TypeB;
+        struct TypeC;
+        struct TypeD;
+
+        let stack = ResolutionStack::new();
+
+        // Simulate: A -> B -> C -> D -> A
+        stack.push::<TypeA>("TypeA");
+        stack.push::<TypeB>("TypeB");
+        stack.push::<TypeC>("TypeC");
+        stack.push::<TypeD>("TypeD");
+
+        // D tries to resolve A (cycle!)
+        let cycle = stack.check_cycle::<TypeA>("TypeA");
+        assert!(cycle.is_some(), "Should detect A -> B -> C -> D -> A cycle");
+        let cycle_path = cycle.unwrap();
+        assert_eq!(cycle_path.len(), 5); // TypeA, TypeB, TypeC, TypeD, TypeA
+        assert_eq!(cycle_path[0], "TypeA");
+        assert_eq!(cycle_path[4], "TypeA");
+    }
+
+    // Test: ResolutionStack allows diamond pattern (no false positive)
+    #[test]
+    fn resolution_stack_allows_diamond() {
+        struct Top;
+        struct Left;
+        struct Right;
+        struct Bottom;
+
+        let stack = ResolutionStack::new();
+
+        // Simulate: Top -> Left -> Bottom (complete Left branch)
+        stack.push::<Top>("Top");
+        stack.push::<Left>("Left");
+        stack.push::<Bottom>("Bottom");
+        stack.pop(); // Bottom done
+        stack.pop(); // Left done
+
+        // Simulate: Top -> Right -> Bottom (Right branch)
+        stack.push::<Right>("Right");
+        // Bottom again - but it's NOT a cycle because we popped it
+        assert!(
+            stack.check_cycle::<Bottom>("Bottom").is_none(),
+            "Diamond pattern should not be detected as a cycle"
+        );
+        stack.push::<Bottom>("Bottom");
+        stack.pop(); // Bottom done
+        stack.pop(); // Right done
+        stack.pop(); // Top done
+
+        assert!(stack.is_empty());
+    }
+
+    // Test: ResolutionStack detects self-dependency
+    #[test]
+    fn resolution_stack_detects_self_dependency() {
+        struct SelfRef;
+
+        let stack = ResolutionStack::new();
+        stack.push::<SelfRef>("SelfRef");
+
+        // Try to resolve same type again (self-cycle!)
+        let cycle = stack.check_cycle::<SelfRef>("SelfRef");
+        assert!(cycle.is_some(), "Should detect self-dependency");
+        let cycle_path = cycle.unwrap();
+        assert_eq!(cycle_path.len(), 2); // SelfRef, SelfRef
+        assert_eq!(cycle_path[0], "SelfRef");
+        assert_eq!(cycle_path[1], "SelfRef");
+    }
+
+    // Test: ResolutionStack basic functionality
+    #[test]
+    fn resolution_stack_basic() {
+        let stack = ResolutionStack::new();
+        assert!(stack.is_empty());
+        assert_eq!(stack.depth(), 0);
+
+        stack.push::<CounterDep>("CounterDep");
+        assert!(!stack.is_empty());
+        assert_eq!(stack.depth(), 1);
+
+        // No cycle yet - different type
+        assert!(stack.check_cycle::<ErrorDep>("ErrorDep").is_none());
+
+        // Push another type
+        stack.push::<ErrorDep>("ErrorDep");
+        assert_eq!(stack.depth(), 2);
+
+        // Check for cycle with first type - should detect it
+        let cycle = stack.check_cycle::<CounterDep>("CounterDep");
+        assert!(cycle.is_some());
+        let cycle_path = cycle.unwrap();
+        assert!(cycle_path.contains(&"CounterDep".to_string()));
+
+        // Pop and verify
+        stack.pop();
+        assert_eq!(stack.depth(), 1);
+        stack.pop();
+        assert!(stack.is_empty());
+    }
+
+    // Test: CircularDependencyError formatting
+    #[test]
+    fn circular_dependency_error_formatting() {
+        let err = CircularDependencyError::new(vec![
+            "DbPool".to_string(),
+            "UserService".to_string(),
+            "AuthService".to_string(),
+            "DbPool".to_string(),
+        ]);
+        let msg = err.to_string();
+        assert!(msg.contains("Circular dependency detected"));
+        assert!(msg.contains("DbPool -> UserService -> AuthService -> DbPool"));
+        assert_eq!(
+            err.cycle_path(),
+            "DbPool -> UserService -> AuthService -> DbPool"
+        );
+    }
+
+    // Test: CircularDependencyError into_response
+    #[test]
+    fn circular_dependency_error_into_response() {
+        let err =
+            CircularDependencyError::new(vec!["A".to_string(), "B".to_string(), "A".to_string()]);
+        let response = err.into_response();
+        assert_eq!(response.status().as_u16(), 500);
+    }
+
+    // Test: Diamond dependency graph resolves correctly (runtime test)
+    #[derive(Clone)]
+    struct DiamondBottom {
+        id: u32,
+    }
+    #[derive(Clone)]
+    struct DiamondLeft {
+        bottom_id: u32,
+    }
+    #[derive(Clone)]
+    struct DiamondRight {
+        bottom_id: u32,
+    }
+    #[derive(Clone)]
+    struct DiamondTop {
+        left_id: u32,
+        right_id: u32,
+    }
+
+    impl FromDependency for DiamondBottom {
+        type Error = HttpError;
+        async fn from_dependency(
+            _ctx: &RequestContext,
+            _req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            Ok(DiamondBottom { id: 42 })
+        }
+    }
+
+    impl FromDependency for DiamondLeft {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let bottom = Depends::<DiamondBottom>::from_request(ctx, req).await?;
+            Ok(DiamondLeft {
+                bottom_id: bottom.id,
+            })
+        }
+    }
+
+    impl FromDependency for DiamondRight {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let bottom = Depends::<DiamondBottom>::from_request(ctx, req).await?;
+            Ok(DiamondRight {
+                bottom_id: bottom.id,
+            })
+        }
+    }
+
+    impl FromDependency for DiamondTop {
+        type Error = HttpError;
+        async fn from_dependency(
+            ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let left = Depends::<DiamondLeft>::from_request(ctx, req).await?;
+            let right = Depends::<DiamondRight>::from_request(ctx, req).await?;
+            Ok(DiamondTop {
+                left_id: left.bottom_id,
+                right_id: right.bottom_id,
+            })
+        }
+    }
+
+    #[test]
+    fn diamond_pattern_resolves_correctly() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+        // Diamond pattern should NOT trigger circular dependency detection
+        let result =
+            futures_executor::block_on(Depends::<DiamondTop>::from_request(&ctx, &mut req));
+        assert!(result.is_ok(), "Diamond pattern should not be a cycle");
+        let top = result.unwrap();
+        assert_eq!(top.left_id, 42);
+        assert_eq!(top.right_id, 42);
     }
 }

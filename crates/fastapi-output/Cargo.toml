@@ -1,0 +1,27 @@
+[package]
+name = "fastapi-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent-aware rich console output for fastapi_rust"
+repository = "https://github.com/Dicklesworthstone/fastapi_rust"
+keywords = ["fastapi", "console", "terminal", "rich", "output"]
+categories = ["command-line-interface", "development-tools"]
+
+[dependencies]
+# Core terminal detection (always needed)
+crossterm = "0.28"
+
+# Rich output library (optional)
+rich_rust = { path = "/dp/rich_rust", optional = true }
+
+[features]
+default = ["rich"]
+rich = ["dep:rich_rust"]
+
+[dev-dependencies]
+# For testing
+
+[lints]
+workspace = true
