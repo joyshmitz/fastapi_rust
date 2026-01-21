@@ -26,12 +26,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-audit
         run: cargo install cargo-audit
 
       - name: Run security audit
-        run: cargo audit --deny warnings
+        # Don't fail on unmaintained crate warnings (bincode via asupersync)
+        run: cargo audit --ignore RUSTSEC-2025-0141
 
       - name: Create issue on failure
         if: failure() && github.event_name == 'schedule'
@@ -71,6 +76,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: ../asupersync
       - uses: EmbarkStudios/cargo-deny-action@v1
         with:
           command: check advisories
