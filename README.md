@@ -1,14 +1,10 @@
 # fastapi_rust
 
 <div align="center">
+  <img src="fastapi_rust_illustration.webp" alt="fastapi_rust - High-performance Rust web framework with FastAPI-inspired ergonomics">
+</div>
 
-```
-    ___           __  ___    ____  ____   ____             __
-   / __\__ _ ___ / /_/   |  / __ \/  _/  / __ \__  _______/ /_
-  / /_/ _ `/(_-</ __/ /| | / /_/ // /   / /_/ / / / / ___/ __/
- / __/\__,_/___/\__/_/ |_|/ .___/___/  / _, _/ /_/ (__  ) /_
-/_/                      /_/          /_/ |_|\__,_/____/\__/
-```
+<div align="center">
 
 **High-performance Rust web framework with FastAPI-inspired ergonomics**
 

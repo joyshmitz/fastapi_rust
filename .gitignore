@@ -17,3 +17,7 @@ Thumbs.db
 
 # BV lock file (ephemeral)
 .beads/.bv.lock
+
+# Source images (webp versions are committed instead)
+*.png
+._*.png
