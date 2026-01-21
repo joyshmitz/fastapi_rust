@@ -7,7 +7,7 @@ use asupersync::types::CancelReason;
 use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 use std::sync::Arc;
 
-use crate::dependency::{DependencyCache, DependencyOverrides, ResolutionStack};
+use crate::dependency::{CleanupStack, DependencyCache, DependencyOverrides, ResolutionStack};
 
 /// Request context that wraps asupersync's capability context.
 ///
@@ -43,6 +43,8 @@ pub struct RequestContext {
     dependency_overrides: Arc<DependencyOverrides>,
     /// Stack tracking dependencies currently being resolved (for cycle detection).
     resolution_stack: Arc<ResolutionStack>,
+    /// Cleanup functions to run after handler completion (LIFO order).
+    cleanup_stack: Arc<CleanupStack>,
 }
 
 impl RequestContext {
@@ -58,6 +60,7 @@ impl RequestContext {
             dependency_cache: Arc::new(DependencyCache::new()),
             dependency_overrides: Arc::new(DependencyOverrides::new()),
             resolution_stack: Arc::new(ResolutionStack::new()),
+            cleanup_stack: Arc::new(CleanupStack::new()),
         }
     }
 
@@ -70,6 +73,7 @@ impl RequestContext {
             dependency_cache: Arc::new(DependencyCache::new()),
             dependency_overrides: overrides,
             resolution_stack: Arc::new(ResolutionStack::new()),
+            cleanup_stack: Arc::new(CleanupStack::new()),
         }
     }
 
@@ -97,6 +101,14 @@ impl RequestContext {
     #[must_use]
     pub fn resolution_stack(&self) -> &ResolutionStack {
         &self.resolution_stack
+    }
+
+    /// Returns the cleanup stack for registering cleanup functions.
+    ///
+    /// Cleanup functions run after the handler completes in LIFO order.
+    #[must_use]
+    pub fn cleanup_stack(&self) -> &CleanupStack {
+        &self.cleanup_stack
     }
 
     /// Returns the underlying region ID from asupersync.

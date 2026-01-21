@@ -67,8 +67,9 @@ pub mod testing;
 
 pub use context::{CancelledError, IntoOutcome, RequestContext};
 pub use dependency::{
-    DefaultConfig, DefaultDependencyConfig, DependencyCache, DependencyOverrides, DependencyScope,
-    Depends, DependsConfig, FromDependency, NoCache,
+    CleanupFn, CleanupStack, DefaultConfig, DefaultDependencyConfig, DependencyCache,
+    DependencyOverrides, DependencyScope, Depends, DependsCleanup, DependsConfig, FromDependency,
+    FromDependencyWithCleanup, NoCache,
 };
 pub use error::{HttpError, LocItem, ValidationError, ValidationErrors};
 pub use extract::{

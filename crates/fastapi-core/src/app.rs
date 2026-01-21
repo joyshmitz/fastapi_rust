@@ -1260,6 +1260,9 @@ impl App {
                 let handler = RouteHandler { entry };
                 let response = self.middleware.execute(&handler, ctx, req).await;
 
+                // Run cleanup functions in LIFO order (even on error)
+                ctx.cleanup_stack().run_cleanups().await;
+
                 // Apply any response mutations set by the handler
                 if let Some(mutations) = req.get_extension::<crate::extract::ResponseMutations>() {
                     mutations.clone().apply(response)

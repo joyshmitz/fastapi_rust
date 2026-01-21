@@ -17,6 +17,7 @@ use crate::context::RequestContext;
 use crate::extract::FromRequest;
 use crate::request::Request;
 use crate::response::{IntoResponse, Response, ResponseBody, StatusCode};
+use parking_lot::Mutex;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -32,6 +33,284 @@ pub enum DependencyScope {
     Function,
     /// Cache for the lifetime of the request.
     Request,
+}
+
+// ============================================================================
+// Cleanup Stack (for Generator-style Dependencies)
+// ============================================================================
+
+/// Type alias for cleanup functions.
+///
+/// A cleanup function is an async closure that performs teardown work after
+/// the request handler completes. Cleanup functions run in LIFO (last-in,
+/// first-out) order, similar to Python's `contextlib.ExitStack`.
+pub type CleanupFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// Stack of cleanup functions to run after handler completion.
+///
+/// `CleanupStack` provides generator-style dependency lifecycle management
+/// similar to FastAPI's `yield` dependencies. Cleanup functions are registered
+/// during dependency resolution and run in LIFO order after the handler
+/// completes, even on error or panic.
+///
+/// # Example
+///
+/// ```ignore
+/// // Dependency with cleanup
+/// impl FromDependencyWithCleanup for DbConnection {
+///     type Value = DbConnection;
+///     type Error = HttpError;
+///
+///     async fn setup(ctx: &RequestContext, req: &mut Request)
+///         -> Result<(Self::Value, Option<CleanupFn>), Self::Error>
+///     {
+///         let conn = DbPool::get_connection().await?;
+///         let cleanup = {
+///             let conn = conn.clone();
+///             Box::new(move || {
+///                 Box::pin(async move {
+///                     conn.release().await;
+///                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
+///             }) as CleanupFn
+///         };
+///         Ok((conn, Some(cleanup)))
+///     }
+/// }
+/// ```
+///
+/// # Cleanup Order
+///
+/// Cleanup functions run in LIFO order (last registered runs first):
+///
+/// ```text
+/// Setup order:   A -> B -> C
+/// Cleanup order: C -> B -> A
+/// ```
+///
+/// This ensures that dependencies are cleaned up in the reverse order
+/// of their setup, maintaining proper resource lifecycle semantics.
+pub struct CleanupStack {
+    /// Cleanup functions in registration order (will be reversed when running).
+    cleanups: Mutex<Vec<CleanupFn>>,
+}
+
+impl CleanupStack {
+    /// Create an empty cleanup stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cleanups: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a cleanup function to run after handler completion.
+    ///
+    /// Cleanup functions are run in LIFO order (last registered runs first).
+    pub fn push(&self, cleanup: CleanupFn) {
+        let mut guard = self.cleanups.lock();
+        guard.push(cleanup);
+    }
+
+    /// Take all cleanup functions for execution.
+    ///
+    /// Returns cleanups in LIFO order (reversed from registration order).
+    /// After calling this, the stack is empty.
+    pub fn take_cleanups(&self) -> Vec<CleanupFn> {
+        let mut guard = self.cleanups.lock();
+        let mut cleanups = std::mem::take(&mut *guard);
+        cleanups.reverse(); // LIFO order
+        cleanups
+    }
+
+    /// Returns the number of registered cleanup functions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let guard = self.cleanups.lock();
+        guard.len()
+    }
+
+    /// Returns true if no cleanup functions are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Run all cleanup functions in LIFO order.
+    ///
+    /// This consumes all registered cleanup functions. Each cleanup is
+    /// awaited in sequence. If a cleanup function panics, the remaining
+    /// cleanups are still attempted.
+    ///
+    /// # Returns
+    ///
+    /// The number of cleanup functions that completed successfully.
+    pub async fn run_cleanups(&self) -> usize {
+        let cleanups = self.take_cleanups();
+        let mut completed = 0;
+
+        for cleanup in cleanups {
+            // Run each cleanup, catching panics to ensure all cleanups run
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cleanup));
+            match result {
+                Ok(future) => {
+                    future.await;
+                    completed += 1;
+                }
+                Err(_) => {
+                    // Cleanup panicked during creation, continue with remaining cleanups
+                }
+            }
+        }
+
+        completed
+    }
+}
+
+impl Default for CleanupStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for CleanupStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CleanupStack")
+            .field("count", &self.len())
+            .finish()
+    }
+}
+
+/// Trait for dependencies that require cleanup after handler completion.
+///
+/// This is similar to FastAPI's `yield` dependencies. Dependencies implementing
+/// this trait can perform setup logic and register cleanup functions that
+/// run after the request handler completes.
+///
+/// # Example
+///
+/// ```ignore
+/// struct DbTransaction {
+///     tx: Transaction,
+/// }
+///
+/// impl FromDependencyWithCleanup for DbTransaction {
+///     type Value = DbTransaction;
+///     type Error = HttpError;
+///
+///     async fn setup(ctx: &RequestContext, req: &mut Request)
+///         -> Result<(Self::Value, Option<CleanupFn>), Self::Error>
+///     {
+///         let pool = Depends::<DbPool>::from_request(ctx, req).await?;
+///         let tx = pool.begin().await.map_err(|_| HttpError::internal())?;
+///
+///         let cleanup_tx = tx.clone();
+///         let cleanup = Box::new(move || {
+///             Box::pin(async move {
+///                 // Commit or rollback happens here
+///                 cleanup_tx.commit().await.ok();
+///             }) as Pin<Box<dyn Future<Output = ()> + Send>>
+///         }) as CleanupFn;
+///
+///         Ok((DbTransaction { tx }, Some(cleanup)))
+///     }
+/// }
+/// ```
+pub trait FromDependencyWithCleanup: Clone + Send + Sync + 'static {
+    /// The value type produced by setup.
+    type Value: Clone + Send + Sync + 'static;
+    /// Error type when setup fails.
+    type Error: IntoResponse + Send + Sync + 'static;
+
+    /// Set up the dependency and optionally return a cleanup function.
+    ///
+    /// The cleanup function (if provided) will run after the request handler
+    /// completes, even on error or panic.
+    fn setup(
+        ctx: &RequestContext,
+        req: &mut Request,
+    ) -> impl Future<Output = Result<(Self::Value, Option<CleanupFn>), Self::Error>> + Send;
+}
+
+/// Wrapper for dependencies that have cleanup callbacks.
+///
+/// `DependsCleanup` works like `Depends` but for types implementing
+/// `FromDependencyWithCleanup`. It automatically registers cleanup
+/// functions with the request's cleanup stack.
+#[derive(Debug, Clone)]
+pub struct DependsCleanup<T, C = DefaultDependencyConfig>(pub T, PhantomData<C>);
+
+impl<T, C> DependsCleanup<T, C> {
+    /// Create a new `DependsCleanup` wrapper.
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self(value, PhantomData)
+    }
+
+    /// Unwrap the inner value.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T, C> Deref for DependsCleanup<T, C> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, C> DerefMut for DependsCleanup<T, C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T, C> FromRequest for DependsCleanup<T, C>
+where
+    T: FromDependencyWithCleanup<Value = T>,
+    C: DependsConfig,
+{
+    type Error = T::Error;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let scope = C::SCOPE.unwrap_or(DependencyScope::Request);
+        let use_cache = C::USE_CACHE && scope == DependencyScope::Request;
+
+        // Check cache first
+        if use_cache {
+            if let Some(cached) = ctx.dependency_cache().get::<T::Value>() {
+                return Ok(DependsCleanup::new(cached));
+            }
+        }
+
+        // Check for circular dependency
+        let type_name = std::any::type_name::<T>();
+        if let Some(cycle) = ctx.resolution_stack().check_cycle::<T>(type_name) {
+            let err = CircularDependencyError::new(cycle);
+            panic!("{}", err);
+        }
+
+        // Push onto resolution stack
+        ctx.resolution_stack().push::<T>(type_name);
+        let _guard = ResolutionGuard::new(ctx.resolution_stack());
+
+        // Setup the dependency
+        let (value, cleanup) = T::setup(ctx, req).await?;
+
+        // Register cleanup if provided
+        if let Some(cleanup_fn) = cleanup {
+            ctx.cleanup_stack().push(cleanup_fn);
+        }
+
+        // Cache if needed
+        if use_cache {
+            ctx.dependency_cache().insert::<T::Value>(value.clone());
+        }
+
+        Ok(DependsCleanup::new(value))
+    }
 }
 
 /// Configuration for `Depends` resolution.
