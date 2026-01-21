@@ -44,16 +44,20 @@
 //! server.serve(handler).await?;
 //! ```
 
-use crate::parser::{ParseError, ParseLimits, Parser};
+use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
+use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::{TcpListener, TcpStream};
+use asupersync::stream::Stream;
 use asupersync::{Budget, Cx, Time};
 use fastapi_core::{Request, RequestContext, Response};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 
 /// Default request timeout in seconds.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -343,25 +347,70 @@ impl TcpServer {
     /// multiple requests on the same connection.
     async fn handle_connection<H, Fut>(
         &self,
-        _ctx: &RequestContext,
-        _stream: TcpStream,
+        ctx: &RequestContext,
+        mut stream: TcpStream,
         _peer_addr: SocketAddr,
-        _handler: &H,
+        handler: &H,
     ) -> Result<(), ServerError>
     where
         H: Fn(RequestContext, Request) -> Fut + Send + Sync,
         Fut: Future<Output = Response> + Send,
     {
-        // TODO: Implement once asupersync TcpStream has read/write methods.
-        // This is scaffolding for the TCP server integration (Phase 1).
-        //
-        // The implementation needs:
-        // - AsyncReadExt::read() on TcpStream
-        // - AsyncWriteExt::write_all() on TcpStream
-        // - ResponseWrite to have an as_bytes() method or similar
-        //
-        // For now, this is a stub to allow compilation.
-        todo!("TCP connection handling pending asupersync I/O completion")
+        let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
+        let mut read_buffer = vec![0u8; self.config.read_buffer_size];
+        let mut response_writer = ResponseWriter::new();
+
+        loop {
+            // Check for cancellation
+            if ctx.cx().is_cancel_requested() {
+                return Ok(());
+            }
+
+            // Try to parse a complete request from buffered data first
+            let parse_result = parser.feed(&[])?;
+
+            let request = match parse_result {
+                ParseStatus::Complete { request, .. } => request,
+                ParseStatus::Incomplete => {
+                    // Need more data - read from stream
+                    let bytes_read = read_into_buffer(&mut stream, &mut read_buffer).await?;
+
+                    if bytes_read == 0 {
+                        // Connection closed by client
+                        return Ok(());
+                    }
+
+                    // Feed new data to parser
+                    match parser.feed(&read_buffer[..bytes_read])? {
+                        ParseStatus::Complete { request, .. } => request,
+                        ParseStatus::Incomplete => {
+                            // Still incomplete, continue reading
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Generate unique request ID for this request
+            let request_id = self.next_request_id();
+            let request_cx = Cx::for_testing(); // TODO: derive from connection region
+            let request_ctx = RequestContext::new(request_cx, request_id);
+
+            // Check if this is a keep-alive connection
+            let keep_alive = should_keep_alive(&request);
+
+            // Call the handler
+            let response = handler(request_ctx, request).await;
+
+            // Write the response
+            let response_write = response_writer.write(response);
+            write_response(&mut stream, response_write).await?;
+
+            // If not keep-alive, close the connection
+            if !keep_alive {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -378,6 +427,93 @@ fn is_fatal_accept_error(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::NotConnected | io::ErrorKind::InvalidInput
     )
+}
+
+/// Reads data from a TCP stream into a buffer.
+///
+/// Returns the number of bytes read, or 0 if the connection was closed.
+async fn read_into_buffer(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Result<usize> {
+    use std::future::poll_fn;
+
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buffer);
+        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Writes a response to a TCP stream.
+///
+/// Handles both full (buffered) and streaming (chunked) responses.
+async fn write_response(stream: &mut TcpStream, response: ResponseWrite) -> io::Result<()> {
+    use std::future::poll_fn;
+
+    match response {
+        ResponseWrite::Full(bytes) => {
+            write_all(stream, &bytes).await?;
+        }
+        ResponseWrite::Stream(mut encoder) => {
+            // Write chunks as they become available
+            loop {
+                let chunk = poll_fn(|cx| Pin::new(&mut encoder).poll_next(cx)).await;
+                match chunk {
+                    Some(bytes) => {
+                        write_all(stream, &bytes).await?;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Flush the stream
+    poll_fn(|cx| Pin::new(&mut *stream).poll_flush(cx)).await?;
+
+    Ok(())
+}
+
+/// Writes all bytes to a stream.
+async fn write_all(stream: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
+    use std::future::poll_fn;
+
+    while !buf.is_empty() {
+        let n = poll_fn(|cx| Pin::new(&mut *stream).poll_write(cx, buf)).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+/// Determines if a connection should be kept alive based on HTTP headers.
+///
+/// HTTP/1.1 defaults to keep-alive unless "Connection: close" is present.
+/// HTTP/1.0 requires explicit "Connection: keep-alive".
+fn should_keep_alive(request: &Request) -> bool {
+    // Check for Connection header
+    if let Some(connection) = request.headers().get("connection") {
+        if let Ok(value) = std::str::from_utf8(connection) {
+            let value = value.to_ascii_lowercase();
+            if value.contains("close") {
+                return false;
+            }
+            if value.contains("keep-alive") {
+                return true;
+            }
+        }
+    }
+
+    // HTTP/1.1 defaults to keep-alive
+    // For simplicity, we assume HTTP/1.1 for now
+    true
 }
 
 // ============================================================================
@@ -484,5 +620,55 @@ mod tests {
         let request = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let result = server.parse_request(request);
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Keep-alive detection tests
+    // ========================================================================
+
+    #[test]
+    fn keep_alive_default_http11() {
+        // HTTP/1.1 defaults to keep-alive
+        let mut request = Request::new(fastapi_core::Method::Get, "/path".to_string());
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"example.com".to_vec());
+        assert!(should_keep_alive(&request));
+    }
+
+    #[test]
+    fn keep_alive_explicit_keep_alive() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/path".to_string());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"keep-alive".to_vec());
+        assert!(should_keep_alive(&request));
+    }
+
+    #[test]
+    fn keep_alive_connection_close() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/path".to_string());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"close".to_vec());
+        assert!(!should_keep_alive(&request));
+    }
+
+    #[test]
+    fn keep_alive_connection_close_case_insensitive() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/path".to_string());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"CLOSE".to_vec());
+        assert!(!should_keep_alive(&request));
+    }
+
+    #[test]
+    fn keep_alive_multiple_values() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/path".to_string());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"keep-alive, upgrade".to_vec());
+        assert!(should_keep_alive(&request));
     }
 }
