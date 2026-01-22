@@ -8,6 +8,8 @@
 
 **High-performance Rust web framework with FastAPI-inspired ergonomics**
 
+*A Rust port inspired by [tiangolo/fastapi](https://github.com/tiangolo/fastapi) (Python), extended with [asupersync](https://github.com/Dicklesworthstone/asupersync) for structured concurrency, zero-copy parsing, and deterministic testing.*
+
 [![License: MIT](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-early%20development-yellow.svg)]()
