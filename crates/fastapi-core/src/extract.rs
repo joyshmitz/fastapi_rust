@@ -5912,6 +5912,490 @@ impl SecureCompare for Vec<u8> {
     }
 }
 
+// ============================================================================
+// Pagination Extractor and Response
+// ============================================================================
+
+/// Default page number (1-indexed).
+pub const DEFAULT_PAGE: u64 = 1;
+/// Default items per page.
+pub const DEFAULT_PER_PAGE: u64 = 20;
+/// Maximum items per page (to prevent abuse).
+pub const MAX_PER_PAGE: u64 = 100;
+
+/// Pagination query parameters extractor.
+///
+/// Extracts common pagination parameters from the query string:
+/// - `page`: Current page number (1-indexed, default: 1)
+/// - `per_page` or `limit`: Items per page (default: 20, max: 100)
+/// - `offset`: Alternative to page-based pagination (overrides page if set)
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::Pagination;
+///
+/// #[get("/items")]
+/// async fn list_items(cx: &Cx, pagination: Pagination) -> impl IntoResponse {
+///     let offset = pagination.offset();
+///     let limit = pagination.limit();
+///
+///     // Fetch items from database with offset and limit
+///     let items = db.fetch_items(offset, limit).await;
+///
+///     // Return paginated response
+///     pagination.paginate(items, total_count, "/items")
+/// }
+/// ```
+///
+/// # Query String Formats
+///
+/// ```text
+/// # Page-based (preferred)
+/// ?page=2&per_page=10
+///
+/// # Using limit alias
+/// ?page=2&limit=10
+///
+/// # Offset-based (for cursor-style pagination)
+/// ?offset=20&limit=10
+/// ```
+///
+/// # Configuration
+///
+/// Use [`PaginationConfig`] to customize defaults and limits:
+///
+/// ```ignore
+/// use fastapi_core::{Pagination, PaginationConfig};
+///
+/// let config = PaginationConfig::new()
+///     .default_per_page(50)
+///     .max_per_page(200);
+///
+/// // The config can be stored in app state and used by handlers
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pagination {
+    /// Current page (1-indexed).
+    page: u64,
+    /// Items per page.
+    per_page: u64,
+    /// Explicit offset (overrides page calculation if set).
+    offset: Option<u64>,
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            page: DEFAULT_PAGE,
+            per_page: DEFAULT_PER_PAGE,
+            offset: None,
+        }
+    }
+}
+
+impl Pagination {
+    /// Create pagination with specific values.
+    #[must_use]
+    pub fn new(page: u64, per_page: u64) -> Self {
+        Self {
+            page: page.max(1),
+            per_page: per_page.clamp(1, MAX_PER_PAGE),
+            offset: None,
+        }
+    }
+
+    /// Create pagination from offset and limit.
+    #[must_use]
+    pub fn from_offset(offset: u64, limit: u64) -> Self {
+        Self {
+            page: (offset / limit.max(1)) + 1,
+            per_page: limit.clamp(1, MAX_PER_PAGE),
+            offset: Some(offset),
+        }
+    }
+
+    /// Get the current page number (1-indexed).
+    #[must_use]
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// Get the number of items per page.
+    #[must_use]
+    pub fn per_page(&self) -> u64 {
+        self.per_page
+    }
+
+    /// Alias for `per_page()` - returns the page size limit.
+    #[must_use]
+    pub fn limit(&self) -> u64 {
+        self.per_page
+    }
+
+    /// Calculate the offset for database queries.
+    ///
+    /// If an explicit offset was provided, returns that.
+    /// Otherwise, calculates from page number: `(page - 1) * per_page`.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset.unwrap_or_else(|| (self.page.saturating_sub(1)) * self.per_page)
+    }
+
+    /// Calculate total number of pages given a total item count.
+    #[must_use]
+    pub fn total_pages(&self, total_items: u64) -> u64 {
+        if self.per_page == 0 {
+            return 0;
+        }
+        total_items.div_ceil(self.per_page)
+    }
+
+    /// Check if there is a next page.
+    #[must_use]
+    pub fn has_next(&self, total_items: u64) -> bool {
+        self.page < self.total_pages(total_items)
+    }
+
+    /// Check if there is a previous page.
+    #[must_use]
+    pub fn has_prev(&self) -> bool {
+        self.page > 1
+    }
+
+    /// Create a paginated response from items.
+    ///
+    /// # Arguments
+    ///
+    /// * `items` - The items for the current page
+    /// * `total` - Total number of items across all pages
+    /// * `base_url` - Base URL for generating Link headers (e.g., "/api/items")
+    #[must_use]
+    pub fn paginate<T>(self, items: Vec<T>, total: u64, base_url: &str) -> Page<T> {
+        Page::new(items, total, self, base_url.to_string())
+    }
+}
+
+impl FromRequest for Pagination {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let query = req
+            .get_extension::<QueryParams>()
+            .cloned()
+            .unwrap_or_default();
+
+        // Parse page (1-indexed, default 1)
+        let page = query
+            .get("page")
+            .and_then(|v: &str| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PAGE)
+            .max(1);
+
+        // Parse per_page or limit (default 20, max 100)
+        let per_page = query
+            .get("per_page")
+            .or_else(|| query.get("limit"))
+            .and_then(|v: &str| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PER_PAGE)
+            .clamp(1, MAX_PER_PAGE);
+
+        // Parse offset (optional, overrides page if present)
+        let offset = query
+            .get("offset")
+            .and_then(|v: &str| v.parse::<u64>().ok());
+
+        Ok(Pagination {
+            page,
+            per_page,
+            offset,
+        })
+    }
+}
+
+/// Configuration for pagination behavior.
+///
+/// Use this to customize default values and limits for pagination.
+#[derive(Debug, Clone, Copy)]
+pub struct PaginationConfig {
+    /// Default items per page when not specified.
+    pub default_per_page: u64,
+    /// Maximum allowed items per page.
+    pub max_per_page: u64,
+    /// Default page number (usually 1).
+    pub default_page: u64,
+}
+
+impl Default for PaginationConfig {
+    fn default() -> Self {
+        Self {
+            default_per_page: DEFAULT_PER_PAGE,
+            max_per_page: MAX_PER_PAGE,
+            default_page: DEFAULT_PAGE,
+        }
+    }
+}
+
+impl PaginationConfig {
+    /// Create a new pagination configuration with defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the default items per page.
+    #[must_use]
+    pub fn default_per_page(mut self, value: u64) -> Self {
+        self.default_per_page = value;
+        self
+    }
+
+    /// Set the maximum items per page.
+    #[must_use]
+    pub fn max_per_page(mut self, value: u64) -> Self {
+        self.max_per_page = value;
+        self
+    }
+
+    /// Set the default page number.
+    #[must_use]
+    pub fn default_page(mut self, value: u64) -> Self {
+        self.default_page = value;
+        self
+    }
+}
+
+/// Paginated response wrapper.
+///
+/// Wraps a collection of items with pagination metadata and generates
+/// RFC 5988 Link headers for navigation.
+///
+/// # JSON Response Format
+///
+/// ```json
+/// {
+///     "items": [...],
+///     "total": 100,
+///     "page": 2,
+///     "per_page": 20,
+///     "pages": 5
+/// }
+/// ```
+///
+/// # Link Headers
+///
+/// When converted to a response, includes RFC 5988 Link headers:
+///
+/// ```text
+/// Link: </items?page=1&per_page=20>; rel="first",
+///       </items?page=1&per_page=20>; rel="prev",
+///       </items?page=3&per_page=20>; rel="next",
+///       </items?page=5&per_page=20>; rel="last"
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{Pagination, Page};
+///
+/// #[get("/users")]
+/// async fn list_users(cx: &Cx, pagination: Pagination) -> impl IntoResponse {
+///     let users = fetch_users(pagination.offset(), pagination.limit()).await;
+///     let total = count_users().await;
+///
+///     pagination.paginate(users, total, "/users")
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    /// Items for the current page.
+    pub items: Vec<T>,
+    /// Total number of items across all pages.
+    pub total: u64,
+    /// Current page number (1-indexed).
+    pub page: u64,
+    /// Items per page.
+    pub per_page: u64,
+    /// Total number of pages.
+    pub pages: u64,
+    /// Base URL for Link header generation.
+    base_url: String,
+}
+
+impl<T> Page<T> {
+    /// Create a new paginated response.
+    #[must_use]
+    pub fn new(items: Vec<T>, total: u64, pagination: Pagination, base_url: String) -> Self {
+        let pages = pagination.total_pages(total);
+        Self {
+            items,
+            total,
+            page: pagination.page(),
+            per_page: pagination.per_page(),
+            pages,
+            base_url,
+        }
+    }
+
+    /// Create a page with explicit values (for testing or manual construction).
+    #[must_use]
+    pub fn with_values(
+        items: Vec<T>,
+        total: u64,
+        page: u64,
+        per_page: u64,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let pages = if per_page > 0 {
+            total.div_ceil(per_page)
+        } else {
+            0
+        };
+        Self {
+            items,
+            total,
+            page,
+            per_page,
+            pages,
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Get the number of items on the current page.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Check if the page is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Check if there is a next page.
+    #[must_use]
+    pub fn has_next(&self) -> bool {
+        self.page < self.pages
+    }
+
+    /// Check if there is a previous page.
+    #[must_use]
+    pub fn has_prev(&self) -> bool {
+        self.page > 1
+    }
+
+    /// Generate RFC 5988 Link header value.
+    ///
+    /// Returns a string with Link headers for navigation:
+    /// - `first`: Link to the first page
+    /// - `prev`: Link to the previous page (if applicable)
+    /// - `next`: Link to the next page (if applicable)
+    /// - `last`: Link to the last page
+    #[must_use]
+    pub fn link_header(&self) -> String {
+        let mut links = Vec::with_capacity(4);
+
+        // Always include first and last
+        links.push(format!(
+            "<{}?page=1&per_page={}>; rel=\"first\"",
+            self.base_url, self.per_page
+        ));
+
+        // Previous page (if not on first page)
+        if self.has_prev() {
+            links.push(format!(
+                "<{}?page={}&per_page={}>; rel=\"prev\"",
+                self.base_url,
+                self.page - 1,
+                self.per_page
+            ));
+        }
+
+        // Next page (if not on last page)
+        if self.has_next() {
+            links.push(format!(
+                "<{}?page={}&per_page={}>; rel=\"next\"",
+                self.base_url,
+                self.page + 1,
+                self.per_page
+            ));
+        }
+
+        // Last page
+        links.push(format!(
+            "<{}?page={}&per_page={}>; rel=\"last\"",
+            self.base_url, self.pages, self.per_page
+        ));
+
+        links.join(", ")
+    }
+
+    /// Map the items using a transformation function.
+    pub fn map<U, F>(self, f: F) -> Page<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        Page {
+            items: self.items.into_iter().map(f).collect(),
+            total: self.total,
+            page: self.page,
+            per_page: self.per_page,
+            pages: self.pages,
+            base_url: self.base_url,
+        }
+    }
+}
+
+/// JSON representation of a paginated response.
+#[derive(serde::Serialize)]
+struct PageJson<'a, T: serde::Serialize> {
+    items: &'a Vec<T>,
+    total: u64,
+    page: u64,
+    per_page: u64,
+    pages: u64,
+}
+
+impl<T: serde::Serialize> IntoResponse for Page<T> {
+    fn into_response(self) -> crate::response::Response {
+        let json_body = PageJson {
+            items: &self.items,
+            total: self.total,
+            page: self.page,
+            per_page: self.per_page,
+            pages: self.pages,
+        };
+
+        // Serialize to JSON
+        let Ok(body_bytes) = serde_json::to_vec(&json_body) else {
+            // Fallback to empty error response on serialization failure
+            return crate::response::Response::with_status(
+                crate::response::StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .header("content-type", b"application/json".to_vec())
+            .body(crate::response::ResponseBody::Bytes(
+                b"{\"error\":\"Serialization failed\"}".to_vec(),
+            ));
+        };
+
+        // Build response with Link header
+        let link_header = self.link_header();
+
+        crate::response::Response::ok()
+            .header("content-type", b"application/json".to_vec())
+            .header("link", link_header.into_bytes())
+            .header(
+                "x-total-count",
+                self.total.to_string().into_bytes(),
+            )
+            .header("x-page", self.page.to_string().into_bytes())
+            .header("x-per-page", self.per_page.to_string().into_bytes())
+            .header("x-total-pages", self.pages.to_string().into_bytes())
+            .body(crate::response::ResponseBody::Bytes(body_bytes))
+    }
+}
+
 /// Multiple header values extractor.
 ///
 /// Extracts all values for a header that may appear multiple times.
@@ -7129,6 +7613,429 @@ mod secure_compare_tests {
 
         // Both should take the same code path (all 13 bytes XORed)
         // We can't easily verify timing in unit tests, but we verify correctness
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::IntoResponse;
+
+    // Helper to create a test context
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    // ========================================================================
+    // Pagination struct tests
+    // ========================================================================
+
+    #[test]
+    fn pagination_default_values() {
+        let p = Pagination::default();
+        assert_eq!(p.page(), DEFAULT_PAGE);
+        assert_eq!(p.per_page(), DEFAULT_PER_PAGE);
+        assert_eq!(p.limit(), DEFAULT_PER_PAGE);
+        assert_eq!(p.offset(), 0);
+    }
+
+    #[test]
+    fn pagination_new() {
+        let p = Pagination::new(3, 50);
+        assert_eq!(p.page(), 3);
+        assert_eq!(p.per_page(), 50);
+        assert_eq!(p.offset(), 100); // (3-1) * 50
+    }
+
+    #[test]
+    fn pagination_new_clamps_per_page() {
+        // Below minimum
+        let p = Pagination::new(1, 0);
+        assert_eq!(p.per_page(), 1);
+
+        // Above maximum
+        let p = Pagination::new(1, 1000);
+        assert_eq!(p.per_page(), MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn pagination_new_clamps_page() {
+        // Page 0 should become 1
+        let p = Pagination::new(0, 20);
+        assert_eq!(p.page(), 1);
+    }
+
+    #[test]
+    fn pagination_from_offset() {
+        let p = Pagination::from_offset(40, 20);
+        assert_eq!(p.offset(), 40); // Explicit offset preserved
+        assert_eq!(p.per_page(), 20);
+        assert_eq!(p.page(), 3); // 40/20 + 1
+    }
+
+    #[test]
+    fn pagination_total_pages() {
+        let p = Pagination::new(1, 10);
+        assert_eq!(p.total_pages(0), 0);
+        assert_eq!(p.total_pages(10), 1);
+        assert_eq!(p.total_pages(11), 2);
+        assert_eq!(p.total_pages(100), 10);
+    }
+
+    #[test]
+    fn pagination_has_next_prev() {
+        let p = Pagination::new(1, 10);
+        assert!(!p.has_prev());
+        assert!(p.has_next(100));
+
+        let p = Pagination::new(5, 10);
+        assert!(p.has_prev());
+        assert!(p.has_next(100));
+
+        let p = Pagination::new(10, 10);
+        assert!(p.has_prev());
+        assert!(!p.has_next(100));
+    }
+
+    // ========================================================================
+    // Pagination extractor tests
+    // ========================================================================
+
+    #[test]
+    fn pagination_extractor_default_params() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items");
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.page(), DEFAULT_PAGE);
+        assert_eq!(p.per_page(), DEFAULT_PER_PAGE);
+    }
+
+    #[test]
+    fn pagination_extractor_page_param() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?page=5");
+        req.insert_extension(QueryParams::parse("page=5"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.page(), 5);
+        assert_eq!(p.per_page(), DEFAULT_PER_PAGE);
+    }
+
+    #[test]
+    fn pagination_extractor_per_page_param() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?per_page=50");
+        req.insert_extension(QueryParams::parse("per_page=50"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.page(), DEFAULT_PAGE);
+        assert_eq!(p.per_page(), 50);
+    }
+
+    #[test]
+    fn pagination_extractor_limit_alias() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?limit=25");
+        req.insert_extension(QueryParams::parse("limit=25"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.per_page(), 25);
+    }
+
+    #[test]
+    fn pagination_extractor_offset_param() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?offset=40&limit=10");
+        req.insert_extension(QueryParams::parse("offset=40&limit=10"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.offset(), 40);
+        assert_eq!(p.per_page(), 10);
+    }
+
+    #[test]
+    fn pagination_extractor_clamps_max_per_page() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?per_page=1000");
+        req.insert_extension(QueryParams::parse("per_page=1000"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.per_page(), MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn pagination_extractor_invalid_page_uses_default() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/items?page=abc");
+        req.insert_extension(QueryParams::parse("page=abc"));
+
+        let p = futures_executor::block_on(Pagination::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(p.page(), DEFAULT_PAGE);
+    }
+
+    // ========================================================================
+    // Page struct tests
+    // ========================================================================
+
+    #[test]
+    fn page_new() {
+        let items = vec!["a", "b", "c"];
+        let pagination = Pagination::new(2, 10);
+        let page = Page::new(items.clone(), 100, pagination, "/items".to_string());
+
+        assert_eq!(page.items, items);
+        assert_eq!(page.total, 100);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.per_page, 10);
+        assert_eq!(page.pages, 10);
+    }
+
+    #[test]
+    fn page_with_values() {
+        let items = vec![1, 2, 3];
+        let page = Page::with_values(items.clone(), 50, 3, 10, "/users");
+
+        assert_eq!(page.items, items);
+        assert_eq!(page.total, 50);
+        assert_eq!(page.page, 3);
+        assert_eq!(page.per_page, 10);
+        assert_eq!(page.pages, 5);
+    }
+
+    #[test]
+    fn page_len_is_empty() {
+        let page: Page<i32> = Page::with_values(vec![], 0, 1, 10, "/items");
+        assert!(page.is_empty());
+        assert_eq!(page.len(), 0);
+
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        assert!(!page.is_empty());
+        assert_eq!(page.len(), 3);
+    }
+
+    #[test]
+    fn page_has_next_prev() {
+        // First page
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        assert!(!page.has_prev());
+        assert!(page.has_next());
+
+        // Middle page
+        let page = Page::with_values(vec![1, 2, 3], 100, 5, 10, "/items");
+        assert!(page.has_prev());
+        assert!(page.has_next());
+
+        // Last page
+        let page = Page::with_values(vec![1, 2, 3], 100, 10, 10, "/items");
+        assert!(page.has_prev());
+        assert!(!page.has_next());
+    }
+
+    #[test]
+    fn page_map() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        let mapped = page.map(|n| n * 2);
+
+        assert_eq!(mapped.items, vec![2, 4, 6]);
+        assert_eq!(mapped.total, 100);
+        assert_eq!(mapped.page, 1);
+    }
+
+    // ========================================================================
+    // Link header tests
+    // ========================================================================
+
+    #[test]
+    fn page_link_header_first_page() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        let link = page.link_header();
+
+        assert!(link.contains("rel=\"first\""));
+        assert!(link.contains("rel=\"last\""));
+        assert!(link.contains("rel=\"next\""));
+        assert!(!link.contains("rel=\"prev\"")); // No prev on first page
+        assert!(link.contains("page=1"));
+        assert!(link.contains("page=2")); // Next page
+        assert!(link.contains("page=10")); // Last page
+    }
+
+    #[test]
+    fn page_link_header_middle_page() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 5, 10, "/items");
+        let link = page.link_header();
+
+        assert!(link.contains("rel=\"first\""));
+        assert!(link.contains("rel=\"last\""));
+        assert!(link.contains("rel=\"next\""));
+        assert!(link.contains("rel=\"prev\""));
+        assert!(link.contains("page=4")); // Prev page
+        assert!(link.contains("page=6")); // Next page
+    }
+
+    #[test]
+    fn page_link_header_last_page() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 10, 10, "/items");
+        let link = page.link_header();
+
+        assert!(link.contains("rel=\"first\""));
+        assert!(link.contains("rel=\"last\""));
+        assert!(!link.contains("rel=\"next\"")); // No next on last page
+        assert!(link.contains("rel=\"prev\""));
+        assert!(link.contains("page=9")); // Prev page
+    }
+
+    #[test]
+    fn page_link_header_single_page() {
+        let page = Page::with_values(vec![1, 2, 3], 3, 1, 10, "/items");
+        let link = page.link_header();
+
+        assert!(link.contains("rel=\"first\""));
+        assert!(link.contains("rel=\"last\""));
+        assert!(!link.contains("rel=\"next\"")); // Only one page
+        assert!(!link.contains("rel=\"prev\""));
+    }
+
+    // ========================================================================
+    // IntoResponse tests
+    // ========================================================================
+
+    #[test]
+    fn page_into_response_status_ok() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        let response = page.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn page_into_response_content_type() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        let response = page.into_response();
+
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "content-type");
+        assert!(content_type.is_some());
+        assert_eq!(content_type.unwrap().1, b"application/json");
+    }
+
+    #[test]
+    fn page_into_response_has_link_header() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
+        let response = page.into_response();
+
+        let link_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "link");
+        assert!(link_header.is_some());
+
+        let link_value = String::from_utf8_lossy(&link_header.unwrap().1);
+        assert!(link_value.contains("rel=\"first\""));
+    }
+
+    #[test]
+    fn page_into_response_has_pagination_headers() {
+        let page = Page::with_values(vec![1, 2, 3], 100, 2, 10, "/items");
+        let response = page.into_response();
+
+        let get_header = |name: &str| {
+            response
+                .headers()
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| String::from_utf8_lossy(v).to_string())
+        };
+
+        assert_eq!(get_header("x-total-count"), Some("100".to_string()));
+        assert_eq!(get_header("x-page"), Some("2".to_string()));
+        assert_eq!(get_header("x-per-page"), Some("10".to_string()));
+        assert_eq!(get_header("x-total-pages"), Some("10".to_string()));
+    }
+
+    #[test]
+    fn page_into_response_json_body() {
+        let page = Page::with_values(vec!["a", "b", "c"], 100, 2, 10, "/items");
+        let response = page.into_response();
+
+        let body_str = match response.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        // Parse and verify JSON structure
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(json["items"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(json["total"], 100);
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["per_page"], 10);
+        assert_eq!(json["pages"], 10);
+    }
+
+    // ========================================================================
+    // PaginationConfig tests
+    // ========================================================================
+
+    #[test]
+    fn pagination_config_default() {
+        let config = PaginationConfig::default();
+        assert_eq!(config.default_per_page, DEFAULT_PER_PAGE);
+        assert_eq!(config.max_per_page, MAX_PER_PAGE);
+        assert_eq!(config.default_page, DEFAULT_PAGE);
+    }
+
+    #[test]
+    fn pagination_config_builder() {
+        let config = PaginationConfig::new()
+            .default_per_page(50)
+            .max_per_page(200)
+            .default_page(1);
+
+        assert_eq!(config.default_per_page, 50);
+        assert_eq!(config.max_per_page, 200);
+        assert_eq!(config.default_page, 1);
+    }
+
+    // ========================================================================
+    // Integration tests
+    // ========================================================================
+
+    #[test]
+    fn pagination_paginate_helper() {
+        let pagination = Pagination::new(2, 10);
+        let items = vec!["item1", "item2", "item3"];
+
+        let page = pagination.paginate(items.clone(), 100, "/api/items");
+
+        assert_eq!(page.items, items);
+        assert_eq!(page.total, 100);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.per_page, 10);
+        assert_eq!(page.pages, 10);
+    }
+
+    #[test]
+    fn pagination_equality() {
+        let p1 = Pagination::new(2, 10);
+        let p2 = Pagination::new(2, 10);
+        let p3 = Pagination::new(3, 10);
+
+        assert_eq!(p1, p2);
+        assert_ne!(p1, p3);
+    }
+
+    #[test]
+    fn pagination_copy_clone() {
+        let p1 = Pagination::new(2, 10);
+        let p2 = p1; // Copy
+        let p3 = p1.clone(); // Clone
+
+        assert_eq!(p1, p2);
+        assert_eq!(p1, p3);
     }
 }
 
