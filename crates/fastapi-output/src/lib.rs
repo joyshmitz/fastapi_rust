@@ -31,6 +31,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod components;
 pub mod detection;
 pub mod facade;
 pub mod mode;
@@ -43,7 +44,7 @@ pub use detection::{
     detection_diagnostics, is_agent_environment,
 };
 pub use facade::{RichOutput, RichOutputBuilder, StatusKind, get_global, set_global};
-pub use mode::OutputMode;
+pub use mode::{OutputMode, feature_info, has_rich_support};
 pub use testing::{
     OutputEntry, OutputLevel, TestOutput, assert_contains, assert_contains_in_order,
     assert_has_ansi, assert_max_width, assert_no_ansi, assert_not_contains, capture, capture_both,
@@ -51,14 +52,29 @@ pub use testing::{
 };
 pub use themes::{FastApiTheme, ThemePreset};
 
+// Re-export component types
+pub use components::banner::{Banner, BannerConfig, ServerInfo};
+pub use components::errors::{ErrorFormatter, FormattedError, HttpErrorInfo, LocItem, ValidationErrorDetail};
+pub use components::logging::{HttpMethod, LogEntry, RequestLogger, ResponseTiming};
+pub use components::routes::{RouteDisplay, RouteEntry, RouteTableConfig};
+
 /// Prelude module for convenient imports.
 pub mod prelude {
+    // Components
+    pub use crate::components::banner::{Banner, BannerConfig, ServerInfo};
+    pub use crate::components::errors::{
+        ErrorFormatter, FormattedError, HttpErrorInfo, LocItem, ValidationErrorDetail,
+    };
+    pub use crate::components::logging::{HttpMethod, LogEntry, RequestLogger, ResponseTiming};
+    pub use crate::components::routes::{RouteDisplay, RouteEntry, RouteTableConfig};
+
+    // Core types
     pub use crate::detection::{
         DetectionResult, OutputPreference, OverrideMode, detect_environment, detected_preference,
         is_agent_environment,
     };
     pub use crate::facade::{RichOutput, RichOutputBuilder, StatusKind, get_global, set_global};
-    pub use crate::mode::OutputMode;
+    pub use crate::mode::{OutputMode, feature_info, has_rich_support};
     pub use crate::testing::{
         OutputEntry, OutputLevel, TestOutput, assert_contains, assert_contains_in_order,
         assert_has_ansi, assert_max_width, assert_no_ansi, assert_not_contains, capture,

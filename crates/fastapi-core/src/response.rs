@@ -5,6 +5,8 @@ use std::fmt;
 use std::pin::Pin;
 
 use asupersync::stream::Stream;
+
+use crate::extract::Cookie;
 #[cfg(test)]
 use asupersync::types::PanicPayload;
 use asupersync::types::{CancelKind, CancelReason, Outcome};
@@ -228,6 +230,45 @@ impl Response {
     pub fn body(mut self, body: ResponseBody) -> Self {
         self.body = body;
         self
+    }
+
+    /// Set a cookie on the response.
+    ///
+    /// Adds a `Set-Cookie` header with the serialized cookie value.
+    /// Multiple cookies can be set by calling this method multiple times.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fastapi_core::{Response, Cookie, SameSite};
+    ///
+    /// let response = Response::ok()
+    ///     .set_cookie(Cookie::new("session", "abc123").http_only(true))
+    ///     .set_cookie(Cookie::new("prefs", "dark").same_site(SameSite::Lax));
+    /// ```
+    #[must_use]
+    pub fn set_cookie(self, cookie: Cookie) -> Self {
+        self.header("set-cookie", cookie.to_header_value().into_bytes())
+    }
+
+    /// Delete a cookie by setting it to expire immediately.
+    ///
+    /// This sets the cookie with an empty value and `Max-Age=0`, which tells
+    /// the browser to remove the cookie.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fastapi_core::Response;
+    ///
+    /// let response = Response::ok()
+    ///     .delete_cookie("session");
+    /// ```
+    #[must_use]
+    pub fn delete_cookie(self, name: &str) -> Self {
+        // Create an expired cookie to delete it
+        let cookie = Cookie::new(name, "").max_age(0);
+        self.set_cookie(cookie)
     }
 
     /// Create a JSON response.
@@ -1056,5 +1097,112 @@ mod tests {
     #[test]
     fn status_code_see_other_canonical_reason() {
         assert_eq!(StatusCode::SEE_OTHER.canonical_reason(), "See Other");
+    }
+
+    // =========================================================================
+    // Cookie setting tests
+    // =========================================================================
+
+    #[test]
+    fn response_set_cookie_adds_header() {
+        use crate::extract::Cookie;
+
+        let response = Response::ok().set_cookie(Cookie::new("session", "abc123"));
+
+        let cookie_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string());
+
+        assert!(cookie_header.is_some());
+        let header_value = cookie_header.unwrap();
+        assert!(header_value.contains("session=abc123"));
+    }
+
+    #[test]
+    fn response_set_cookie_with_attributes() {
+        use crate::extract::{Cookie, SameSite};
+
+        let response = Response::ok().set_cookie(
+            Cookie::new("session", "token123")
+                .http_only(true)
+                .secure(true)
+                .same_site(SameSite::Strict)
+                .max_age(3600)
+                .path("/api"),
+        );
+
+        let cookie_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string())
+            .unwrap();
+
+        assert!(cookie_header.contains("session=token123"));
+        assert!(cookie_header.contains("HttpOnly"));
+        assert!(cookie_header.contains("Secure"));
+        assert!(cookie_header.contains("SameSite=Strict"));
+        assert!(cookie_header.contains("Max-Age=3600"));
+        assert!(cookie_header.contains("Path=/api"));
+    }
+
+    #[test]
+    fn response_set_multiple_cookies() {
+        use crate::extract::Cookie;
+
+        let response = Response::ok()
+            .set_cookie(Cookie::new("session", "abc"))
+            .set_cookie(Cookie::new("prefs", "dark"));
+
+        let cookie_headers: Vec<_> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string())
+            .collect();
+
+        assert_eq!(cookie_headers.len(), 2);
+        assert!(cookie_headers.iter().any(|h| h.contains("session=abc")));
+        assert!(cookie_headers.iter().any(|h| h.contains("prefs=dark")));
+    }
+
+    #[test]
+    fn response_delete_cookie_sets_max_age_zero() {
+        let response = Response::ok().delete_cookie("session");
+
+        let cookie_header = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string())
+            .unwrap();
+
+        assert!(cookie_header.contains("session="));
+        assert!(cookie_header.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn response_set_and_delete_cookies() {
+        use crate::extract::Cookie;
+
+        // Set a new cookie and delete an old one in the same response
+        let response = Response::ok()
+            .set_cookie(Cookie::new("new_session", "xyz"))
+            .delete_cookie("old_session");
+
+        let cookie_headers: Vec<_> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string())
+            .collect();
+
+        assert_eq!(cookie_headers.len(), 2);
+        assert!(cookie_headers.iter().any(|h| h.contains("new_session=xyz")));
+        assert!(cookie_headers
+            .iter()
+            .any(|h| h.contains("old_session=") && h.contains("Max-Age=0")));
     }
 }

@@ -12,8 +12,15 @@ fastapi-http = { workspace = true }
 fastapi-router = { workspace = true }
 fastapi-macros = { workspace = true }
 fastapi-openapi = { workspace = true }
+fastapi-output = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = ["output"]
+output = ["dep:fastapi-output", "fastapi-output/rich"]
+output-plain = ["dep:fastapi-output"]
+full = ["output", "fastapi-output/full"]
 
 [lints]
 workspace = true

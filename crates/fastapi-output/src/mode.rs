@@ -146,6 +146,24 @@ impl FromStr for OutputMode {
     }
 }
 
+/// Check if rich output support is compiled in.
+#[must_use]
+pub const fn has_rich_support() -> bool {
+    cfg!(feature = "rich")
+}
+
+/// Get a human-readable description of available output features.
+#[must_use]
+pub fn feature_info() -> &'static str {
+    if cfg!(feature = "full") {
+        "full (rich output with syntax highlighting)"
+    } else if cfg!(feature = "rich") {
+        "rich (styled output with tables and panels)"
+    } else {
+        "plain (text only, no dependencies)"
+    }
+}
+
 /// Error returned when parsing an invalid output mode string.
 #[derive(Debug, Clone)]
 pub struct OutputModeParseError(String);
@@ -330,6 +348,30 @@ mod tests {
         assert!(OutputMode::Rich.supports_tables());
         assert!(!OutputMode::Plain.supports_tables());
         assert!(!OutputMode::Minimal.supports_tables());
+    }
+
+    #[test]
+    fn test_feature_info_matches_flags() {
+        let info = feature_info();
+        eprintln!("[TEST] feature_info: {info}");
+        if cfg!(feature = "full") {
+            assert!(info.contains("full"));
+        } else if cfg!(feature = "rich") {
+            assert!(info.contains("rich"));
+        } else {
+            assert!(info.contains("plain"));
+        }
+    }
+
+    #[test]
+    fn test_has_rich_support_flag() {
+        let expected = cfg!(feature = "rich");
+        eprintln!(
+            "[TEST] has_rich_support: expected={}, actual={}",
+            expected,
+            has_rich_support()
+        );
+        assert_eq!(has_rich_support(), expected);
     }
 
     // ========== INDICATOR TESTS ==========

@@ -21,6 +21,7 @@ rich_rust = { path = "/dp/rich_rust", optional = true }
 [features]
 default = ["rich"]
 rich = ["dep:rich_rust"]
+full = ["rich", "rich_rust/full"]
 
 [dev-dependencies]
 # For testing
