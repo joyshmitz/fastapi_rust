@@ -1,36 +1,596 @@
 //! Validation derive macro implementation.
+//!
+//! This module implements the `#[derive(Validate)]` macro that generates
+//! validation code from field attributes.
+//!
+//! # Supported Validators
+//!
+//! - `length(min = N, max = M)` - String/Vec length bounds
+//! - `range(gt, ge, lt, le)` - Numeric range bounds
+//! - `email` - Email format validation
+//! - `url` - URL format validation
+//! - `regex = "pattern"` - Regex pattern matching
+//! - `custom = function` - Custom validation function
+//! - `nested` - Validate nested structs
+//! - `multiple_of = N` - Divisibility check
+//!
+//! # Example
+//!
+//! ```ignore
+//! #[derive(Validate)]
+//! struct CreateUser {
+//!     #[validate(length(min = 1, max = 100))]
+//!     name: String,
+//!
+//!     #[validate(email)]
+//!     email: String,
+//!
+//!     #[validate(range(ge = 0, le = 150))]
+//!     age: i32,
+//! }
+//! ```
 
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{DeriveInput, parse_macro_input};
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{quote, ToTokens};
+use syn::{
+    parse_macro_input, punctuated::Punctuated, Attribute, Data, DeriveInput, Expr, ExprLit,
+    ExprPath, Field, Fields, Lit, Meta, MetaList, MetaNameValue, Token,
+};
 
+/// Parsed validation rules for a field.
+#[derive(Default)]
+struct FieldValidators {
+    /// Minimum length for strings/collections.
+    length_min: Option<usize>,
+    /// Maximum length for strings/collections.
+    length_max: Option<usize>,
+    /// Greater than (exclusive).
+    range_gt: Option<String>,
+    /// Greater than or equal (inclusive).
+    range_ge: Option<String>,
+    /// Less than (exclusive).
+    range_lt: Option<String>,
+    /// Less than or equal (inclusive).
+    range_le: Option<String>,
+    /// Email format validation.
+    email: bool,
+    /// URL format validation.
+    url: bool,
+    /// Regex pattern.
+    regex: Option<String>,
+    /// Custom validation function path.
+    custom: Option<String>,
+    /// Validate nested struct.
+    nested: bool,
+    /// Multiple of (divisibility).
+    multiple_of: Option<String>,
+}
+
+impl FieldValidators {
+    fn is_empty(&self) -> bool {
+        self.length_min.is_none()
+            && self.length_max.is_none()
+            && self.range_gt.is_none()
+            && self.range_ge.is_none()
+            && self.range_lt.is_none()
+            && self.range_le.is_none()
+            && !self.email
+            && !self.url
+            && self.regex.is_none()
+            && self.custom.is_none()
+            && !self.nested
+            && self.multiple_of.is_none()
+    }
+}
+
+/// Parse validate attributes from a field.
+fn parse_validate_attrs(attrs: &[Attribute]) -> FieldValidators {
+    let mut validators = FieldValidators::default();
+
+    for attr in attrs {
+        if !attr.path().is_ident("validate") {
+            continue;
+        }
+
+        // Parse #[validate(...)]
+        if let Meta::List(meta_list) = &attr.meta {
+            parse_validate_list(&meta_list, &mut validators);
+        }
+    }
+
+    validators
+}
+
+/// Parse the contents of #[validate(...)].
+fn parse_validate_list(meta_list: &MetaList, validators: &mut FieldValidators) {
+    // Parse as a punctuated list of nested meta items
+    let nested: Result<Punctuated<Meta, Token![,]>, _> =
+        meta_list.parse_args_with(Punctuated::parse_terminated);
+
+    if let Ok(items) = nested {
+        for item in items {
+            match &item {
+                // Handle simple validators like `email`, `url`, `nested`
+                Meta::Path(path) => {
+                    if path.is_ident("email") {
+                        validators.email = true;
+                    } else if path.is_ident("url") {
+                        validators.url = true;
+                    } else if path.is_ident("nested") {
+                        validators.nested = true;
+                    }
+                }
+                // Handle key = value like `regex = "pattern"`, `custom = fn_name`
+                Meta::NameValue(nv) => {
+                    parse_name_value(nv, validators);
+                }
+                // Handle nested lists like `length(min = 1, max = 100)`, `range(ge = 0)`
+                Meta::List(list) => {
+                    parse_nested_validator(list, validators);
+                }
+            }
+        }
+    }
+}
+
+/// Parse key = value attributes.
+fn parse_name_value(nv: &MetaNameValue, validators: &mut FieldValidators) {
+    let name = nv.path.get_ident().map(|i| i.to_string());
+
+    match name.as_deref() {
+        Some("regex") => {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &nv.value
+            {
+                validators.regex = Some(s.value());
+            }
+        }
+        Some("custom") => {
+            // custom = validate_fn or custom = "validate_fn"
+            match &nv.value {
+                Expr::Path(ExprPath { path, .. }) => {
+                    validators.custom = Some(path.to_token_stream().to_string());
+                }
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) => {
+                    validators.custom = Some(s.value());
+                }
+                _ => {}
+            }
+        }
+        Some("multiple_of") => {
+            validators.multiple_of = Some(expr_to_string(&nv.value));
+        }
+        _ => {}
+    }
+}
+
+/// Parse nested validators like `length(...)` or `range(...)`.
+fn parse_nested_validator(list: &MetaList, validators: &mut FieldValidators) {
+    let name = list.path.get_ident().map(|i| i.to_string());
+
+    match name.as_deref() {
+        Some("length") => {
+            // Parse length(min = N, max = M)
+            if let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            {
+                for item in nested {
+                    if let Meta::NameValue(nv) = item {
+                        let key = nv.path.get_ident().map(|i| i.to_string());
+                        match key.as_deref() {
+                            Some("min") => {
+                                validators.length_min = expr_to_usize(&nv.value);
+                            }
+                            Some("max") => {
+                                validators.length_max = expr_to_usize(&nv.value);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Some("range") => {
+            // Parse range(gt = N, ge = N, lt = N, le = N)
+            if let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            {
+                for item in nested {
+                    if let Meta::NameValue(nv) = item {
+                        let key = nv.path.get_ident().map(|i| i.to_string());
+                        let value = expr_to_string(&nv.value);
+                        match key.as_deref() {
+                            Some("gt") => validators.range_gt = Some(value),
+                            Some("ge") => validators.range_ge = Some(value),
+                            Some("lt") => validators.range_lt = Some(value),
+                            Some("le") => validators.range_le = Some(value),
+                            // Also support min/max as aliases
+                            Some("min") => validators.range_ge = Some(value),
+                            Some("max") => validators.range_le = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert expression to usize (for length constraints).
+fn expr_to_usize(expr: &Expr) -> Option<usize> {
+    if let Expr::Lit(ExprLit {
+        lit: Lit::Int(i), ..
+    }) = expr
+    {
+        i.base10_parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Convert expression to string representation (for numeric values).
+fn expr_to_string(expr: &Expr) -> String {
+    match expr {
+        Expr::Lit(ExprLit { lit, .. }) => match lit {
+            Lit::Int(i) => i.to_string(),
+            Lit::Float(f) => f.to_string(),
+            Lit::Str(s) => s.value(),
+            _ => expr.to_token_stream().to_string(),
+        },
+        _ => expr.to_token_stream().to_string(),
+    }
+}
+
+/// Generate validation code for a single field.
+fn generate_field_validation(field: &Field, validators: &FieldValidators) -> TokenStream2 {
+    let field_name = field.ident.as_ref().expect("Named field required");
+    let field_name_str = field_name.to_string();
+
+    let mut validations = Vec::new();
+
+    // Length validation (for String and collections)
+    if let Some(min) = validators.length_min {
+        validations.push(quote! {
+            if self.#field_name.len() < #min {
+                errors.push(
+                    fastapi_core::ValidationError::string_too_short(
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                        #min,
+                    )
+                );
+            }
+        });
+    }
+
+    if let Some(max) = validators.length_max {
+        validations.push(quote! {
+            if self.#field_name.len() > #max {
+                errors.push(
+                    fastapi_core::ValidationError::string_too_long(
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                        #max,
+                    )
+                );
+            }
+        });
+    }
+
+    // Range validation (for numeric types)
+    if let Some(ref gt) = validators.range_gt {
+        let gt_val: TokenStream2 = gt.parse().unwrap_or_else(|_| quote!(0));
+        validations.push(quote! {
+            if !(self.#field_name > #gt_val) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::GREATER_THAN_EQUAL,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("Input should be greater than {}", #gt))
+                    .with_ctx_value("gt", serde_json::json!(#gt_val))
+                );
+            }
+        });
+    }
+
+    if let Some(ref ge) = validators.range_ge {
+        let ge_val: TokenStream2 = ge.parse().unwrap_or_else(|_| quote!(0));
+        validations.push(quote! {
+            if !(self.#field_name >= #ge_val) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::GREATER_THAN_EQUAL,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("Input should be greater than or equal to {}", #ge))
+                    .with_ctx_value("ge", serde_json::json!(#ge_val))
+                );
+            }
+        });
+    }
+
+    if let Some(ref lt) = validators.range_lt {
+        let lt_val: TokenStream2 = lt.parse().unwrap_or_else(|_| quote!(0));
+        validations.push(quote! {
+            if !(self.#field_name < #lt_val) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::LESS_THAN_EQUAL,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("Input should be less than {}", #lt))
+                    .with_ctx_value("lt", serde_json::json!(#lt_val))
+                );
+            }
+        });
+    }
+
+    if let Some(ref le) = validators.range_le {
+        let le_val: TokenStream2 = le.parse().unwrap_or_else(|_| quote!(0));
+        validations.push(quote! {
+            if !(self.#field_name <= #le_val) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::LESS_THAN_EQUAL,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("Input should be less than or equal to {}", #le))
+                    .with_ctx_value("le", serde_json::json!(#le_val))
+                );
+            }
+        });
+    }
+
+    // Email validation
+    if validators.email {
+        validations.push(quote! {
+            {
+                let email = &self.#field_name;
+                // Simple email validation: contains @ and has content before/after
+                let is_valid = email.contains('@')
+                    && email.split('@').count() == 2
+                    && {
+                        let parts: Vec<&str> = email.split('@').collect();
+                        !parts[0].is_empty() && !parts[1].is_empty() && parts[1].contains('.')
+                    };
+                if !is_valid {
+                    errors.push(
+                        fastapi_core::ValidationError::new(
+                            fastapi_core::error::error_types::VALUE_ERROR,
+                            vec![
+                                fastapi_core::error::LocItem::field("body"),
+                                fastapi_core::error::LocItem::field(#field_name_str),
+                            ],
+                        )
+                        .with_msg("value is not a valid email address")
+                    );
+                }
+            }
+        });
+    }
+
+    // URL validation
+    if validators.url {
+        validations.push(quote! {
+            {
+                let url = &self.#field_name;
+                // Simple URL validation: starts with http:// or https://
+                let is_valid = url.starts_with("http://") || url.starts_with("https://");
+                if !is_valid {
+                    errors.push(
+                        fastapi_core::ValidationError::new(
+                            fastapi_core::error::error_types::URL_TYPE,
+                            vec![
+                                fastapi_core::error::LocItem::field("body"),
+                                fastapi_core::error::LocItem::field(#field_name_str),
+                            ],
+                        )
+                        .with_msg("value is not a valid URL")
+                    );
+                }
+            }
+        });
+    }
+
+    // Regex validation
+    if let Some(ref pattern) = validators.regex {
+        validations.push(quote! {
+            {
+                // Compile regex at runtime - could be optimized with lazy_static in user code
+                match regex::Regex::new(#pattern) {
+                    Ok(re) => {
+                        if !re.is_match(&self.#field_name) {
+                            errors.push(
+                                fastapi_core::ValidationError::new(
+                                    fastapi_core::error::error_types::STRING_PATTERN_MISMATCH,
+                                    vec![
+                                        fastapi_core::error::LocItem::field("body"),
+                                        fastapi_core::error::LocItem::field(#field_name_str),
+                                    ],
+                                )
+                                .with_msg("String should match pattern")
+                                .with_ctx_value("pattern", serde_json::json!(#pattern))
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Invalid regex pattern - this is a programmer error
+                        errors.push(
+                            fastapi_core::ValidationError::new(
+                                fastapi_core::error::error_types::VALUE_ERROR,
+                                vec![
+                                    fastapi_core::error::LocItem::field("body"),
+                                    fastapi_core::error::LocItem::field(#field_name_str),
+                                ],
+                            )
+                            .with_msg("Invalid regex pattern in validation rule")
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // Custom validation function
+    if let Some(ref func) = validators.custom {
+        let func_path: TokenStream2 = func.parse().unwrap_or_else(|_| quote!(validate_field));
+        validations.push(quote! {
+            if let Err(msg) = #func_path(&self.#field_name) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::VALUE_ERROR,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(msg)
+                );
+            }
+        });
+    }
+
+    // Nested validation
+    if validators.nested {
+        validations.push(quote! {
+            if let Err(nested_errors) = self.#field_name.validate() {
+                // Add the field name prefix to all nested errors
+                for mut err in nested_errors {
+                    let mut new_loc = vec![
+                        fastapi_core::error::LocItem::field("body"),
+                        fastapi_core::error::LocItem::field(#field_name_str),
+                    ];
+                    // Skip "body" prefix from nested if present
+                    let skip = if err.loc.first().map(|l| l.as_str()) == Some(Some("body")) {
+                        1
+                    } else {
+                        0
+                    };
+                    new_loc.extend(err.loc.into_iter().skip(skip));
+                    err.loc = new_loc;
+                    errors.push(err);
+                }
+            }
+        });
+    }
+
+    // Multiple of validation
+    if let Some(ref divisor) = validators.multiple_of {
+        let div_val: TokenStream2 = divisor.parse().unwrap_or_else(|_| quote!(1));
+        validations.push(quote! {
+            if self.#field_name % #div_val != 0 {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::VALUE_ERROR,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("Input should be a multiple of {}", #divisor))
+                    .with_ctx_value("multiple_of", serde_json::json!(#div_val))
+                );
+            }
+        });
+    }
+
+    quote! {
+        #(#validations)*
+    }
+}
+
+/// Main entry point for the derive macro.
 pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    // TODO: Parse #[validate(...)] attributes on fields
-    // and generate validation code
+    // Only support structs with named fields
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => &fields.named,
+            _ => {
+                return syn::Error::new_spanned(
+                    &input,
+                    "Validate can only be derived for structs with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(&input, "Validate can only be derived for structs")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    // Generate validation code for each field
+    let mut field_validations = Vec::new();
+    for field in fields {
+        let validators = parse_validate_attrs(&field.attrs);
+        if !validators.is_empty() {
+            field_validations.push(generate_field_validation(field, &validators));
+        }
+    }
 
     let expanded = quote! {
-        impl #name {
-            /// Validate this value.
+        impl #impl_generics #name #ty_generics #where_clause {
+            /// Validate this value according to the `#[validate(...)]` attributes.
             ///
             /// # Errors
             ///
-            /// Returns validation errors if any constraints are violated.
+            /// Returns a collection of validation errors if any constraints are violated.
+            ///
+            /// # Example
+            ///
+            /// ```ignore
+            /// let user = CreateUser { name: "".into(), email: "invalid".into(), age: -1 };
+            /// match user.validate() {
+            ///     Ok(()) => println!("Valid!"),
+            ///     Err(errors) => println!("Errors: {}", errors.len()),
+            /// }
+            /// ```
             pub fn validate(&self) -> Result<(), fastapi_core::ValidationErrors> {
-                let mut errors = fastapi_core::ValidationErrors::new();
+                let mut errors = Vec::<fastapi_core::ValidationError>::new();
 
-                // TODO: Generate field validations from attributes
+                #(#field_validations)*
 
                 if errors.is_empty() {
                     Ok(())
                 } else {
-                    Err(errors)
+                    Err(fastapi_core::ValidationErrors::from_errors(errors))
                 }
             }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests would go here but proc-macro crates can't have unit tests
+    // that actually expand macros. Use integration tests instead.
 }
