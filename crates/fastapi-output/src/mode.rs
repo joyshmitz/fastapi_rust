@@ -21,6 +21,37 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
+    /// Get the mode name as a static string.
+    ///
+    /// Returns one of: `"rich"`, `"plain"`, or `"minimal"`.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rich => "rich",
+            Self::Plain => "plain",
+            Self::Minimal => "minimal",
+        }
+    }
+
+    /// Check if this mode is agent-friendly (produces output suitable for parsing).
+    ///
+    /// Returns `true` for `Plain` mode, which uses no ANSI codes and
+    /// consistent text prefixes like `[OK]`, `[ERROR]`, etc.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastapi_output::OutputMode;
+    ///
+    /// assert!(OutputMode::Plain.is_agent_friendly());
+    /// assert!(!OutputMode::Rich.is_agent_friendly());
+    /// assert!(!OutputMode::Minimal.is_agent_friendly());
+    /// ```
+    #[must_use]
+    pub const fn is_agent_friendly(&self) -> bool {
+        matches!(self, Self::Plain)
+    }
+
     /// Select the appropriate mode based on environment detection.
     #[must_use]
     pub fn auto() -> Self {
@@ -529,5 +560,61 @@ mod tests {
         let err = OutputModeParseError("x".to_string());
         let _: &dyn std::error::Error = &err;
         eprintln!("[TEST] OutputModeParseError implements Error trait");
+    }
+
+    // ========== AS_STR TESTS ==========
+
+    #[test]
+    fn test_as_str_rich() {
+        assert_eq!(OutputMode::Rich.as_str(), "rich");
+    }
+
+    #[test]
+    fn test_as_str_plain() {
+        assert_eq!(OutputMode::Plain.as_str(), "plain");
+    }
+
+    #[test]
+    fn test_as_str_minimal() {
+        assert_eq!(OutputMode::Minimal.as_str(), "minimal");
+    }
+
+    #[test]
+    fn test_as_str_matches_display() {
+        // as_str() should match Display implementation
+        assert_eq!(OutputMode::Rich.as_str(), OutputMode::Rich.to_string());
+        assert_eq!(OutputMode::Plain.as_str(), OutputMode::Plain.to_string());
+        assert_eq!(
+            OutputMode::Minimal.as_str(),
+            OutputMode::Minimal.to_string()
+        );
+    }
+
+    // ========== IS_AGENT_FRIENDLY TESTS ==========
+
+    #[test]
+    fn test_is_agent_friendly_plain() {
+        assert!(OutputMode::Plain.is_agent_friendly());
+    }
+
+    #[test]
+    fn test_is_agent_friendly_rich() {
+        assert!(!OutputMode::Rich.is_agent_friendly());
+    }
+
+    #[test]
+    fn test_is_agent_friendly_minimal() {
+        assert!(!OutputMode::Minimal.is_agent_friendly());
+    }
+
+    #[test]
+    fn test_is_agent_friendly_consistency() {
+        // Plain mode should be the only agent-friendly mode
+        let modes = [OutputMode::Rich, OutputMode::Plain, OutputMode::Minimal];
+        let agent_friendly_count = modes.iter().filter(|m| m.is_agent_friendly()).count();
+        assert_eq!(
+            agent_friendly_count, 1,
+            "Only Plain should be agent-friendly"
+        );
     }
 }

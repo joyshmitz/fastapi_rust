@@ -22,7 +22,116 @@
 //! // Print styled text (rendered appropriately for mode)
 //! output.success("Server started successfully");
 //! output.error("Failed to bind to port 8000");
+//!
+//! // Check if running in agent-friendly mode
+//! if output.is_agent_mode() {
+//!     // Output is plain text, safe for agent parsing
+//! }
 //! ```
+//!
+//! # Output Modes
+//!
+//! The library supports three output modes:
+//!
+//! | Mode | Description | Use Case |
+//! |------|-------------|----------|
+//! | `Rich` | Full ANSI styling with Unicode symbols | Human terminals |
+//! | `Plain` | Zero ANSI codes, ASCII only | AI agents, CI, logs |
+//! | `Minimal` | Colors only, no box characters | Simple terminals |
+//!
+//! # Agent Detection
+//!
+//! The library automatically detects agent environments by checking for
+//! known environment variables set by AI coding assistants:
+//!
+//! | Variable | Agent |
+//! |----------|-------|
+//! | `CLAUDE_CODE` | Claude Code CLI |
+//! | `CODEX_CLI` | OpenAI Codex CLI |
+//! | `CURSOR_SESSION` | Cursor IDE |
+//! | `AIDER_SESSION` | Aider |
+//! | `AGENT_MODE` | Generic agent flag |
+//! | `WINDSURF_SESSION` | Windsurf |
+//! | `CLINE_SESSION` | Cline |
+//! | `COPILOT_AGENT` | GitHub Copilot agent mode |
+//!
+//! # CI Detection
+//!
+//! CI environments are also detected and default to plain mode:
+//!
+//! | Variable | CI System |
+//! |----------|-----------|
+//! | `CI` | Generic CI flag |
+//! | `GITHUB_ACTIONS` | GitHub Actions |
+//! | `GITLAB_CI` | GitLab CI |
+//! | `JENKINS_URL` | Jenkins |
+//! | `CIRCLECI` | CircleCI |
+//! | `TRAVIS` | Travis CI |
+//! | `BUILDKITE` | Buildkite |
+//!
+//! # Environment Variable Precedence
+//!
+//! Environment variables are checked in the following order (highest to lowest priority):
+//!
+//! 1. **`FASTAPI_OUTPUT_MODE`** (highest) - Explicit mode selection
+//!    - Values: `rich`, `plain`, `minimal`
+//!    - Example: `FASTAPI_OUTPUT_MODE=plain cargo run`
+//!
+//! 2. **`FASTAPI_AGENT_MODE=1`** - Force agent detection (plain mode)
+//!    - Useful for testing agent behavior in a human terminal
+//!
+//! 3. **`FASTAPI_HUMAN_MODE=1`** - Force human detection (rich mode)
+//!    - Overrides agent detection when you want rich output
+//!
+//! 4. **`FORCE_COLOR`** - Standard force-color flag
+//!    - Non-zero value forces rich output even in CI
+//!
+//! 5. **`NO_COLOR`** - Standard no-color flag
+//!    - When set (any value), forces plain output
+//!
+//! 6. **Auto-detection** (lowest) - TTY check + agent/CI env vars
+//!
+//! ## Precedence Examples
+//!
+//! ```bash
+//! # Explicit mode always wins
+//! FASTAPI_OUTPUT_MODE=rich CLAUDE_CODE=1 cargo run  # → Rich mode
+//!
+//! # Agent override beats CI detection
+//! FASTAPI_HUMAN_MODE=1 CI=true cargo run  # → Rich mode
+//!
+//! # FORCE_COLOR beats NO_COLOR and CI
+//! FORCE_COLOR=1 CI=true NO_COLOR=1 cargo run  # → Rich mode
+//!
+//! # NO_COLOR beats auto-detection
+//! NO_COLOR=1 cargo run  # → Plain mode (even in TTY)
+//! ```
+//!
+//! # For Agent Authors
+//!
+//! If you're building an AI coding agent that invokes fastapi_rust applications:
+//!
+//! 1. **Set your agent's env var** (e.g., `CLAUDE_CODE=1`) for auto-detection
+//! 2. **Or set `FASTAPI_OUTPUT_MODE=plain`** for explicit plain mode
+//! 3. **Parse plain output** which uses consistent prefixes:
+//!    - `[OK]` for success
+//!    - `[ERROR]` for errors
+//!    - `[WARN]` for warnings
+//!    - `[INFO]` for info
+//!    - `[DEBUG]` for debug
+//!
+//! # Components
+//!
+//! The library provides several output components:
+//!
+//! - [`Banner`] - Server startup banner with ASCII art
+//! - [`RouteDisplay`] - Route table display
+//! - [`ErrorFormatter`] - Validation and HTTP error formatting
+//! - [`RequestLogger`] - HTTP request/response logging
+//! - [`MiddlewareStackDisplay`] - Middleware stack visualization
+//! - [`DependencyTreeDisplay`] - Dependency injection tree
+//! - [`ShutdownProgressDisplay`] - Graceful shutdown progress
+//! - [`TestReportDisplay`] - Test results formatting
 
 // SAFETY: We use deny instead of forbid to allow unsafe in test modules.
 // The only unsafe code is for env::set_var/remove_var in tests, which

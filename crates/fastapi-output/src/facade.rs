@@ -100,6 +100,44 @@ impl RichOutput {
         self.mode = mode;
     }
 
+    /// Check if running in agent-friendly mode (plain text output).
+    ///
+    /// Returns `true` if the output mode is `Plain`, which is the mode
+    /// used when an AI agent environment is detected or explicitly requested.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastapi_output::prelude::*;
+    ///
+    /// let output = RichOutput::plain();
+    /// assert!(output.is_agent_mode());
+    ///
+    /// let output = RichOutput::rich();
+    /// assert!(!output.is_agent_mode());
+    /// ```
+    #[must_use]
+    pub const fn is_agent_mode(&self) -> bool {
+        matches!(self.mode, OutputMode::Plain)
+    }
+
+    /// Get the mode name as a string for logging/debugging.
+    ///
+    /// Returns one of: `"rich"`, `"plain"`, or `"minimal"`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use fastapi_output::prelude::*;
+    ///
+    /// let output = RichOutput::plain();
+    /// assert_eq!(output.mode_name(), "plain");
+    /// ```
+    #[must_use]
+    pub const fn mode_name(&self) -> &'static str {
+        self.mode.as_str()
+    }
+
     /// Get the current theme.
     #[must_use]
     pub const fn theme(&self) -> &FastApiTheme {
@@ -522,5 +560,45 @@ mod tests {
         set_global(RichOutput::plain());
         assert_eq!(get_global().mode(), OutputMode::Plain);
         set_global(original);
+    }
+
+    // ========== IS_AGENT_MODE TESTS ==========
+
+    #[test]
+    fn test_is_agent_mode_plain() {
+        let output = RichOutput::plain();
+        assert!(output.is_agent_mode());
+    }
+
+    #[test]
+    fn test_is_agent_mode_rich() {
+        let output = RichOutput::rich();
+        assert!(!output.is_agent_mode());
+    }
+
+    #[test]
+    fn test_is_agent_mode_minimal() {
+        let output = RichOutput::new(OutputMode::Minimal);
+        assert!(!output.is_agent_mode());
+    }
+
+    // ========== MODE_NAME TESTS ==========
+
+    #[test]
+    fn test_mode_name_plain() {
+        let output = RichOutput::plain();
+        assert_eq!(output.mode_name(), "plain");
+    }
+
+    #[test]
+    fn test_mode_name_rich() {
+        let output = RichOutput::rich();
+        assert_eq!(output.mode_name(), "rich");
+    }
+
+    #[test]
+    fn test_mode_name_minimal() {
+        let output = RichOutput::new(OutputMode::Minimal);
+        assert_eq!(output.mode_name(), "minimal");
     }
 }
