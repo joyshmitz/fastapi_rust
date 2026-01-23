@@ -1647,8 +1647,7 @@ mod tests {
     #[test]
     fn http_error_binary_header_value() {
         // Test header with non-UTF8 bytes
-        let error = HttpError::bad_request()
-            .with_header("X-Binary", vec![0x00, 0xFF, 0x80]);
+        let error = HttpError::bad_request().with_header("X-Binary", vec![0x00, 0xFF, 0x80]);
 
         assert_eq!(error.headers[0].1, vec![0x00, 0xFF, 0x80]);
     }
