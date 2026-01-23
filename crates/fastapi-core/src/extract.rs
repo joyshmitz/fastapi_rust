@@ -5712,6 +5712,279 @@ impl FromRequest for BearerToken {
 }
 
 // ============================================================================
+// Basic Authentication Extractor
+// ============================================================================
+
+/// Extracts HTTP Basic authentication credentials from the `Authorization` header.
+///
+/// This implements the HTTP Basic authentication scheme as defined in RFC 7617.
+/// The Authorization header should contain `Basic <base64(username:password)>`.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::BasicAuth;
+///
+/// async fn protected_route(auth: BasicAuth) -> impl IntoResponse {
+///     format!("Hello, {}!", auth.username())
+/// }
+/// ```
+///
+/// # Error Handling
+///
+/// When credentials are missing or invalid, a 401 Unauthorized response is returned
+/// with a `WWW-Authenticate: Basic` header, following RFC 7617.
+///
+/// # Optional Extraction
+///
+/// Wrap in `Option` to make authentication optional:
+///
+/// ```ignore
+/// async fn maybe_auth(auth: Option<BasicAuth>) -> impl IntoResponse {
+///     match auth {
+///         Some(a) => format!("Hello, {}!", a.username()),
+///         None => "Anonymous access".to_string(),
+///     }
+/// }
+/// ```
+///
+/// # OpenAPI
+///
+/// This extractor generates the following OpenAPI security scheme:
+/// ```yaml
+/// securitySchemes:
+///   BasicAuth:
+///     type: http
+///     scheme: basic
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicAuth {
+    /// The username extracted from the credentials.
+    username: String,
+    /// The password extracted from the credentials.
+    password: String,
+}
+
+impl BasicAuth {
+    /// Create a new BasicAuth with the given username and password.
+    #[must_use]
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// Get the username.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Get the password.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
+    /// Consume self and return the username and password as a tuple.
+    #[must_use]
+    pub fn into_credentials(self) -> (String, String) {
+        (self.username, self.password)
+    }
+}
+
+/// Error when basic auth extraction fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasicAuthError {
+    /// The Authorization header is missing.
+    MissingHeader,
+    /// The Authorization header doesn't use the Basic scheme.
+    InvalidScheme,
+    /// The credentials are not valid base64.
+    InvalidBase64,
+    /// The decoded credentials don't contain a colon separator.
+    MissingColon,
+    /// The header value is not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl BasicAuthError {
+    /// Create a missing header error.
+    #[must_use]
+    pub fn missing_header() -> Self {
+        Self::MissingHeader
+    }
+
+    /// Create an invalid scheme error.
+    #[must_use]
+    pub fn invalid_scheme() -> Self {
+        Self::InvalidScheme
+    }
+
+    /// Create an invalid base64 error.
+    #[must_use]
+    pub fn invalid_base64() -> Self {
+        Self::InvalidBase64
+    }
+
+    /// Create a missing colon error.
+    #[must_use]
+    pub fn missing_colon() -> Self {
+        Self::MissingColon
+    }
+
+    /// Create an invalid UTF-8 error.
+    #[must_use]
+    pub fn invalid_utf8() -> Self {
+        Self::InvalidUtf8
+    }
+
+    /// Get a human-readable description of this error.
+    #[must_use]
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::MissingHeader => "Not authenticated",
+            Self::InvalidScheme => "Invalid authentication credentials",
+            Self::InvalidBase64 => "Invalid authentication credentials",
+            Self::MissingColon => "Invalid authentication credentials",
+            Self::InvalidUtf8 => "Invalid authentication credentials",
+        }
+    }
+}
+
+impl fmt::Display for BasicAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHeader => write!(f, "Missing Authorization header"),
+            Self::InvalidScheme => write!(f, "Authorization header must use Basic scheme"),
+            Self::InvalidBase64 => write!(f, "Invalid base64 encoding in credentials"),
+            Self::MissingColon => write!(f, "Credentials must contain username:password"),
+            Self::InvalidUtf8 => write!(f, "Credentials contain invalid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for BasicAuthError {}
+
+impl IntoResponse for BasicAuthError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        let body = serde_json::json!({
+            "detail": self.detail()
+        });
+
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", b"Basic".to_vec())
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+/// Decode a base64 string to bytes.
+///
+/// This is a minimal implementation for Basic auth credential decoding.
+/// Supports standard base64 alphabet (A-Za-z0-9+/) with optional padding.
+fn decode_base64(input: &str) -> Result<Vec<u8>, BasicAuthError> {
+    const DECODE_TABLE: [i8; 256] = {
+        let mut table = [-1i8; 256];
+        let mut i = 0u8;
+        // A-Z = 0-25
+        while i < 26 {
+            table[(b'A' + i) as usize] = i as i8;
+            i += 1;
+        }
+        // a-z = 26-51
+        i = 0;
+        while i < 26 {
+            table[(b'a' + i) as usize] = (26 + i) as i8;
+            i += 1;
+        }
+        // 0-9 = 52-61
+        i = 0;
+        while i < 10 {
+            table[(b'0' + i) as usize] = (52 + i) as i8;
+            i += 1;
+        }
+        // + = 62, / = 63
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+        table
+    };
+
+    // Remove padding and whitespace
+    let input = input.trim_end_matches('=').trim();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut output = Vec::with_capacity((input.len() * 3) / 4);
+    let mut buffer: u32 = 0;
+    let mut bits_collected: u8 = 0;
+
+    for byte in input.bytes() {
+        let value = DECODE_TABLE[byte as usize];
+        if value < 0 {
+            return Err(BasicAuthError::InvalidBase64);
+        }
+
+        buffer = (buffer << 6) | (value as u32);
+        bits_collected += 6;
+
+        if bits_collected >= 8 {
+            bits_collected -= 8;
+            output.push((buffer >> bits_collected) as u8);
+            buffer &= (1 << bits_collected) - 1;
+        }
+    }
+
+    Ok(output)
+}
+
+impl FromRequest for BasicAuth {
+    type Error = BasicAuthError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get the Authorization header
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .ok_or(BasicAuthError::MissingHeader)?;
+
+        // Convert to string
+        let auth_str =
+            std::str::from_utf8(auth_header).map_err(|_| BasicAuthError::InvalidUtf8)?;
+
+        // Check for "Basic " prefix (case-insensitive per RFC 7617)
+        const BASIC_PREFIX: &str = "Basic ";
+        const BASIC_PREFIX_LOWER: &str = "basic ";
+
+        let encoded = if auth_str.starts_with(BASIC_PREFIX) {
+            &auth_str[BASIC_PREFIX.len()..]
+        } else if auth_str.starts_with(BASIC_PREFIX_LOWER) {
+            &auth_str[BASIC_PREFIX_LOWER.len()..]
+        } else {
+            return Err(BasicAuthError::InvalidScheme);
+        };
+
+        // Decode base64
+        let decoded_bytes = decode_base64(encoded.trim())?;
+
+        // Convert to UTF-8 string
+        let decoded =
+            String::from_utf8(decoded_bytes).map_err(|_| BasicAuthError::InvalidUtf8)?;
+
+        // Split on first colon (password may contain colons)
+        let colon_pos = decoded.find(':').ok_or(BasicAuthError::MissingColon)?;
+        let (username, password_with_colon) = decoded.split_at(colon_pos);
+        let password = &password_with_colon[1..]; // Skip the colon
+
+        Ok(BasicAuth::new(username, password))
+    }
+}
+
+// ============================================================================
 // Timing-Safe Comparison Utilities
 // ============================================================================
 
@@ -7345,6 +7618,417 @@ mod bearer_token_tests {
         let token = BearerToken::new("cloneable");
         let cloned = token.clone();
         assert_eq!(token, cloned);
+    }
+}
+
+#[cfg(test)]
+mod basic_auth_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::IntoResponse;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    // Helper to base64 encode credentials
+    fn encode_basic_auth(username: &str, password: &str) -> String {
+        // Manual base64 encoding for test purposes
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let input = format!("{username}:{password}");
+        let bytes = input.as_bytes();
+        let mut output = String::new();
+
+        for chunk in bytes.chunks(3) {
+            let mut n: u32 = 0;
+            for (i, &byte) in chunk.iter().enumerate() {
+                n |= (byte as u32) << (16 - 8 * i);
+            }
+
+            let chars = match chunk.len() {
+                3 => 4,
+                2 => 3,
+                1 => 2,
+                _ => unreachable!(),
+            };
+
+            for i in 0..chars {
+                let idx = ((n >> (18 - 6 * i)) & 0x3F) as usize;
+                output.push(ALPHABET[idx] as char);
+            }
+
+            // Add padding
+            for _ in chars..4 {
+                output.push('=');
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn basic_auth_extract_valid_credentials() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        let encoded = encode_basic_auth("alice", "secret123");
+        req.headers_mut()
+            .insert("authorization", format!("Basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert_eq!(auth.username(), "alice");
+        assert_eq!(auth.password(), "secret123");
+    }
+
+    #[test]
+    fn basic_auth_extract_lowercase_basic() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        let encoded = encode_basic_auth("bob", "pass");
+        req.headers_mut()
+            .insert("authorization", format!("basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert_eq!(auth.username(), "bob");
+        assert_eq!(auth.password(), "pass");
+    }
+
+    #[test]
+    fn basic_auth_missing_header() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        // No authorization header
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let err = result.unwrap_err();
+        assert_eq!(err, BasicAuthError::MissingHeader);
+    }
+
+    #[test]
+    fn basic_auth_wrong_scheme() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("authorization", b"Bearer sometoken".to_vec());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let err = result.unwrap_err();
+        assert_eq!(err, BasicAuthError::InvalidScheme);
+    }
+
+    #[test]
+    fn basic_auth_invalid_base64() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("authorization", b"Basic !!!invalid!!!".to_vec());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let err = result.unwrap_err();
+        assert_eq!(err, BasicAuthError::InvalidBase64);
+    }
+
+    #[test]
+    fn basic_auth_missing_colon() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        // Base64 of "nocolon" (no colon separator)
+        req.headers_mut()
+            .insert("authorization", b"Basic bm9jb2xvbg==".to_vec());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let err = result.unwrap_err();
+        assert_eq!(err, BasicAuthError::MissingColon);
+    }
+
+    #[test]
+    fn basic_auth_empty_username() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        let encoded = encode_basic_auth("", "password");
+        req.headers_mut()
+            .insert("authorization", format!("Basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert_eq!(auth.username(), "");
+        assert_eq!(auth.password(), "password");
+    }
+
+    #[test]
+    fn basic_auth_empty_password() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        let encoded = encode_basic_auth("user", "");
+        req.headers_mut()
+            .insert("authorization", format!("Basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert_eq!(auth.username(), "user");
+        assert_eq!(auth.password(), "");
+    }
+
+    #[test]
+    fn basic_auth_password_with_colons() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        // Password contains colons: "pass:word:with:colons"
+        let encoded = encode_basic_auth("user", "pass:word:with:colons");
+        req.headers_mut()
+            .insert("authorization", format!("Basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(BasicAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert_eq!(auth.username(), "user");
+        assert_eq!(auth.password(), "pass:word:with:colons");
+    }
+
+    #[test]
+    fn basic_auth_optional_some() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        let encoded = encode_basic_auth("optional", "user");
+        req.headers_mut()
+            .insert("authorization", format!("Basic {encoded}").into_bytes());
+
+        let result = futures_executor::block_on(Option::<BasicAuth>::from_request(&ctx, &mut req));
+        let maybe_auth = result.unwrap();
+        assert!(maybe_auth.is_some());
+        assert_eq!(maybe_auth.unwrap().username(), "optional");
+    }
+
+    #[test]
+    fn basic_auth_optional_none() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        // No authorization header
+
+        let result = futures_executor::block_on(Option::<BasicAuth>::from_request(&ctx, &mut req));
+        let maybe_auth = result.unwrap();
+        assert!(maybe_auth.is_none());
+    }
+
+    #[test]
+    fn basic_auth_error_response_401() {
+        let err = BasicAuthError::missing_header();
+        let response = err.into_response();
+        assert_eq!(response.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn basic_auth_error_has_www_authenticate() {
+        let err = BasicAuthError::missing_header();
+        let response = err.into_response();
+
+        let has_www_auth = response
+            .headers()
+            .iter()
+            .any(|(name, value)| name == "www-authenticate" && value == b"Basic");
+        assert!(has_www_auth);
+    }
+
+    #[test]
+    fn basic_auth_error_display() {
+        assert_eq!(
+            BasicAuthError::missing_header().to_string(),
+            "Missing Authorization header"
+        );
+        assert_eq!(
+            BasicAuthError::invalid_scheme().to_string(),
+            "Authorization header must use Basic scheme"
+        );
+        assert_eq!(
+            BasicAuthError::invalid_base64().to_string(),
+            "Invalid base64 encoding in credentials"
+        );
+        assert_eq!(
+            BasicAuthError::missing_colon().to_string(),
+            "Credentials must contain username:password"
+        );
+        assert_eq!(
+            BasicAuthError::invalid_utf8().to_string(),
+            "Credentials contain invalid UTF-8"
+        );
+    }
+
+    #[test]
+    fn basic_auth_error_detail() {
+        assert_eq!(BasicAuthError::MissingHeader.detail(), "Not authenticated");
+        assert_eq!(
+            BasicAuthError::InvalidScheme.detail(),
+            "Invalid authentication credentials"
+        );
+        assert_eq!(
+            BasicAuthError::InvalidBase64.detail(),
+            "Invalid authentication credentials"
+        );
+        assert_eq!(
+            BasicAuthError::MissingColon.detail(),
+            "Invalid authentication credentials"
+        );
+        assert_eq!(
+            BasicAuthError::InvalidUtf8.detail(),
+            "Invalid authentication credentials"
+        );
+    }
+
+    #[test]
+    fn basic_auth_new_and_accessors() {
+        let auth = BasicAuth::new("testuser", "testpass");
+        assert_eq!(auth.username(), "testuser");
+        assert_eq!(auth.password(), "testpass");
+        let (user, pass) = auth.into_credentials();
+        assert_eq!(user, "testuser");
+        assert_eq!(pass, "testpass");
+    }
+
+    #[test]
+    fn basic_auth_error_response_json_body() {
+        let err = BasicAuthError::missing_header();
+        let response = err.into_response();
+
+        let body_str = match response.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+            _ => panic!("Expected Bytes body"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert_eq!(body["detail"], "Not authenticated");
+    }
+
+    #[test]
+    fn basic_auth_error_content_type_json() {
+        let err = BasicAuthError::missing_header();
+        let response = err.into_response();
+
+        let has_json_content_type = response
+            .headers()
+            .iter()
+            .any(|(name, value)| {
+                name == "content-type" && value == b"application/json"
+            });
+        assert!(has_json_content_type);
+    }
+
+    #[test]
+    fn basic_auth_all_errors_return_401() {
+        let errors = [
+            BasicAuthError::missing_header(),
+            BasicAuthError::invalid_scheme(),
+            BasicAuthError::invalid_base64(),
+            BasicAuthError::missing_colon(),
+            BasicAuthError::invalid_utf8(),
+        ];
+
+        for err in errors {
+            let response = err.into_response();
+            assert_eq!(response.status().as_u16(), 401, "All BasicAuth errors should be 401");
+        }
+    }
+
+    #[test]
+    fn basic_auth_all_errors_have_www_authenticate() {
+        let errors = [
+            BasicAuthError::missing_header(),
+            BasicAuthError::invalid_scheme(),
+            BasicAuthError::invalid_base64(),
+            BasicAuthError::missing_colon(),
+            BasicAuthError::invalid_utf8(),
+        ];
+
+        for err in errors {
+            let response = err.into_response();
+            let has_www_auth = response
+                .headers()
+                .iter()
+                .any(|(name, value)| name == "www-authenticate" && value == b"Basic");
+            assert!(has_www_auth, "All BasicAuth errors should have WWW-Authenticate: Basic");
+        }
+    }
+
+    #[test]
+    fn basic_auth_eq_and_clone() {
+        let auth1 = BasicAuth::new("user", "pass");
+        let auth2 = BasicAuth::new("user", "pass");
+        let auth3 = BasicAuth::new("other", "pass");
+
+        assert_eq!(auth1, auth2);
+        assert_ne!(auth1, auth3);
+
+        let cloned = auth1.clone();
+        assert_eq!(auth1, cloned);
+    }
+
+    #[test]
+    fn basic_auth_error_eq() {
+        assert_eq!(BasicAuthError::MissingHeader, BasicAuthError::MissingHeader);
+        assert_eq!(BasicAuthError::InvalidScheme, BasicAuthError::InvalidScheme);
+        assert_eq!(BasicAuthError::InvalidBase64, BasicAuthError::InvalidBase64);
+        assert_eq!(BasicAuthError::MissingColon, BasicAuthError::MissingColon);
+        assert_eq!(BasicAuthError::InvalidUtf8, BasicAuthError::InvalidUtf8);
+        assert_ne!(BasicAuthError::MissingHeader, BasicAuthError::InvalidScheme);
+    }
+
+    #[test]
+    fn basic_auth_debug() {
+        let auth = BasicAuth::new("debug_user", "debug_pass");
+        let debug_str = format!("{auth:?}");
+        assert!(debug_str.contains("debug_user"));
+        assert!(debug_str.contains("debug_pass"));
+    }
+
+    // Base64 decoder tests
+    #[test]
+    fn decode_base64_valid() {
+        // "user:pass" encodes to "dXNlcjpwYXNz"
+        let result = decode_base64("dXNlcjpwYXNz").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "user:pass");
+    }
+
+    #[test]
+    fn decode_base64_with_padding() {
+        // "a" encodes to "YQ=="
+        let result = decode_base64("YQ==").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "a");
+
+        // "ab" encodes to "YWI="
+        let result = decode_base64("YWI=").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "ab");
+    }
+
+    #[test]
+    fn decode_base64_without_padding() {
+        // Padding is optional
+        let result = decode_base64("YQ").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "a");
+
+        let result = decode_base64("YWI").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "ab");
+    }
+
+    #[test]
+    fn decode_base64_empty() {
+        let result = decode_base64("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_base64_invalid_char() {
+        let result = decode_base64("abc!def");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_base64_complex_password() {
+        // Test with special characters in password
+        // "admin:p@$$w0rd!123" base64 encoded
+        let encoded = encode_basic_auth("admin", "p@$$w0rd!123");
+        // Strip "Basic " prefix that encode_basic_auth adds
+        let result = decode_base64(&encoded).unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "admin:p@$$w0rd!123");
     }
 }
 

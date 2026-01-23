@@ -1203,4 +1203,453 @@ mod tests {
         assert_eq!(error_types::JSON_INVALID, "json_invalid");
         assert_eq!(error_types::VALUE_ERROR, "value_error");
     }
+
+    // ========================================================================
+    // HttpError Tests
+    // ========================================================================
+
+    #[test]
+    fn http_error_new_with_status() {
+        let error = HttpError::new(StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(error.detail.is_none());
+        assert!(error.headers.is_empty());
+    }
+
+    #[test]
+    fn http_error_bad_request() {
+        let error = HttpError::bad_request();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.status.as_u16(), 400);
+    }
+
+    #[test]
+    fn http_error_unauthorized() {
+        let error = HttpError::unauthorized();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.status.as_u16(), 401);
+    }
+
+    #[test]
+    fn http_error_forbidden() {
+        let error = HttpError::forbidden();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.status.as_u16(), 403);
+    }
+
+    #[test]
+    fn http_error_not_found() {
+        let error = HttpError::not_found();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status.as_u16(), 404);
+    }
+
+    #[test]
+    fn http_error_internal() {
+        let error = HttpError::internal();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.status.as_u16(), 500);
+    }
+
+    #[test]
+    fn http_error_payload_too_large() {
+        let error = HttpError::payload_too_large();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.status.as_u16(), 413);
+    }
+
+    #[test]
+    fn http_error_unsupported_media_type() {
+        let error = HttpError::unsupported_media_type();
+        assert_eq!(error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(error.status.as_u16(), 415);
+    }
+
+    #[test]
+    fn http_error_with_detail() {
+        let error = HttpError::not_found().with_detail("User not found");
+        assert_eq!(error.detail, Some("User not found".to_owned()));
+    }
+
+    #[test]
+    fn http_error_with_detail_owned_string() {
+        let detail = String::from("Resource missing");
+        let error = HttpError::not_found().with_detail(detail);
+        assert_eq!(error.detail, Some("Resource missing".to_owned()));
+    }
+
+    #[test]
+    fn http_error_with_header() {
+        let error = HttpError::unauthorized()
+            .with_header("WWW-Authenticate", b"Bearer realm=\"api\"".to_vec());
+        assert_eq!(error.headers.len(), 1);
+        assert_eq!(error.headers[0].0, "WWW-Authenticate");
+        assert_eq!(error.headers[0].1, b"Bearer realm=\"api\"".to_vec());
+    }
+
+    #[test]
+    fn http_error_with_multiple_headers() {
+        let error = HttpError::bad_request()
+            .with_header("X-Error-Code", b"E001".to_vec())
+            .with_header("X-Error-Context", b"validation".to_vec())
+            .with_header("Retry-After", b"60".to_vec());
+        assert_eq!(error.headers.len(), 3);
+    }
+
+    #[test]
+    fn http_error_with_detail_and_headers() {
+        let error = HttpError::unauthorized()
+            .with_detail("Invalid or expired token")
+            .with_header("WWW-Authenticate", b"Bearer".to_vec())
+            .with_header("X-Token-Expired", b"true".to_vec());
+
+        assert_eq!(error.detail, Some("Invalid or expired token".to_owned()));
+        assert_eq!(error.headers.len(), 2);
+    }
+
+    #[test]
+    fn http_error_display_without_detail() {
+        let error = HttpError::not_found();
+        let display = format!("{}", error);
+        assert_eq!(display, "Not Found");
+    }
+
+    #[test]
+    fn http_error_display_with_detail() {
+        let error = HttpError::not_found().with_detail("User 123 not found");
+        let display = format!("{}", error);
+        assert_eq!(display, "Not Found: User 123 not found");
+    }
+
+    #[test]
+    fn http_error_is_error_trait() {
+        let error: Box<dyn std::error::Error> = Box::new(HttpError::internal());
+        // Just verify it compiles and we can use it as a trait object
+        assert!(error.to_string().contains("Internal Server Error"));
+    }
+
+    #[test]
+    fn http_error_into_response_status() {
+        let error = HttpError::forbidden();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn http_error_into_response_json_content_type() {
+        let error = HttpError::bad_request();
+        let response = error.into_response();
+
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(content_type, Some(b"application/json".as_slice()));
+    }
+
+    #[test]
+    fn http_error_into_response_json_body_format() {
+        let error = HttpError::not_found().with_detail("Resource not found");
+        let response = error.into_response();
+
+        // Extract body
+        let body = match response.body() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["detail"], "Resource not found");
+    }
+
+    #[test]
+    fn http_error_into_response_default_detail() {
+        // When no detail is provided, should use canonical reason
+        let error = HttpError::not_found();
+        let response = error.into_response();
+
+        let body = match response.body() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["detail"], "Not Found");
+    }
+
+    #[test]
+    fn http_error_into_response_with_custom_headers() {
+        let error = HttpError::unauthorized()
+            .with_detail("Token expired")
+            .with_header("WWW-Authenticate", b"Bearer realm=\"api\"".to_vec());
+
+        let response = error.into_response();
+
+        // Check custom header is present
+        let www_auth = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(www_auth, Some(b"Bearer realm=\"api\"".as_slice()));
+    }
+
+    #[test]
+    fn http_error_into_response_multiple_custom_headers() {
+        let error = HttpError::bad_request()
+            .with_header("X-Error-Code", b"VALIDATION_FAILED".to_vec())
+            .with_header("X-Request-Id", b"abc-123".to_vec());
+
+        let response = error.into_response();
+
+        let headers: Vec<_> = response.headers().iter().collect();
+
+        // Should have content-type plus our two custom headers
+        assert!(headers.len() >= 3);
+
+        let error_code = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-error-code"))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(error_code, Some(b"VALIDATION_FAILED".as_slice()));
+
+        let request_id = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, v)| v.as_slice());
+        assert_eq!(request_id, Some(b"abc-123".as_slice()));
+    }
+
+    #[test]
+    fn http_error_response_body_is_valid_json() {
+        // Test all status code variants produce valid JSON
+        let errors = vec![
+            HttpError::bad_request(),
+            HttpError::unauthorized(),
+            HttpError::forbidden(),
+            HttpError::not_found(),
+            HttpError::internal(),
+            HttpError::payload_too_large(),
+            HttpError::unsupported_media_type(),
+        ];
+
+        for error in errors {
+            let status = error.status;
+            let response = error.into_response();
+            let body = match response.body() {
+                ResponseBody::Bytes(b) => b.clone(),
+                _ => panic!("Expected bytes body"),
+            };
+
+            // Should parse as valid JSON
+            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+            assert!(
+                parsed.is_ok(),
+                "Failed to parse JSON for status {}: {:?}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
+            );
+
+            // Should have detail field
+            let json = parsed.unwrap();
+            assert!(
+                json.get("detail").is_some(),
+                "Missing detail field for status {}",
+                status.as_u16()
+            );
+        }
+    }
+
+    #[test]
+    fn http_error_fastapi_compatible_format() {
+        // Verify our error format matches FastAPI's HTTPException
+        // FastAPI returns: {"detail": "message"}
+        let error = HttpError::forbidden().with_detail("Insufficient permissions");
+        let response = error.into_response();
+
+        let body = match response.body() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Only "detail" key, no extra fields
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "Expected only 'detail' field");
+        assert_eq!(json["detail"], "Insufficient permissions");
+    }
+
+    #[test]
+    fn http_error_chained_builder_pattern() {
+        // Verify builder pattern works correctly with method chaining
+        let error = HttpError::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_detail("Rate limit exceeded")
+            .with_header("Retry-After", b"60".to_vec())
+            .with_header("X-RateLimit-Remaining", b"0".to_vec());
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.detail, Some("Rate limit exceeded".to_owned()));
+        assert_eq!(error.headers.len(), 2);
+    }
+
+    // ========================================================================
+    // Additional Error Types Constants Tests
+    // ========================================================================
+
+    #[test]
+    fn error_types_all_constants_defined() {
+        // Verify all error type constants are non-empty
+        assert!(!error_types::MISSING.is_empty());
+        assert!(!error_types::STRING_TOO_SHORT.is_empty());
+        assert!(!error_types::STRING_TOO_LONG.is_empty());
+        assert!(!error_types::STRING_TYPE.is_empty());
+        assert!(!error_types::INT_TYPE.is_empty());
+        assert!(!error_types::FLOAT_TYPE.is_empty());
+        assert!(!error_types::BOOL_TYPE.is_empty());
+        assert!(!error_types::GREATER_THAN_EQUAL.is_empty());
+        assert!(!error_types::LESS_THAN_EQUAL.is_empty());
+        assert!(!error_types::STRING_PATTERN_MISMATCH.is_empty());
+        assert!(!error_types::VALUE_ERROR.is_empty());
+        assert!(!error_types::URL_TYPE.is_empty());
+        assert!(!error_types::UUID_TYPE.is_empty());
+        assert!(!error_types::JSON_INVALID.is_empty());
+        assert!(!error_types::JSON_TYPE.is_empty());
+        assert!(!error_types::TOO_SHORT.is_empty());
+        assert!(!error_types::TOO_LONG.is_empty());
+        assert!(!error_types::ENUM.is_empty());
+        assert!(!error_types::EXTRA_FORBIDDEN.is_empty());
+    }
+
+    #[test]
+    fn error_types_numeric_range_constants() {
+        // Verify numeric range error types
+        assert_eq!(error_types::GREATER_THAN_EQUAL, "greater_than_equal");
+        assert_eq!(error_types::LESS_THAN_EQUAL, "less_than_equal");
+    }
+
+    #[test]
+    fn error_types_collection_constants() {
+        // Verify collection-related error types
+        assert_eq!(error_types::TOO_SHORT, "too_short");
+        assert_eq!(error_types::TOO_LONG, "too_long");
+    }
+
+    // ========================================================================
+    // Edge Cases and Error Conditions
+    // ========================================================================
+
+    #[test]
+    fn validation_error_empty_location() {
+        let error = ValidationError::new(error_types::VALUE_ERROR, vec![]);
+        assert!(error.loc.is_empty());
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["loc"], json!([]));
+    }
+
+    #[test]
+    fn validation_error_deeply_nested_location() {
+        // Test very deeply nested location path
+        let error = ValidationError::missing(vec![
+            LocItem::field("body"),
+            LocItem::field("data"),
+            LocItem::field("users"),
+            LocItem::index(0),
+            LocItem::field("profile"),
+            LocItem::field("settings"),
+            LocItem::index(5),
+            LocItem::field("value"),
+        ]);
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            json["loc"],
+            json!(["body", "data", "users", 0, "profile", "settings", 5, "value"])
+        );
+    }
+
+    #[test]
+    fn validation_errors_empty_to_json() {
+        let errors = ValidationErrors::new();
+        let json = errors.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["detail"], json!([]));
+    }
+
+    #[test]
+    fn validation_errors_many_errors() {
+        // Test with many errors to ensure performance
+        let mut errors = ValidationErrors::new();
+        for i in 0..100 {
+            errors.push(ValidationError::missing(loc::query(&format!("param{}", i))));
+        }
+
+        assert_eq!(errors.len(), 100);
+
+        let json = errors.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["detail"].as_array().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn validation_error_special_characters_in_field_name() {
+        // Test field names with special characters
+        let error = ValidationError::missing(vec![
+            LocItem::field("body"),
+            LocItem::field("user-name"),
+            LocItem::field("email@domain"),
+        ]);
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["loc"], json!(["body", "user-name", "email@domain"]));
+    }
+
+    #[test]
+    fn validation_error_unicode_in_message() {
+        let error = ValidationError::new(error_types::VALUE_ERROR, loc::body_field("name"))
+            .with_msg("名前が無効です");
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["msg"], "名前が無効です");
+    }
+
+    #[test]
+    fn validation_error_large_input_value() {
+        // Test with large input value
+        let large_string = "x".repeat(10000);
+        let error = ValidationError::string_too_long(loc::body_field("bio"), 500)
+            .with_input(json!(large_string));
+
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["input"].as_str().unwrap().len(), 10000);
+    }
+
+    #[test]
+    fn http_error_empty_detail() {
+        // Explicitly setting empty string as detail
+        let error = HttpError::bad_request().with_detail("");
+        assert_eq!(error.detail, Some(String::new()));
+
+        let response = error.into_response();
+        let body = match response.body() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Empty detail should be used as-is
+        assert_eq!(parsed["detail"], "");
+    }
+
+    #[test]
+    fn http_error_binary_header_value() {
+        // Test header with non-UTF8 bytes
+        let error = HttpError::bad_request()
+            .with_header("X-Binary", vec![0x00, 0xFF, 0x80]);
+
+        assert_eq!(error.headers[0].1, vec![0x00, 0xFF, 0x80]);
+    }
 }

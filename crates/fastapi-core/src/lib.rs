@@ -73,15 +73,15 @@ pub use dependency::{
 };
 pub use error::{HttpError, LocItem, ValidationError, ValidationErrors};
 pub use extract::{
-    Accept, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BearerToken,
-    BearerTokenError, ContentType, Cookie, CookiePrefix, CookiePrefixError, DEFAULT_JSON_LIMIT,
-    DEFAULT_PAGE, DEFAULT_PER_PAGE, FromHeaderValue, FromRequest, Header, HeaderExtractError,
-    HeaderName, HeaderValues, Host, Json, JsonConfig, JsonExtractError, MAX_PER_PAGE, NamedHeader,
-    OAuth2BearerError, OAuth2BearerErrorKind, OAuth2PasswordBearer, OAuth2PasswordBearerConfig, Page,
-    Pagination, PaginationConfig, Path, PathExtractError, PathParams, Query, QueryExtractError,
-    QueryParams, RequestRef, ResponseMut, ResponseMutations, SameSite, SecureCompare, State,
-    StateExtractError, UserAgent, XRequestId, constant_time_eq, constant_time_str_eq,
-    snake_to_header_case,
+    Accept, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BasicAuth,
+    BasicAuthError, BearerToken, BearerTokenError, ContentType, Cookie, CookiePrefix,
+    CookiePrefixError, DEFAULT_JSON_LIMIT, DEFAULT_PAGE, DEFAULT_PER_PAGE, FromHeaderValue,
+    FromRequest, Header, HeaderExtractError, HeaderName, HeaderValues, Host, Json, JsonConfig,
+    JsonExtractError, MAX_PER_PAGE, NamedHeader, OAuth2BearerError, OAuth2BearerErrorKind,
+    OAuth2PasswordBearer, OAuth2PasswordBearerConfig, Page, Pagination, PaginationConfig, Path,
+    PathExtractError, PathParams, Query, QueryExtractError, QueryParams, RequestRef, ResponseMut,
+    ResponseMutations, SameSite, SecureCompare, State, StateExtractError, UserAgent, XRequestId,
+    constant_time_eq, constant_time_str_eq, snake_to_header_case,
 };
 pub use middleware::{
     AddResponseHeader, BoxFuture, ControlFlow, Cors, CorsConfig, Handler, Layer, Layered,

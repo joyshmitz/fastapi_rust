@@ -50,6 +50,7 @@ use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::stream::Stream;
 use asupersync::{Budget, Cx, Time};
+use fastapi_core::app::App;
 use fastapi_core::{Request, RequestContext, Response, StatusCode};
 use std::future::Future;
 use std::io;
@@ -409,7 +410,7 @@ impl TcpServer {
     /// Returns an error if binding fails or an unrecoverable IO error occurs.
     pub async fn serve<H, Fut>(&self, cx: &Cx, handler: H) -> Result<(), ServerError>
     where
-        H: Fn(RequestContext, Request) -> Fut + Send + Sync + 'static,
+        H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
     {
         let bind_addr = self.config.bind_addr.clone();
@@ -431,7 +432,7 @@ impl TcpServer {
         handler: H,
     ) -> Result<(), ServerError>
     where
-        H: Fn(RequestContext, Request) -> Fut + Send + Sync + 'static,
+        H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
     {
         self.accept_loop(cx, listener, handler).await
@@ -445,7 +446,7 @@ impl TcpServer {
         handler: H,
     ) -> Result<(), ServerError>
     where
-        H: Fn(RequestContext, Request) -> Fut + Send + Sync + 'static,
+        H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
     {
         let handler = Arc::new(handler);
@@ -559,7 +560,7 @@ impl TcpServer {
         handler: &H,
     ) -> Result<(), ServerError>
     where
-        H: Fn(RequestContext, Request) -> Fut + Send + Sync,
+        H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync,
         Fut: Future<Output = Response> + Send,
     {
         let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
@@ -577,7 +578,7 @@ impl TcpServer {
             // Try to parse a complete request from buffered data first
             let parse_result = parser.feed(&[])?;
 
-            let request = match parse_result {
+            let mut request = match parse_result {
                 ParseStatus::Complete { request, .. } => request,
                 ParseStatus::Incomplete => {
                     // Need more data - read from stream
@@ -624,7 +625,7 @@ impl TcpServer {
             let timeout_duration = Duration::from_nanos(self.config.request_timeout.as_nanos());
 
             // Call the handler
-            let response = handler(ctx, request).await;
+            let response = handler(ctx, &mut request).await;
 
             // Check if request exceeded timeout and return 504 Gateway Timeout
             let mut response = if request_start.elapsed() > timeout_duration {
@@ -647,6 +648,11 @@ impl TcpServer {
             // Write the response
             let response_write = response_writer.write(response);
             write_response(&mut stream, response_write).await?;
+
+            // Execute background tasks
+            if let Some(tasks) = App::take_background_tasks(&mut request) {
+                tasks.execute_all().await;
+            }
 
             // If not keep-alive, close the connection
             if !server_will_keep_alive {
