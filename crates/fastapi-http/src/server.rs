@@ -44,6 +44,7 @@
 //! server.serve(handler).await?;
 //! ```
 
+use crate::connection::should_keep_alive;
 use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -54,7 +55,7 @@ use fastapi_core::app::App;
 use fastapi_core::{Request, RequestContext, Response, StatusCode};
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -92,6 +93,10 @@ pub struct ServerConfig {
     pub read_buffer_size: usize,
     /// HTTP parse limits.
     pub parse_limits: ParseLimits,
+    /// Allowed hostnames for Host header validation (empty = allow all).
+    pub allowed_hosts: Vec<String>,
+    /// Whether to trust X-Forwarded-Host for host validation.
+    pub trust_x_forwarded_host: bool,
     /// Enable TCP_NODELAY.
     pub tcp_nodelay: bool,
     /// Keep-alive timeout (time to wait for next request on a connection).
@@ -114,6 +119,8 @@ impl ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             read_buffer_size: DEFAULT_READ_BUFFER_SIZE,
             parse_limits: ParseLimits::default(),
+            allowed_hosts: Vec::new(),
+            trust_x_forwarded_host: false,
             tcp_nodelay: true,
             keep_alive_timeout: Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
             max_requests_per_connection: DEFAULT_MAX_REQUESTS_PER_CONNECTION,
@@ -153,6 +160,33 @@ impl ServerConfig {
     #[must_use]
     pub fn with_parse_limits(mut self, limits: ParseLimits) -> Self {
         self.parse_limits = limits;
+        self
+    }
+
+    /// Sets allowed hosts for Host header validation.
+    ///
+    /// An empty list means "allow any host".
+    #[must_use]
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds a single allowed host.
+    #[must_use]
+    pub fn allow_host(mut self, host: impl Into<String>) -> Self {
+        self.allowed_hosts.push(host.into());
+        self
+    }
+
+    /// Enables or disables trust of X-Forwarded-Host.
+    #[must_use]
+    pub fn with_trust_x_forwarded_host(mut self, trust: bool) -> Self {
+        self.trust_x_forwarded_host = trust;
         self
     }
 
@@ -245,6 +279,241 @@ impl std::error::Error for ServerError {
             _ => None,
         }
     }
+}
+
+// ============================================================================
+// Host Header Validation
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostValidationErrorKind {
+    Missing,
+    Invalid,
+    NotAllowed,
+}
+
+#[derive(Debug, Clone)]
+struct HostValidationError {
+    kind: HostValidationErrorKind,
+    detail: String,
+}
+
+impl HostValidationError {
+    fn missing() -> Self {
+        Self {
+            kind: HostValidationErrorKind::Missing,
+            detail: "missing Host header".to_string(),
+        }
+    }
+
+    fn invalid(detail: impl Into<String>) -> Self {
+        Self {
+            kind: HostValidationErrorKind::Invalid,
+            detail: detail.into(),
+        }
+    }
+
+    fn not_allowed(detail: impl Into<String>) -> Self {
+        Self {
+            kind: HostValidationErrorKind::NotAllowed,
+            detail: detail.into(),
+        }
+    }
+
+    fn response(&self) -> Response {
+        let message = match self.kind {
+            HostValidationErrorKind::Missing => "Bad Request: Host header required",
+            HostValidationErrorKind::Invalid => "Bad Request: invalid Host header",
+            HostValidationErrorKind::NotAllowed => "Bad Request: Host not allowed",
+        };
+        Response::with_status(StatusCode::BAD_REQUEST).body(fastapi_core::ResponseBody::Bytes(
+            message.as_bytes().to_vec(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostHeader {
+    host: String,
+    port: Option<u16>,
+}
+
+fn validate_host_header(
+    request: &Request,
+    config: &ServerConfig,
+) -> Result<HostHeader, HostValidationError> {
+    let raw = extract_effective_host(request, config)?;
+    let parsed = parse_host_header(&raw)
+        .ok_or_else(|| HostValidationError::invalid(format!("invalid host value: {raw}")))?;
+
+    if !is_allowed_host(&parsed, &config.allowed_hosts) {
+        return Err(HostValidationError::not_allowed(format!(
+            "host not allowed: {}",
+            parsed.host
+        )));
+    }
+
+    Ok(parsed)
+}
+
+fn extract_effective_host(
+    request: &Request,
+    config: &ServerConfig,
+) -> Result<String, HostValidationError> {
+    if config.trust_x_forwarded_host {
+        if let Some(value) = header_value(request, "x-forwarded-host")? {
+            let forwarded = extract_first_list_value(&value)
+                .ok_or_else(|| HostValidationError::invalid("empty X-Forwarded-Host value"))?;
+            return Ok(forwarded.to_string());
+        }
+    }
+
+    match header_value(request, "host")? {
+        Some(value) => Ok(value),
+        None => Err(HostValidationError::missing()),
+    }
+}
+
+fn header_value(request: &Request, name: &str) -> Result<Option<String>, HostValidationError> {
+    request
+        .headers()
+        .get(name)
+        .map(|bytes| {
+            std::str::from_utf8(bytes)
+                .map(|s| s.trim().to_string())
+                .map_err(|_| {
+                    HostValidationError::invalid(format!("invalid UTF-8 in {name} header"))
+                })
+        })
+        .transpose()
+}
+
+fn extract_first_list_value(value: &str) -> Option<&str> {
+    value.split(',').map(str::trim).find(|v| !v.is_empty())
+}
+
+fn parse_host_header(value: &str) -> Option<HostHeader> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        let host = &value[1..end];
+        if host.is_empty() {
+            return None;
+        }
+        if host.parse::<Ipv6Addr>().is_err() {
+            return None;
+        }
+        let rest = &value[end + 1..];
+        let port = if rest.is_empty() {
+            None
+        } else if let Some(port_str) = rest.strip_prefix(':') {
+            parse_port(port_str)
+        } else {
+            return None;
+        };
+        return Some(HostHeader {
+            host: host.to_ascii_lowercase(),
+            port,
+        });
+    }
+
+    let mut parts = value.split(':');
+    let host = parts.next().unwrap_or("");
+    let port_part = parts.next();
+    if parts.next().is_some() {
+        // Multiple colons without brackets (likely IPv6) are invalid
+        return None;
+    }
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = match port_part {
+        Some(p) => parse_port(p),
+        None => None,
+    };
+
+    if host.parse::<Ipv4Addr>().is_ok() || is_valid_hostname(host) {
+        Some(HostHeader {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_port(port: &str) -> Option<u16> {
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = port.parse::<u16>().ok()?;
+    if value == 0 { None } else { Some(value) }
+}
+
+fn is_valid_hostname(host: &str) -> bool {
+    if host.len() > 253 {
+        return false;
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        let bytes = label.as_bytes();
+        if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_allowed_host(host: &HostHeader, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+
+    allowed_hosts
+        .iter()
+        .any(|pattern| host_matches_pattern(host, pattern))
+}
+
+fn host_matches_pattern(host: &HostHeader, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        let suffix = suffix.to_ascii_lowercase();
+        if host.host == suffix {
+            return false;
+        }
+        return host.host.ends_with(&format!(".{suffix}"));
+    }
+
+    if let Some(parsed) = parse_host_header(pattern) {
+        if parsed.host != host.host {
+            return false;
+        }
+        if let Some(port) = parsed.port {
+            return host.port == Some(port);
+        }
+        return true;
+    }
+
+    false
 }
 
 impl From<io::Error> for ServerError {
@@ -611,6 +880,15 @@ impl TcpServer {
             let request_cx = Cx::for_testing_with_budget(request_budget);
             let ctx = RequestContext::new(request_cx, request_id);
 
+            // Validate Host header (required for HTTP/1.1 and virtual hosting).
+            if let Err(err) = validate_host_header(&request, &self.config) {
+                ctx.trace(&format!("Rejecting request: {}", err.detail));
+                let response = err.response().header("connection", b"close".to_vec());
+                let response_write = response_writer.write(response);
+                write_response(&mut stream, response_write).await?;
+                return Ok(());
+            }
+
             // Check if this is a keep-alive connection
             let client_wants_keep_alive = should_keep_alive(&request);
 
@@ -741,28 +1019,7 @@ async fn write_all(stream: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Determines if a connection should be kept alive based on HTTP headers.
-///
-/// HTTP/1.1 defaults to keep-alive unless "Connection: close" is present.
-/// HTTP/1.0 requires explicit "Connection: keep-alive".
-fn should_keep_alive(request: &Request) -> bool {
-    // Check for Connection header
-    if let Some(connection) = request.headers().get("connection") {
-        if let Ok(value) = std::str::from_utf8(connection) {
-            let value = value.to_ascii_lowercase();
-            if value.contains("close") {
-                return false;
-            }
-            if value.contains("keep-alive") {
-                return true;
-            }
-        }
-    }
-
-    // HTTP/1.1 defaults to keep-alive
-    // For simplicity, we assume HTTP/1.1 for now
-    true
-}
+// Connection header handling moved to crate::connection module
 
 // ============================================================================
 // Synchronous Server (for compatibility)
@@ -818,12 +1075,16 @@ mod tests {
         let config = ServerConfig::new("0.0.0.0:3000")
             .with_request_timeout_secs(60)
             .with_max_connections(1000)
-            .with_tcp_nodelay(false);
+            .with_tcp_nodelay(false)
+            .with_allowed_hosts(["example.com", "api.example.com"])
+            .with_trust_x_forwarded_host(true);
 
         assert_eq!(config.bind_addr, "0.0.0.0:3000");
         assert_eq!(config.request_timeout, Time::from_secs(60));
         assert_eq!(config.max_connections, 1000);
         assert!(!config.tcp_nodelay);
+        assert_eq!(config.allowed_hosts.len(), 2);
+        assert!(config.trust_x_forwarded_host);
     }
 
     #[test]
@@ -836,6 +1097,8 @@ mod tests {
         );
         assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert!(config.tcp_nodelay);
+        assert!(config.allowed_hosts.is_empty());
+        assert!(!config.trust_x_forwarded_host);
     }
 
     #[test]
@@ -868,6 +1131,83 @@ mod tests {
         let request = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let result = server.parse_request(request);
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Host header validation tests
+    // ========================================================================
+
+    #[test]
+    fn host_validation_missing_host_rejected() {
+        let config = ServerConfig::default();
+        let request = Request::new(fastapi_core::Method::Get, "/");
+        let err = validate_host_header(&request, &config).unwrap_err();
+        assert_eq!(err.kind, HostValidationErrorKind::Missing);
+        assert_eq!(err.response().status().as_u16(), 400);
+    }
+
+    #[test]
+    fn host_validation_allows_configured_host() {
+        let config = ServerConfig::default().with_allowed_hosts(["example.com"]);
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"example.com".to_vec());
+        assert!(validate_host_header(&request, &config).is_ok());
+    }
+
+    #[test]
+    fn host_validation_rejects_disallowed_host() {
+        let config = ServerConfig::default().with_allowed_hosts(["example.com"]);
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"evil.com".to_vec());
+        let err = validate_host_header(&request, &config).unwrap_err();
+        assert_eq!(err.kind, HostValidationErrorKind::NotAllowed);
+    }
+
+    #[test]
+    fn host_validation_wildcard_allows_subdomains_only() {
+        let config = ServerConfig::default().with_allowed_hosts(["*.example.com"]);
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"api.example.com".to_vec());
+        assert!(validate_host_header(&request, &config).is_ok());
+
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"example.com".to_vec());
+        let err = validate_host_header(&request, &config).unwrap_err();
+        assert_eq!(err.kind, HostValidationErrorKind::NotAllowed);
+    }
+
+    #[test]
+    fn host_validation_uses_x_forwarded_host_when_trusted() {
+        let config = ServerConfig::default()
+            .with_allowed_hosts(["example.com"])
+            .with_trust_x_forwarded_host(true);
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"internal.local".to_vec());
+        request
+            .headers_mut()
+            .insert("X-Forwarded-Host".to_string(), b"example.com".to_vec());
+        assert!(validate_host_header(&request, &config).is_ok());
+    }
+
+    #[test]
+    fn host_validation_rejects_invalid_host_value() {
+        let config = ServerConfig::default();
+        let mut request = Request::new(fastapi_core::Method::Get, "/");
+        request
+            .headers_mut()
+            .insert("Host".to_string(), b"bad host".to_vec());
+        let err = validate_host_header(&request, &config).unwrap_err();
+        assert_eq!(err.kind, HostValidationErrorKind::Invalid);
     }
 
     // ========================================================================

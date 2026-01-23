@@ -60,7 +60,7 @@ fn e2e_full_startup_flow_plain_mode() {
             .openapi_path("/openapi.json");
         let banner_output = banner.render(&info);
 
-        eprintln!("[E2E] Banner output:\n{}", banner_output);
+        eprintln!("[E2E] Banner output:\n{banner_output}");
 
         // Verify no ANSI codes in banner
         assert_no_ansi(&banner_output);
@@ -83,7 +83,7 @@ fn e2e_full_startup_flow_plain_mode() {
             out.success("Server started successfully");
         });
 
-        eprintln!("[E2E] Status output:\n{}", status_captured);
+        eprintln!("[E2E] Status output:\n{status_captured}");
 
         // Verify status messages with correct prefixes
         assert_no_ansi(&status_captured);
@@ -258,12 +258,12 @@ fn e2e_request_logging_flow() {
         let mut all_output = String::new();
         for req in &requests {
             let line = logger.format(req);
-            eprintln!("[E2E] Log line: {}", line);
+            eprintln!("[E2E] Log line: {line}");
             all_output.push_str(&line);
             all_output.push('\n');
         }
 
-        eprintln!("[E2E] Full request log output:\n{}", all_output);
+        eprintln!("[E2E] Full request log output:\n{all_output}");
 
         assert_no_ansi(&all_output);
         assert_contains(&all_output, "GET");
@@ -318,7 +318,7 @@ fn e2e_all_components_use_consistent_mode() {
             output.success("All components verified");
         });
 
-        eprintln!("[E2E] Component consistency output:\n{}", captured);
+        eprintln!("[E2E] Component consistency output:\n{captured}");
         assert_no_ansi(&captured);
 
         eprintln!("[E2E] PASS: All components use consistent mode");
@@ -415,8 +415,8 @@ fn e2e_capture_both_produces_different_output() {
             output.success("Test message");
         });
 
-        eprintln!("[E2E] Plain: {}", plain);
-        eprintln!("[E2E] Rich: {}", rich);
+        eprintln!("[E2E] Plain: {plain}");
+        eprintln!("[E2E] Rich: {rich}");
 
         // Both should contain the message
         assert_contains(&plain, "Test message");
@@ -438,8 +438,8 @@ fn e2e_strip_ansi_works() {
         let with_ansi = "\x1b[32m\x1b[1m✓\x1b[0m Success message";
         let stripped = strip_ansi_codes(with_ansi);
 
-        eprintln!("[E2E] Original: {:?}", with_ansi);
-        eprintln!("[E2E] Stripped: {:?}", stripped);
+        eprintln!("[E2E] Original: {with_ansi:?}");
+        eprintln!("[E2E] Stripped: {stripped:?}");
 
         assert!(!stripped.contains("\x1b["));
         assert_contains(&stripped, "Success message");

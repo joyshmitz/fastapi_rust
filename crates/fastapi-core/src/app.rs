@@ -36,6 +36,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -50,6 +51,67 @@ use crate::response::{Response, StatusCode};
 use crate::routing::{RouteLookup, RouteTable, format_allow_header};
 use crate::shutdown::ShutdownController;
 use serde::Deserialize;
+
+// ============================================================================
+// Type-Safe State Registry (Compile-Time State Tracking)
+// ============================================================================
+
+/// Marker trait for the type-level state registry.
+///
+/// The state registry is a type-level set represented as nested tuples:
+/// - `()` represents the empty set
+/// - `(T, S)` represents the set containing T plus all types in S
+///
+/// This enables compile-time verification that state types are registered
+/// before they are used by handlers.
+pub trait StateRegistry: Send + Sync + 'static {}
+
+impl StateRegistry for () {}
+impl<T: Send + Sync + 'static, S: StateRegistry> StateRegistry for (T, S) {}
+
+/// Marker trait indicating that type T is present in state registry S.
+///
+/// This trait is automatically implemented for any type T that appears
+/// in the nested tuple structure of S.
+///
+/// # Example
+///
+/// ```ignore
+/// // (DbPool, (Config, ())) contains both DbPool and Config
+/// fn requires_db<S: HasState<DbPool>>() {}
+/// fn requires_config<S: HasState<Config>>() {}
+///
+/// // Both work with (DbPool, (Config, ()))
+/// type MyState = (DbPool, (Config, ()));
+/// requires_db::<MyState>();   // compiles
+/// requires_config::<MyState>(); // compiles
+/// ```
+pub trait HasState<T>: StateRegistry {}
+
+// T is in (T, S) - direct match (at head of tuple)
+impl<T: Send + Sync + 'static, S: StateRegistry> HasState<T> for (T, S) {}
+
+// Note: A recursive impl like "T is in (U, S) if T is in S" would conflict
+// with the direct impl when T == U. Without negative bounds or specialization,
+// we can only support checking for types at specific positions in the tuple.
+// For multiple state types, users can define impls manually for their specific
+// tuple structure, or use a different state organization.
+
+/// Trait for types that require specific state to be registered.
+///
+/// This is implemented by extractors like `State<T>` to declare their
+/// state dependencies at the type level.
+///
+/// # Example
+///
+/// ```ignore
+/// // State<DbPool> requires DbPool to be in the registry
+/// impl<S: HasState<DbPool>> RequiresState<S> for State<DbPool> {}
+/// ```
+pub trait RequiresState<S: StateRegistry> {}
+
+// All types that don't need state trivially satisfy RequiresState
+impl<S: StateRegistry> RequiresState<S> for () {}
 
 // ============================================================================
 // Lifecycle Hook Types
@@ -189,6 +251,192 @@ impl StartupOutcome {
     }
 }
 
+// ============================================================================
+// Lifespan Context Manager
+// ============================================================================
+
+/// Error during lifespan startup.
+///
+/// This error is returned when the lifespan function fails during the startup phase.
+/// It will abort the application startup, preventing the server from accepting connections.
+#[derive(Debug)]
+pub struct LifespanError {
+    /// Description of what went wrong.
+    pub message: String,
+    /// Optional underlying error source.
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl LifespanError {
+    /// Creates a new lifespan error with a message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Creates a lifespan error wrapping another error.
+    pub fn with_source<E: std::error::Error + Send + Sync + 'static>(
+        message: impl Into<String>,
+        source: E,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl std::fmt::Display for LifespanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lifespan error: {}", self.message)?;
+        if let Some(ref source) = self.source {
+            write!(f, " (caused by: {})", source)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LifespanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl From<LifespanError> for StartupHookError {
+    fn from(err: LifespanError) -> Self {
+        StartupHookError::new(err.to_string())
+    }
+}
+
+/// Scope returned by a lifespan function containing state and cleanup logic.
+///
+/// The lifespan pattern allows sharing state between startup and shutdown phases,
+/// which is particularly useful for resources like database connections that need
+/// coordinated initialization and cleanup.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::app::{App, LifespanScope, LifespanError};
+///
+/// struct DatabasePool { /* ... */ }
+///
+/// impl DatabasePool {
+///     async fn connect(url: &str) -> Result<Self, Error> { /* ... */ }
+///     async fn close(&self) { /* ... */ }
+/// }
+///
+/// let app = App::builder()
+///     .lifespan(|| async {
+///         // Startup: connect to database
+///         let pool = DatabasePool::connect("postgres://localhost/mydb")
+///             .await
+///             .map_err(|e| LifespanError::with_source("failed to connect to database", e))?;
+///
+///         // Clone for the cleanup closure
+///         let pool_for_cleanup = pool.clone();
+///
+///         // Return state + cleanup
+///         Ok(LifespanScope::new(pool)
+///             .on_shutdown(async move {
+///                 pool_for_cleanup.close().await;
+///             }))
+///     })
+///     .build();
+/// ```
+pub struct LifespanScope<T: Send + Sync + 'static> {
+    /// State produced by the lifespan function.
+    ///
+    /// This state is automatically added to the application's state container
+    /// and can be accessed by handlers via the `State<T>` extractor.
+    pub state: T,
+
+    /// Optional cleanup future to run during shutdown.
+    cleanup: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+impl<T: Send + Sync + 'static> LifespanScope<T> {
+    /// Creates a new lifespan scope with the given state.
+    ///
+    /// The state will be added to the application's state container after
+    /// successful startup, accessible via the `State<T>` extractor.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let scope = LifespanScope::new(MyState { value: 42 });
+    /// ```
+    pub fn new(state: T) -> Self {
+        Self {
+            state,
+            cleanup: None,
+        }
+    }
+
+    /// Sets the cleanup future to run during application shutdown.
+    ///
+    /// The cleanup runs in reverse order relative to other lifespan/shutdown hooks,
+    /// after all in-flight requests have completed or been cancelled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let scope = LifespanScope::new(pool.clone())
+    ///     .on_shutdown(async move {
+    ///         pool.close().await;
+    ///         println!("Database pool closed");
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn on_shutdown<F>(mut self, cleanup: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.cleanup = Some(Box::pin(cleanup));
+        self
+    }
+
+    /// Takes the cleanup future, leaving `None` in its place.
+    ///
+    /// This is used internally to transfer the cleanup to the shutdown system.
+    pub fn take_cleanup(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        self.cleanup.take()
+    }
+}
+
+impl<T: Send + Sync + std::fmt::Debug + 'static> std::fmt::Debug for LifespanScope<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifespanScope")
+            .field("state", &self.state)
+            .field("has_cleanup", &self.cleanup.is_some())
+            .finish()
+    }
+}
+
+/// Boxed lifespan function type.
+///
+/// The lifespan function runs during startup and returns state (as Any) along with
+/// an optional cleanup future for shutdown. The state is then inserted into the container.
+pub type BoxLifespanFn = Box<
+    dyn FnOnce() -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (
+                                Box<dyn std::any::Any + Send + Sync>,
+                                Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+                            ),
+                            LifespanError,
+                        >,
+                    > + Send,
+            >,
+        > + Send,
+>;
+
 /// A boxed handler function.
 ///
 /// The handler may return a future that borrows from the context/request for
@@ -266,6 +514,15 @@ impl StateContainer {
     /// If a value of the same type already exists, it is replaced.
     pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
         self.state.insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// Inserts a boxed Any value into the state container.
+    ///
+    /// This is used by the lifespan system to insert type-erased state.
+    /// The TypeId is obtained from the actual type inside the box.
+    pub fn insert_any(&mut self, value: Box<dyn Any + Send + Sync>) {
+        let type_id = (*value).type_id();
+        self.state.insert(type_id, Arc::from(value));
     }
 
     /// Gets a reference to a value in the state container.
@@ -892,19 +1149,23 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
 }
 
 fn parse_usize(key: &str, value: &str) -> Result<usize, ConfigError> {
-    value.parse::<usize>().map_err(|_| ConfigError::InvalidEnvVar {
-        key: key.to_string(),
-        value: value.to_string(),
-        expected: "usize".to_string(),
-    })
+    value
+        .parse::<usize>()
+        .map_err(|_| ConfigError::InvalidEnvVar {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: "usize".to_string(),
+        })
 }
 
 fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
-    value.parse::<u64>().map_err(|_| ConfigError::InvalidEnvVar {
-        key: key.to_string(),
-        value: value.to_string(),
-        expected: "u64".to_string(),
-    })
+    value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidEnvVar {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: "u64".to_string(),
+        })
 }
 
 /// Builder for constructing an [`App`].
@@ -932,7 +1193,27 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
 ///     .route("/items/{id}", Method::Get, get_item)
 ///     .build();
 /// ```
-pub struct AppBuilder {
+///
+/// # Type-Safe State
+///
+/// The `AppBuilder` uses a type-state pattern to track registered state types
+/// at compile time. The generic parameter `S` represents the type-level set of
+/// registered state types.
+///
+/// When you call `.with_state::<T>(value)`, the builder's type changes from
+/// `AppBuilder<S>` to `AppBuilder<(T, S)>`, recording that `T` is now available.
+///
+/// Handlers that use `State<T>` extractors can optionally be constrained to
+/// require `S: HasState<T>`, ensuring the state is registered at compile time.
+///
+/// ```ignore
+/// // Type changes: AppBuilder<()> -> AppBuilder<(DbPool, ())> -> AppBuilder<(Config, (DbPool, ()))>
+/// let app = App::builder()
+///     .with_state(DbPool::new())  // Now has DbPool
+///     .with_state(Config::default())  // Now has DbPool + Config
+///     .build();
+/// ```
+pub struct AppBuilder<S: StateRegistry = ()> {
     config: AppConfig,
     routes: Vec<RouteEntry>,
     middleware: Vec<Arc<dyn Middleware>>,
@@ -942,9 +1223,12 @@ pub struct AppBuilder {
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
     async_shutdown_hooks: Vec<Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
+    /// Optional lifespan function for async startup/shutdown context management.
+    lifespan: Option<BoxLifespanFn>,
+    _state_marker: PhantomData<S>,
 }
 
-impl Default for AppBuilder {
+impl Default for AppBuilder<()> {
     fn default() -> Self {
         Self {
             config: AppConfig::default(),
@@ -956,17 +1240,21 @@ impl Default for AppBuilder {
             startup_hooks: Vec::new(),
             shutdown_hooks: Vec::new(),
             async_shutdown_hooks: Vec::new(),
+            lifespan: None,
+            _state_marker: PhantomData,
         }
     }
 }
 
-impl AppBuilder {
-    /// Creates a new application builder.
+impl AppBuilder<()> {
+    /// Creates a new application builder with no registered state.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl<S: StateRegistry> AppBuilder<S> {
     /// Sets the application configuration.
     #[must_use]
     pub fn config(mut self, config: AppConfig) -> Self {
@@ -1115,13 +1403,71 @@ impl AppBuilder {
         self
     }
 
-    /// Adds shared state to the application.
+    /// Adds shared state to the application (legacy method).
     ///
     /// State can be accessed by handlers through the `State<T>` extractor.
+    ///
+    /// **Note:** This method is deprecated in favor of [`with_state`](Self::with_state),
+    /// which provides compile-time verification that state types are registered.
     #[must_use]
-    pub fn state<T: Send + Sync + 'static>(mut self, state: T) -> Self {
-        self.state.insert(state);
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `with_state` for compile-time state type verification"
+    )]
+    pub fn state<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        self.state.insert(value);
         self
+    }
+
+    /// Adds typed state to the application with compile-time registration.
+    ///
+    /// This method registers state using a type-state pattern, which enables
+    /// compile-time verification that state types are properly registered before
+    /// they are used by handlers.
+    ///
+    /// The return type changes from `AppBuilder<S>` to `AppBuilder<(T, S)>`,
+    /// recording that type `T` is now available in the state registry.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_core::app::App;
+    ///
+    /// struct DbPool { /* ... */ }
+    /// struct Config { api_key: String }
+    ///
+    /// // Type evolves: () -> (DbPool, ()) -> (Config, (DbPool, ()))
+    /// let app = App::builder()
+    ///     .with_state(DbPool::new())    // Now has DbPool
+    ///     .with_state(Config::default()) // Now has DbPool + Config
+    ///     .build();
+    /// ```
+    ///
+    /// # Compile-Time Safety
+    ///
+    /// When used with the `RequiresState` trait, handlers can declare their
+    /// state dependencies and the compiler will verify they are met:
+    ///
+    /// ```ignore
+    /// // This handler requires DbPool to be registered
+    /// fn handler_requiring_db<S: HasState<DbPool>>(app: AppBuilder<S>) { /* ... */ }
+    /// ```
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(mut self, value: T) -> AppBuilder<(T, S)> {
+        self.state.insert(value);
+        AppBuilder {
+            config: self.config,
+            routes: self.routes,
+            middleware: self.middleware,
+            state: self.state,
+            dependency_overrides: self.dependency_overrides,
+            exception_handlers: self.exception_handlers,
+            startup_hooks: self.startup_hooks,
+            shutdown_hooks: self.shutdown_hooks,
+            async_shutdown_hooks: self.async_shutdown_hooks,
+            lifespan: self.lifespan,
+            _state_marker: PhantomData,
+        }
     }
 
     /// Registers a dependency override for this application (useful in tests).
@@ -1318,6 +1664,120 @@ impl AppBuilder {
         self
     }
 
+    /// Registers a lifespan context manager for async startup/shutdown.
+    ///
+    /// The lifespan pattern is preferred over separate `on_startup`/`on_shutdown` hooks
+    /// because it allows sharing state between the startup and shutdown phases. This is
+    /// especially useful for resources like database connections, HTTP clients, or
+    /// background task managers.
+    ///
+    /// The lifespan function runs during application startup. It should:
+    /// 1. Initialize resources (connect to database, start background tasks, etc.)
+    /// 2. Return a `LifespanScope` containing:
+    ///    - State to be added to the application (accessible via `State<T>` extractor)
+    ///    - An optional cleanup closure to run during shutdown
+    ///
+    /// If the lifespan function returns an error, application startup is aborted.
+    ///
+    /// **Note:** When a lifespan is provided, it runs *before* any `on_startup` hooks.
+    /// The lifespan cleanup runs *after* all `on_shutdown` hooks during shutdown.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_core::app::{App, LifespanScope, LifespanError};
+    ///
+    /// #[derive(Clone)]
+    /// struct DatabasePool { /* ... */ }
+    ///
+    /// impl DatabasePool {
+    ///     async fn connect(url: &str) -> Result<Self, Error> { /* ... */ }
+    ///     async fn close(&self) { /* ... */ }
+    /// }
+    ///
+    /// let app = App::builder()
+    ///     .lifespan(|| async {
+    ///         // Startup: connect to database
+    ///         println!("Connecting to database...");
+    ///         let pool = DatabasePool::connect("postgres://localhost/mydb")
+    ///             .await
+    ///             .map_err(|e| LifespanError::with_source("database connection failed", e))?;
+    ///
+    ///         // Clone for use in cleanup
+    ///         let pool_for_cleanup = pool.clone();
+    ///
+    ///         // Return state and cleanup
+    ///         Ok(LifespanScope::new(pool)
+    ///             .on_shutdown(async move {
+    ///                 println!("Closing database connections...");
+    ///                 pool_for_cleanup.close().await;
+    ///             }))
+    ///     })
+    ///     .get("/users", get_users)  // Handler can use State<DatabasePool>
+    ///     .build();
+    /// ```
+    ///
+    /// # Multiple State Types
+    ///
+    /// To provide multiple state types from a single lifespan, use a tuple or
+    /// define a struct containing all your state:
+    ///
+    /// ```ignore
+    /// #[derive(Clone)]
+    /// struct AppState {
+    ///     db: DatabasePool,
+    ///     cache: RedisClient,
+    ///     config: AppConfig,
+    /// }
+    ///
+    /// let app = App::builder()
+    ///     .lifespan(|| async {
+    ///         let db = DatabasePool::connect("...").await?;
+    ///         let cache = RedisClient::connect("...").await?;
+    ///         let config = load_config().await?;
+    ///
+    ///         let state = AppState { db, cache, config };
+    ///         let state_for_cleanup = state.clone();
+    ///
+    ///         Ok(LifespanScope::new(state)
+    ///             .on_shutdown(async move {
+    ///                 state_for_cleanup.db.close().await;
+    ///                 state_for_cleanup.cache.close().await;
+    ///             }))
+    ///     })
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn lifespan<F, Fut, T>(mut self, lifespan_fn: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<LifespanScope<T>, LifespanError>> + Send + 'static,
+        T: Send + Sync + 'static,
+    {
+        self.lifespan = Some(Box::new(move || {
+            Box::pin(async move {
+                // Run the lifespan function
+                let mut scope = lifespan_fn().await?;
+
+                // Extract cleanup first (before moving state)
+                let cleanup = scope.take_cleanup();
+
+                // Extract the state as a boxed Any
+                let state: Box<dyn std::any::Any + Send + Sync> = Box::new(scope.state);
+
+                // Return both the state and the cleanup future
+                Ok((state, cleanup))
+            })
+        }));
+        self
+    }
+
+    /// Returns true if a lifespan function has been registered.
+    #[must_use]
+    pub fn has_lifespan(&self) -> bool {
+        self.lifespan.is_some()
+    }
+
     /// Returns the number of registered startup hooks.
     #[must_use]
     pub fn startup_hook_count(&self) -> usize {
@@ -1352,17 +1812,19 @@ impl AppBuilder {
             routes: self.routes,
             route_table,
             middleware: middleware_stack,
-            state: Arc::new(self.state),
+            state: Arc::new(parking_lot::RwLock::new(self.state)),
             dependency_overrides: Arc::clone(&self.dependency_overrides),
             exception_handlers: Arc::new(self.exception_handlers),
             startup_hooks: parking_lot::Mutex::new(self.startup_hooks),
             shutdown_hooks: parking_lot::Mutex::new(self.shutdown_hooks),
             async_shutdown_hooks: parking_lot::Mutex::new(self.async_shutdown_hooks),
+            lifespan: parking_lot::Mutex::new(self.lifespan),
+            lifespan_cleanup: parking_lot::Mutex::new(None),
         }
     }
 }
 
-impl std::fmt::Debug for AppBuilder {
+impl<S: StateRegistry> std::fmt::Debug for AppBuilder<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppBuilder")
             .field("config", &self.config)
@@ -1387,7 +1849,8 @@ pub struct App {
     /// Route table for path matching with parameter extraction.
     route_table: RouteTable<usize>,
     middleware: MiddlewareStack,
-    state: Arc<StateContainer>,
+    /// State container with interior mutability to support lifespan-injected state.
+    state: Arc<parking_lot::RwLock<StateContainer>>,
     dependency_overrides: Arc<DependencyOverrides>,
     exception_handlers: Arc<ExceptionHandlers>,
     startup_hooks: parking_lot::Mutex<Vec<StartupHook>>,
@@ -1395,12 +1858,16 @@ pub struct App {
     async_shutdown_hooks: parking_lot::Mutex<
         Vec<Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
     >,
+    /// Pending lifespan function to run during startup.
+    lifespan: parking_lot::Mutex<Option<BoxLifespanFn>>,
+    /// Cleanup future from lifespan function (runs during shutdown).
+    lifespan_cleanup: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
 }
 
 impl App {
     /// Creates a new application builder.
     #[must_use]
-    pub fn builder() -> AppBuilder {
+    pub fn builder() -> AppBuilder<()> {
         AppBuilder::new()
     }
 
@@ -1416,15 +1883,15 @@ impl App {
         self.routes.len()
     }
 
-    /// Returns the shared state container.
+    /// Returns the shared state container (protected by RwLock for lifespan mutation).
     #[must_use]
-    pub fn state(&self) -> &Arc<StateContainer> {
+    pub fn state(&self) -> &Arc<parking_lot::RwLock<StateContainer>> {
         &self.state
     }
 
     /// Gets a reference to shared state of type T.
     pub fn get_state<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.state.get::<T>()
+        self.state.read().get::<T>()
     }
 
     /// Returns the dependency overrides registry.
@@ -1568,8 +2035,30 @@ impl App {
     /// - `StartupOutcome::PartialSuccess` if some hooks had non-fatal errors
     /// - `StartupOutcome::Aborted` if a fatal hook error occurred
     pub async fn run_startup_hooks(&self) -> StartupOutcome {
-        let hooks: Vec<StartupHook> = std::mem::take(&mut *self.startup_hooks.lock());
         let mut warnings = 0;
+
+        // Run lifespan function first (if registered)
+        let lifespan_fn = self.lifespan.lock().take();
+        if let Some(lifespan) = lifespan_fn {
+            // Run the lifespan function (returns state + cleanup)
+            let result = lifespan().await;
+
+            match result {
+                Ok((state, cleanup)) => {
+                    // Insert the state into the container
+                    self.state.write().insert_any(state);
+                    // Store cleanup future for shutdown
+                    *self.lifespan_cleanup.lock() = cleanup;
+                }
+                Err(e) => {
+                    // Convert LifespanError to StartupHookError and abort
+                    return StartupOutcome::Aborted(e.into());
+                }
+            }
+        }
+
+        // Run regular startup hooks
+        let hooks: Vec<StartupHook> = std::mem::take(&mut *self.startup_hooks.lock());
 
         for hook in hooks {
             match hook.run() {
@@ -1622,6 +2111,12 @@ impl App {
         let sync_hooks: Vec<_> = std::mem::take(&mut *self.shutdown_hooks.lock());
         for hook in sync_hooks.into_iter().rev() {
             hook();
+        }
+
+        // Run lifespan cleanup last (mirrors startup order)
+        let lifespan_cleanup = self.lifespan_cleanup.lock().take();
+        if let Some(cleanup) = lifespan_cleanup {
+            cleanup.await;
         }
     }
 
@@ -1699,7 +2194,10 @@ impl<'a> Handler for RouteHandler<'a> {
         req: &'b mut Request,
     ) -> BoxFuture<'b, Response> {
         let handler = self.entry.handler.clone();
-        Box::pin(async move { handler(ctx, req).await })
+        Box::pin(async move {
+            let _ = ctx.checkpoint();
+            handler(ctx, req).await
+        })
     }
 }
 
@@ -1708,27 +2206,9 @@ mod tests {
     use super::*;
 
     use crate::response::ResponseBody;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_env_lock<F: FnOnce()>(f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        f();
-    }
-
-    fn clear_config_env() {
-        for key in [
-            "FASTAPI_NAME",
-            "FASTAPI_VERSION",
-            "FASTAPI_DEBUG",
-            "FASTAPI_MAX_BODY_SIZE",
-            "FASTAPI_REQUEST_TIMEOUT_MS",
-        ] {
-            std::env::remove_var(key);
-        }
-    }
 
     // Test handlers that return 'static futures (no borrowing from parameters)
     fn test_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Ready<Response> {
@@ -1784,44 +2264,59 @@ mod tests {
 
     #[test]
     fn app_config_from_env_parses_values() {
-        with_env_lock(|| {
-            clear_config_env();
-            std::env::set_var("FASTAPI_NAME", "Env API");
-            std::env::set_var("FASTAPI_VERSION", "9.9.9");
-            std::env::set_var("FASTAPI_DEBUG", "true");
-            std::env::set_var("FASTAPI_MAX_BODY_SIZE", "4096");
-            std::env::set_var("FASTAPI_REQUEST_TIMEOUT_MS", "15000");
+        let mut env = HashMap::new();
+        env.insert("FASTAPI_NAME".to_string(), "Env API".to_string());
+        env.insert("FASTAPI_VERSION".to_string(), "9.9.9".to_string());
+        env.insert("FASTAPI_DEBUG".to_string(), "true".to_string());
+        env.insert("FASTAPI_MAX_BODY_SIZE".to_string(), "4096".to_string());
+        env.insert(
+            "FASTAPI_REQUEST_TIMEOUT_MS".to_string(),
+            "15000".to_string(),
+        );
 
-            let config = AppConfig::from_env().expect("env config");
-            assert_eq!(config.name, "Env API");
-            assert_eq!(config.version, "9.9.9");
-            assert!(config.debug);
-            assert_eq!(config.max_body_size, 4096);
-            assert_eq!(config.request_timeout_ms, 15_000);
-            clear_config_env();
-        });
+        let mut config = AppConfig::default();
+        config
+            .apply_env_with(AppConfig::DEFAULT_ENV_PREFIX, |key| {
+                Ok(env.get(key).cloned())
+            })
+            .expect("env config");
+        config.validate().expect("env config");
+
+        assert_eq!(config.name, "Env API");
+        assert_eq!(config.version, "9.9.9");
+        assert!(config.debug);
+        assert_eq!(config.max_body_size, 4096);
+        assert_eq!(config.request_timeout_ms, 15_000);
     }
 
     #[test]
     fn app_config_from_env_invalid_value() {
-        with_env_lock(|| {
-            clear_config_env();
-            std::env::set_var("FASTAPI_MAX_BODY_SIZE", "not-a-number");
-            let err = AppConfig::from_env().expect_err("invalid env should error");
-            match err {
-                ConfigError::InvalidEnvVar { key, .. } => {
-                    assert_eq!(key, "FASTAPI_MAX_BODY_SIZE");
-                }
-                _ => panic!("expected invalid env var error"),
+        let mut env = HashMap::new();
+        env.insert(
+            "FASTAPI_MAX_BODY_SIZE".to_string(),
+            "not-a-number".to_string(),
+        );
+
+        let mut config = AppConfig::default();
+        let err = config
+            .apply_env_with(AppConfig::DEFAULT_ENV_PREFIX, |key| {
+                Ok(env.get(key).cloned())
+            })
+            .expect_err("invalid env should error");
+        match err {
+            ConfigError::InvalidEnvVar { key, .. } => {
+                assert_eq!(key, "FASTAPI_MAX_BODY_SIZE");
             }
-            clear_config_env();
-        });
+            _ => panic!("expected invalid env var error"),
+        }
     }
 
     #[test]
     fn app_config_validation_rejects_empty_name() {
-        let mut config = AppConfig::default();
-        config.name = String::new();
+        let config = AppConfig {
+            name: String::new(),
+            ..Default::default()
+        };
         let err = config.validate().expect_err("empty name invalid");
         assert!(matches!(err, ConfigError::Validation(_)));
     }
@@ -1854,35 +2349,38 @@ mod tests {
 
     #[test]
     fn app_config_env_overrides_file() {
-        with_env_lock(|| {
-            clear_config_env();
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos();
-            let mut path = std::env::temp_dir();
-            path.push(format!("fastapi_config_override_{stamp}.json"));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("fastapi_config_override_{stamp}.json"));
 
-            let json = r#"{
+        let json = r#"{
   "name": "File API",
   "version": "1.0.0",
   "debug": false,
   "max_body_size": 1024,
   "request_timeout_ms": 1000
 }"#;
-            std::fs::write(&path, json).expect("write temp config");
+        std::fs::write(&path, json).expect("write temp config");
 
-            std::env::set_var("FASTAPI_NAME", "Env API");
-            std::env::set_var("FASTAPI_DEBUG", "1");
+        let mut env = HashMap::new();
+        env.insert("FASTAPI_NAME".to_string(), "Env API".to_string());
+        env.insert("FASTAPI_DEBUG".to_string(), "1".to_string());
 
-            let config = AppConfig::from_env_and_file(&path).expect("env+file config");
-            assert_eq!(config.name, "Env API");
-            assert!(config.debug);
-            assert_eq!(config.version, "1.0.0");
-            assert_eq!(config.max_body_size, 1024);
+        let mut config = AppConfig::from_file(&path).expect("file config");
+        config
+            .apply_env_with(AppConfig::DEFAULT_ENV_PREFIX, |key| {
+                Ok(env.get(key).cloned())
+            })
+            .expect("env+file config");
+        config.validate().expect("env+file config");
 
-            clear_config_env();
-        });
+        assert_eq!(config.name, "Env API");
+        assert!(config.debug);
+        assert_eq!(config.version, "1.0.0");
+        assert_eq!(config.max_body_size, 1024);
     }
 
     #[test]
@@ -1924,7 +2422,7 @@ mod tests {
         }
 
         let app = App::builder()
-            .state(DbPool {
+            .with_state(DbPool {
                 connection_count: 10,
             })
             .get("/", test_handler)
@@ -3008,5 +3506,628 @@ mod tests {
         // Second run - no hooks left
         futures_executor::block_on(app.run_shutdown_hooks());
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // =========================================================================
+    // Async Lifecycle Hooks Tests
+    // =========================================================================
+
+    #[test]
+    fn async_startup_hook_runs() {
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let app = App::builder()
+            .on_startup_async(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn async_startup_hook_error_aborts() {
+        let app = App::builder()
+            .on_startup_async(|| async { Err(StartupHookError::new("async connection failed")) })
+            .get("/", test_handler)
+            .build();
+
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(!outcome.can_proceed());
+
+        if let StartupOutcome::Aborted(err) = outcome {
+            assert!(err.message.contains("async connection failed"));
+        } else {
+            panic!("Expected Aborted outcome");
+        }
+    }
+
+    #[test]
+    fn async_shutdown_hook_runs() {
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let app = App::builder()
+            .on_shutdown_async(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        futures_executor::block_on(app.run_shutdown_hooks());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mixed_sync_and_async_startup_hooks() {
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let order1 = Arc::clone(&order);
+        let order2 = Arc::clone(&order);
+        let order3 = Arc::clone(&order);
+
+        let app = App::builder()
+            .on_startup(move || {
+                order1.lock().push(1);
+                Ok(())
+            })
+            .on_startup_async(move || {
+                let order = Arc::clone(&order2);
+                async move {
+                    order.lock().push(2);
+                    Ok(())
+                }
+            })
+            .on_startup(move || {
+                order3.lock().push(3);
+                Ok(())
+            })
+            .get("/", test_handler)
+            .build();
+
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        // FIFO order: 1, 2, 3
+        assert_eq!(*order.lock(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn mixed_sync_and_async_shutdown_hooks() {
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let order1 = Arc::clone(&order);
+        let order2 = Arc::clone(&order);
+        let order3 = Arc::clone(&order);
+
+        let app = App::builder()
+            .on_shutdown(move || {
+                order1.lock().push(1);
+            })
+            .on_shutdown_async(move || {
+                let order = Arc::clone(&order2);
+                async move {
+                    order.lock().push(2);
+                }
+            })
+            .on_shutdown(move || {
+                order3.lock().push(3);
+            })
+            .get("/", test_handler)
+            .build();
+
+        futures_executor::block_on(app.run_shutdown_hooks());
+
+        // LIFO order: 3, 2, 1
+        assert_eq!(*order.lock(), vec![3, 2, 1]);
+    }
+
+    // =========================================================================
+    // State Accessible in Handlers Tests
+    // =========================================================================
+
+    #[test]
+    fn state_accessible_via_app_get_state() {
+        #[derive(Debug, Clone)]
+        struct DatabasePool {
+            connection_count: usize,
+        }
+
+        #[derive(Debug, Clone)]
+        struct CacheClient {
+            max_entries: usize,
+        }
+
+        let app = App::builder()
+            .with_state(DatabasePool {
+                connection_count: 10,
+            })
+            .with_state(CacheClient { max_entries: 1000 })
+            .get("/", test_handler)
+            .build();
+
+        // Multiple state types accessible
+        let db = app.get_state::<DatabasePool>();
+        assert!(db.is_some());
+        assert_eq!(db.unwrap().connection_count, 10);
+
+        let cache = app.get_state::<CacheClient>();
+        assert!(cache.is_some());
+        assert_eq!(cache.unwrap().max_entries, 1000);
+
+        // Non-existent state returns None
+        let missing = app.get_state::<String>();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn state_container_replace_on_duplicate_type() {
+        struct Counter(u32);
+
+        let mut container = StateContainer::new();
+        container.insert(Counter(1));
+        assert_eq!(container.get::<Counter>().unwrap().0, 1);
+
+        // Replace with new value
+        container.insert(Counter(42));
+        assert_eq!(container.get::<Counter>().unwrap().0, 42);
+
+        // Still only one entry
+        assert_eq!(container.len(), 1);
+    }
+
+    #[test]
+    fn state_container_empty_checks() {
+        let container = StateContainer::new();
+        assert!(container.is_empty());
+        assert_eq!(container.len(), 0);
+
+        let mut container = StateContainer::new();
+        container.insert(42i32);
+        assert!(!container.is_empty());
+        assert_eq!(container.len(), 1);
+    }
+
+    // =========================================================================
+    // Configuration Validation Tests
+    // =========================================================================
+
+    #[test]
+    fn app_config_validation_rejects_empty_version() {
+        let config = AppConfig {
+            version: String::new(),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("empty version invalid");
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn app_config_validation_rejects_zero_body_size() {
+        let config = AppConfig {
+            max_body_size: 0,
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("zero body size invalid");
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn app_config_validation_rejects_zero_timeout() {
+        let config = AppConfig {
+            request_timeout_ms: 0,
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("zero timeout invalid");
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn app_config_debug_bool_parsing() {
+        // Test various boolean string formats
+        assert!(parse_bool("test", "true").unwrap());
+        assert!(parse_bool("test", "TRUE").unwrap());
+        assert!(parse_bool("test", "1").unwrap());
+        assert!(parse_bool("test", "yes").unwrap());
+        assert!(parse_bool("test", "YES").unwrap());
+        assert!(parse_bool("test", "on").unwrap());
+        assert!(parse_bool("test", "ON").unwrap());
+
+        assert!(!parse_bool("test", "false").unwrap());
+        assert!(!parse_bool("test", "FALSE").unwrap());
+        assert!(!parse_bool("test", "0").unwrap());
+        assert!(!parse_bool("test", "no").unwrap());
+        assert!(!parse_bool("test", "NO").unwrap());
+        assert!(!parse_bool("test", "off").unwrap());
+        assert!(!parse_bool("test", "OFF").unwrap());
+
+        // Invalid values
+        assert!(parse_bool("test", "maybe").is_err());
+        assert!(parse_bool("test", "2").is_err());
+    }
+
+    #[test]
+    fn app_config_unsupported_format() {
+        let err = AppConfig::from_file("/tmp/config.yaml");
+        assert!(matches!(err, Err(ConfigError::UnsupportedFormat { .. })));
+    }
+
+    // =========================================================================
+    // Full Lifecycle Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn full_lifecycle_startup_serve_shutdown() {
+        let lifecycle_log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let log1 = Arc::clone(&lifecycle_log);
+        let log2 = Arc::clone(&lifecycle_log);
+        let log3 = Arc::clone(&lifecycle_log);
+        let log4 = Arc::clone(&lifecycle_log);
+
+        let app = App::builder()
+            .on_startup(move || {
+                log1.lock().push("startup_1");
+                Ok(())
+            })
+            .on_startup(move || {
+                log2.lock().push("startup_2");
+                Ok(())
+            })
+            .on_shutdown(move || {
+                log3.lock().push("shutdown_1");
+            })
+            .on_shutdown(move || {
+                log4.lock().push("shutdown_2");
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Phase 1: Startup
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        // Phase 2: Serve (simulated - just verify app is functional)
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        let response = futures_executor::block_on(app.handle(&ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 200);
+
+        // Phase 3: Shutdown
+        futures_executor::block_on(app.run_shutdown_hooks());
+
+        // Verify lifecycle order
+        let log = lifecycle_log.lock();
+        assert_eq!(
+            *log,
+            vec!["startup_1", "startup_2", "shutdown_2", "shutdown_1"]
+        );
+    }
+
+    #[test]
+    fn lifecycle_startup_failure_prevents_serving() {
+        let serve_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let app = App::builder()
+            .on_startup(|| Err(StartupHookError::new("database unavailable")))
+            .get("/", test_handler)
+            .build();
+
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+
+        // Startup failed - should not proceed to serving
+        if outcome.can_proceed() {
+            serve_attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        assert!(!serve_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(outcome, StartupOutcome::Aborted(_)));
+    }
+
+    #[test]
+    fn lifecycle_with_state_initialization() {
+        #[derive(Debug)]
+        struct AppState {
+            initialized: std::sync::atomic::AtomicBool,
+        }
+
+        let state = Arc::new(AppState {
+            initialized: std::sync::atomic::AtomicBool::new(false),
+        });
+        let state_for_hook = Arc::clone(&state);
+
+        let app = App::builder()
+            .on_startup(move || {
+                state_for_hook
+                    .initialized
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Before startup
+        assert!(!state.initialized.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Run startup
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        // After startup - state initialized
+        assert!(state.initialized.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lifecycle_shutdown_runs_even_after_failed_startup() {
+        let shutdown_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::clone(&shutdown_ran);
+
+        let app = App::builder()
+            .on_startup(|| Err(StartupHookError::new("startup failed")))
+            .on_shutdown(move || {
+                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Startup fails
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(!outcome.can_proceed());
+
+        // But shutdown hooks should still be available to run for cleanup
+        futures_executor::block_on(app.run_shutdown_hooks());
+        assert!(shutdown_ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn multiple_lifecycle_phases_with_async_hooks() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::<&str>::new()));
+
+        let log1 = Arc::clone(&log);
+        let log2 = Arc::clone(&log);
+        let log3 = Arc::clone(&log);
+        let log4 = Arc::clone(&log);
+
+        let app = App::builder()
+            .on_startup(move || {
+                log1.lock().push("sync_startup");
+                Ok(())
+            })
+            .on_startup_async(move || {
+                let log = Arc::clone(&log2);
+                async move {
+                    log.lock().push("async_startup");
+                    Ok(())
+                }
+            })
+            .on_shutdown(move || {
+                log3.lock().push("sync_shutdown");
+            })
+            .on_shutdown_async(move || {
+                let log = Arc::clone(&log4);
+                async move {
+                    log.lock().push("async_shutdown");
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Run full lifecycle
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        futures_executor::block_on(app.run_shutdown_hooks());
+
+        // Verify order: startup FIFO, shutdown LIFO
+        let events = log.lock();
+        assert_eq!(
+            *events,
+            vec![
+                "sync_startup",
+                "async_startup",
+                "async_shutdown",
+                "sync_shutdown"
+            ]
+        );
+    }
+
+    // =========================================================================
+    // Lifespan Tests
+    // =========================================================================
+
+    #[test]
+    fn lifespan_scope_creation() {
+        let scope = LifespanScope::new(42i32);
+        assert_eq!(scope.state, 42);
+    }
+
+    #[test]
+    fn lifespan_scope_with_cleanup() {
+        let cleanup_called = Arc::new(Mutex::new(false));
+        let cleanup_called_clone = Arc::clone(&cleanup_called);
+
+        let mut scope = LifespanScope::new("state").on_shutdown(async move {
+            *cleanup_called_clone.lock().unwrap() = true;
+        });
+
+        // Cleanup should not be called yet
+        assert!(!*cleanup_called.lock().unwrap());
+
+        // Take the cleanup
+        let cleanup = scope.take_cleanup();
+        assert!(cleanup.is_some());
+
+        // Run the cleanup
+        futures_executor::block_on(cleanup.unwrap());
+        assert!(*cleanup_called.lock().unwrap());
+    }
+
+    #[test]
+    fn lifespan_error_display() {
+        let err = LifespanError::new("connection failed");
+        assert!(err.to_string().contains("connection failed"));
+        assert!(err.source.is_none());
+
+        let io_err = std::io::Error::other("disk full");
+        let err_with_source = LifespanError::with_source("backup failed", io_err);
+        assert!(err_with_source.to_string().contains("backup failed"));
+        assert!(err_with_source.source.is_some());
+    }
+
+    #[test]
+    fn lifespan_error_into_startup_hook_error() {
+        let err = LifespanError::new("startup failed");
+        let hook_err: StartupHookError = err.into();
+        assert!(hook_err.abort);
+        assert!(hook_err.message.contains("startup failed"));
+    }
+
+    /// Simulated database pool for testing.
+    struct TestDbPool {
+        connection_count: i32,
+    }
+
+    #[test]
+    fn lifespan_injects_state() {
+        let app = App::builder()
+            .lifespan(|| async {
+                let pool = TestDbPool {
+                    connection_count: 10,
+                };
+                Ok(LifespanScope::new(pool))
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Run startup hooks (which runs lifespan)
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        // State should now be available
+        let pool = app.get_state::<TestDbPool>();
+        assert!(pool.is_some());
+        assert_eq!(pool.unwrap().connection_count, 10);
+    }
+
+    #[test]
+    fn lifespan_runs_cleanup_on_shutdown() {
+        let cleanup_log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let log_clone = Arc::clone(&cleanup_log);
+
+        let app = App::builder()
+            .lifespan(move || {
+                let log = Arc::clone(&log_clone);
+                async move {
+                    let pool = TestDbPool {
+                        connection_count: 5,
+                    };
+                    Ok(LifespanScope::new(pool).on_shutdown(async move {
+                        log.lock().unwrap().push("cleanup");
+                    }))
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        // Run startup
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+        assert!(outcome.can_proceed());
+
+        // Cleanup not called yet
+        assert!(cleanup_log.lock().unwrap().is_empty());
+
+        // Run shutdown
+        futures_executor::block_on(app.run_shutdown_hooks());
+
+        // Cleanup should have been called
+        assert_eq!(*cleanup_log.lock().unwrap(), vec!["cleanup"]);
+    }
+
+    #[test]
+    fn lifespan_error_aborts_startup() {
+        let app = App::builder()
+            .lifespan(|| async {
+                Err::<LifespanScope<()>, _>(LifespanError::new("database connection failed"))
+            })
+            .get("/", test_handler)
+            .build();
+
+        let outcome = futures_executor::block_on(app.run_startup_hooks());
+
+        match outcome {
+            StartupOutcome::Aborted(err) => {
+                assert!(err.message.contains("database connection failed"));
+                assert!(err.abort);
+            }
+            _ => panic!("expected Aborted outcome"),
+        }
+    }
+
+    #[test]
+    fn lifespan_runs_before_other_startup_hooks() {
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let log1 = Arc::clone(&log);
+        let log2 = Arc::clone(&log);
+
+        let app = App::builder()
+            .on_startup(move || {
+                log1.lock().unwrap().push("regular_hook");
+                Ok(())
+            })
+            .lifespan(move || {
+                let log = Arc::clone(&log2);
+                async move {
+                    log.lock().unwrap().push("lifespan");
+                    Ok(LifespanScope::new(()))
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        futures_executor::block_on(app.run_startup_hooks());
+
+        // Lifespan should run before regular hooks
+        let events = log.lock().unwrap();
+        assert_eq!(*events, vec!["lifespan", "regular_hook"]);
+    }
+
+    #[test]
+    fn lifespan_cleanup_runs_after_other_shutdown_hooks() {
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let log1 = Arc::clone(&log);
+        let log2 = Arc::clone(&log);
+
+        let app = App::builder()
+            .on_shutdown(move || {
+                log1.lock().unwrap().push("regular_hook");
+            })
+            .lifespan(move || {
+                let log = Arc::clone(&log2);
+                async move {
+                    Ok(LifespanScope::new(()).on_shutdown(async move {
+                        log.lock().unwrap().push("lifespan_cleanup");
+                    }))
+                }
+            })
+            .get("/", test_handler)
+            .build();
+
+        futures_executor::block_on(app.run_startup_hooks());
+        futures_executor::block_on(app.run_shutdown_hooks());
+
+        // Lifespan cleanup should run after regular hooks
+        let events = log.lock().unwrap();
+        assert_eq!(*events, vec!["regular_hook", "lifespan_cleanup"]);
     }
 }

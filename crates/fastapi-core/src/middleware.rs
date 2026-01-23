@@ -329,6 +329,7 @@ impl MiddlewareStack {
 
         // Run before hooks in order
         for mw in &self.middleware {
+            let _ = ctx.checkpoint();
             match mw.before(ctx, req).await {
                 ControlFlow::Continue => {
                     ran_before_count += 1;
@@ -343,6 +344,7 @@ impl MiddlewareStack {
         }
 
         // All before hooks passed, call the handler
+        let _ = ctx.checkpoint();
         let response = handler.call(ctx, req).await;
 
         // Run after hooks in reverse order
@@ -360,6 +362,7 @@ impl MiddlewareStack {
     ) -> Response {
         // Run in reverse order (last middleware's after runs first)
         for mw in self.middleware[..count].iter().rev() {
+            let _ = ctx.checkpoint();
             response = mw.after(ctx, req, response).await;
         }
         response
@@ -409,15 +412,19 @@ impl<M: Middleware, H: Handler> Handler for Layered<M, H> {
     ) -> BoxFuture<'a, Response> {
         Box::pin(async move {
             // Run before hook
+            let _ = ctx.checkpoint();
             match self.middleware.before(ctx, req).await {
                 ControlFlow::Continue => {
                     // Call inner handler
+                    let _ = ctx.checkpoint();
                     let response = self.inner.call(ctx, req).await;
                     // Run after hook
+                    let _ = ctx.checkpoint();
                     self.middleware.after(ctx, req, response).await
                 }
                 ControlFlow::Break(response) => {
                     // Short-circuit: still run after for this middleware
+                    let _ = ctx.checkpoint();
                     self.middleware.after(ctx, req, response).await
                 }
             }

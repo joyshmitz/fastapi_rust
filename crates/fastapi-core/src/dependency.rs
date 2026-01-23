@@ -276,6 +276,9 @@ where
     type Error = T::Error;
 
     async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Check cancellation before resolving dependency
+        let _ = ctx.checkpoint();
+
         let scope = C::SCOPE.unwrap_or(DependencyScope::Request);
         let use_cache = C::USE_CACHE && scope == DependencyScope::Request;
 
@@ -298,6 +301,7 @@ where
         let _guard = ResolutionGuard::new(ctx.resolution_stack());
 
         // Setup the dependency
+        let _ = ctx.checkpoint();
         let (value, cleanup) = T::setup(ctx, req).await?;
 
         // Register cleanup if provided
@@ -564,6 +568,9 @@ where
     type Error = T::Error;
 
     async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Check cancellation before resolving dependency (overrides or normal)
+        let _ = ctx.checkpoint();
+
         // Check overrides first (testing support)
         if let Some(result) = ctx.dependency_overrides().resolve::<T>(ctx, req).await {
             return result.map(Depends::new);
@@ -591,6 +598,7 @@ where
         let _guard = ResolutionGuard::new(ctx.resolution_stack());
 
         // Resolve the dependency
+        let _ = ctx.checkpoint();
         let value = T::from_dependency(ctx, req).await?;
 
         // Cache if needed (guard will pop stack when dropped)

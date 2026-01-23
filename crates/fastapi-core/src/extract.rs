@@ -283,9 +283,6 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
     type Error = JsonExtractError;
 
     async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
-        // Check cancellation at start
-        let _ = ctx.checkpoint();
-
         // Validate Content-Type
         let content_type = req
             .headers()
@@ -303,6 +300,9 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
                 actual: content_type.map(String::from),
             });
         }
+
+        // Check cancellation before reading the body
+        let _ = ctx.checkpoint();
 
         // Get body bytes
         let body = req.take_body();
@@ -324,13 +324,17 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
         let _ = ctx.checkpoint();
 
         // Deserialize JSON
-        serde_json::from_slice(&bytes)
-            .map(Json)
-            .map_err(|e| JsonExtractError::DeserializeError {
+        let value =
+            serde_json::from_slice(&bytes).map_err(|e| JsonExtractError::DeserializeError {
                 message: e.to_string(),
                 line: Some(e.line()),
                 column: Some(e.column()),
-            })
+            })?;
+
+        // Check cancellation after parsing
+        let _ = ctx.checkpoint();
+
+        Ok(Json(value))
     }
 }
 
@@ -4108,9 +4112,7 @@ impl Cookie {
     #[must_use]
     pub fn host_prefixed(name: impl Into<String>, value: impl Into<String>) -> Self {
         let prefixed_name = format!("__Host-{}", name.into());
-        Self::new(prefixed_name, value)
-            .secure(true)
-            .path("/")
+        Self::new(prefixed_name, value).secure(true).path("/")
     }
 
     /// Create a cookie with the `__Secure-` prefix.
@@ -4138,8 +4140,7 @@ impl Cookie {
     #[must_use]
     pub fn secure_prefixed(name: impl Into<String>, value: impl Into<String>) -> Self {
         let prefixed_name = format!("__Secure-{}", name.into());
-        Self::new(prefixed_name, value)
-            .secure(true)
+        Self::new(prefixed_name, value).secure(true)
     }
 
     /// Validate that the cookie meets its prefix requirements.
@@ -4782,8 +4783,7 @@ mod special_extractor_tests {
 
     #[test]
     fn secure_prefixed_cookie_validation_fails_without_secure() {
-        let cookie = Cookie::new("__Secure-token", "abc123")
-            .secure(false);
+        let cookie = Cookie::new("__Secure-token", "abc123").secure(false);
         assert_eq!(
             cookie.validate_prefix(),
             Err(CookiePrefixError::SecureRequiresSecure)
@@ -5887,24 +5887,25 @@ impl IntoResponse for BasicAuthError {
 /// This is a minimal implementation for Basic auth credential decoding.
 /// Supports standard base64 alphabet (A-Za-z0-9+/) with optional padding.
 fn decode_base64(input: &str) -> Result<Vec<u8>, BasicAuthError> {
-    const DECODE_TABLE: [i8; 256] = {
-        let mut table = [-1i8; 256];
+    const INVALID: u8 = 0xFF;
+    const DECODE_TABLE: [u8; 256] = {
+        let mut table = [INVALID; 256];
         let mut i = 0u8;
         // A-Z = 0-25
         while i < 26 {
-            table[(b'A' + i) as usize] = i as i8;
+            table[(b'A' + i) as usize] = i;
             i += 1;
         }
         // a-z = 26-51
         i = 0;
         while i < 26 {
-            table[(b'a' + i) as usize] = (26 + i) as i8;
+            table[(b'a' + i) as usize] = 26 + i;
             i += 1;
         }
         // 0-9 = 52-61
         i = 0;
         while i < 10 {
-            table[(b'0' + i) as usize] = (52 + i) as i8;
+            table[(b'0' + i) as usize] = 52 + i;
             i += 1;
         }
         // + = 62, / = 63
@@ -5925,11 +5926,11 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, BasicAuthError> {
 
     for byte in input.bytes() {
         let value = DECODE_TABLE[byte as usize];
-        if value < 0 {
+        if value == INVALID {
             return Err(BasicAuthError::InvalidBase64);
         }
 
-        buffer = (buffer << 6) | (value as u32);
+        buffer = (buffer << 6) | u32::from(value);
         bits_collected += 6;
 
         if bits_collected >= 8 {
@@ -5953,8 +5954,7 @@ impl FromRequest for BasicAuth {
             .ok_or(BasicAuthError::MissingHeader)?;
 
         // Convert to string
-        let auth_str =
-            std::str::from_utf8(auth_header).map_err(|_| BasicAuthError::InvalidUtf8)?;
+        let auth_str = std::str::from_utf8(auth_header).map_err(|_| BasicAuthError::InvalidUtf8)?;
 
         // Check for "Basic " prefix (case-insensitive per RFC 7617)
         const BASIC_PREFIX: &str = "Basic ";
@@ -5972,8 +5972,7 @@ impl FromRequest for BasicAuth {
         let decoded_bytes = decode_base64(encoded.trim())?;
 
         // Convert to UTF-8 string
-        let decoded =
-            String::from_utf8(decoded_bytes).map_err(|_| BasicAuthError::InvalidUtf8)?;
+        let decoded = String::from_utf8(decoded_bytes).map_err(|_| BasicAuthError::InvalidUtf8)?;
 
         // Split on first colon (password may contain colons)
         let colon_pos = decoded.find(':').ok_or(BasicAuthError::MissingColon)?;
@@ -6312,7 +6311,8 @@ impl Pagination {
     /// Otherwise, calculates from page number: `(page - 1) * per_page`.
     #[must_use]
     pub fn offset(&self) -> u64 {
-        self.offset.unwrap_or_else(|| (self.page.saturating_sub(1)) * self.per_page)
+        self.offset
+            .unwrap_or_else(|| (self.page.saturating_sub(1)) * self.per_page)
     }
 
     /// Calculate total number of pages given a total item count.
@@ -6658,10 +6658,7 @@ impl<T: serde::Serialize> IntoResponse for Page<T> {
         crate::response::Response::ok()
             .header("content-type", b"application/json".to_vec())
             .header("link", link_header.into_bytes())
-            .header(
-                "x-total-count",
-                self.total.to_string().into_bytes(),
-            )
+            .header("x-total-count", self.total.to_string().into_bytes())
             .header("x-page", self.page.to_string().into_bytes())
             .header("x-per-page", self.per_page.to_string().into_bytes())
             .header("x-total-pages", self.pages.to_string().into_bytes())
@@ -7075,8 +7072,12 @@ mod oauth2_tests {
             _ => panic!("Expected Bytes body"),
         };
 
-        let json: serde_json::Value = serde_json::from_str(&body).expect("Body should be valid JSON");
-        assert!(json.get("detail").is_some(), "Response should have 'detail' field");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("Body should be valid JSON");
+        assert!(
+            json.get("detail").is_some(),
+            "Response should have 'detail' field"
+        );
         assert_eq!(json["detail"], "Not authenticated");
     }
 
@@ -7090,7 +7091,8 @@ mod oauth2_tests {
             _ => panic!("Expected Bytes body"),
         };
 
-        let json: serde_json::Value = serde_json::from_str(&body).expect("Body should be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("Body should be valid JSON");
         assert_eq!(json["detail"], "Invalid authentication credentials");
     }
 
@@ -7104,7 +7106,8 @@ mod oauth2_tests {
             _ => panic!("Expected Bytes body"),
         };
 
-        let json: serde_json::Value = serde_json::from_str(&body).expect("Body should be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("Body should be valid JSON");
         assert_eq!(json["detail"], "Invalid authentication credentials");
     }
 
@@ -7141,8 +7144,10 @@ mod oauth2_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/protected");
         // Token with unicode characters (unusual but should work)
-        req.headers_mut()
-            .insert("authorization", "Bearer tökën_with_ünïcödë".as_bytes().to_vec());
+        req.headers_mut().insert(
+            "authorization",
+            "Bearer tökën_with_ünïcödë".as_bytes().to_vec(),
+        );
 
         let result = futures_executor::block_on(OAuth2PasswordBearer::from_request(&ctx, &mut req));
         let bearer = result.unwrap();
@@ -7154,13 +7159,18 @@ mod oauth2_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/protected");
         // Invalid UTF-8 sequence
-        req.headers_mut()
-            .insert("authorization", vec![66, 101, 97, 114, 101, 114, 32, 0xFF, 0xFE]);
+        req.headers_mut().insert(
+            "authorization",
+            vec![66, 101, 97, 114, 101, 114, 32, 0xFF, 0xFE],
+        );
 
         let result = futures_executor::block_on(OAuth2PasswordBearer::from_request(&ctx, &mut req));
         // Should return InvalidScheme because it can't be parsed as valid UTF-8
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind, OAuth2BearerErrorKind::InvalidScheme);
+        assert_eq!(
+            result.unwrap_err().kind,
+            OAuth2BearerErrorKind::InvalidScheme
+        );
     }
 
     #[test]
@@ -7219,10 +7229,22 @@ mod oauth2_tests {
     #[test]
     fn oauth2_error_kind_equality() {
         // Verify error kinds implement PartialEq correctly
-        assert_eq!(OAuth2BearerErrorKind::MissingHeader, OAuth2BearerErrorKind::MissingHeader);
-        assert_eq!(OAuth2BearerErrorKind::InvalidScheme, OAuth2BearerErrorKind::InvalidScheme);
-        assert_eq!(OAuth2BearerErrorKind::EmptyToken, OAuth2BearerErrorKind::EmptyToken);
-        assert_ne!(OAuth2BearerErrorKind::MissingHeader, OAuth2BearerErrorKind::InvalidScheme);
+        assert_eq!(
+            OAuth2BearerErrorKind::MissingHeader,
+            OAuth2BearerErrorKind::MissingHeader
+        );
+        assert_eq!(
+            OAuth2BearerErrorKind::InvalidScheme,
+            OAuth2BearerErrorKind::InvalidScheme
+        );
+        assert_eq!(
+            OAuth2BearerErrorKind::EmptyToken,
+            OAuth2BearerErrorKind::EmptyToken
+        );
+        assert_ne!(
+            OAuth2BearerErrorKind::MissingHeader,
+            OAuth2BearerErrorKind::InvalidScheme
+        );
     }
 
     #[test]
@@ -7242,8 +7264,8 @@ mod oauth2_tests {
 
     #[test]
     fn oauth2_config_clone() {
-        let config = OAuth2PasswordBearerConfig::new("/auth/token")
-            .with_scope("admin", "Admin access");
+        let config =
+            OAuth2PasswordBearerConfig::new("/auth/token").with_scope("admin", "Admin access");
         let cloned = config.clone();
         assert_eq!(config.token_url, cloned.token_url);
         assert_eq!(config.scopes.len(), cloned.scopes.len());
@@ -7282,10 +7304,11 @@ mod oauth2_tests {
             let has_www_auth = response
                 .headers()
                 .iter()
-                .any(|(name, value)| {
-                    name == "www-authenticate" && value == b"Bearer"
-                });
-            assert!(has_www_auth, "All OAuth2 errors should have WWW-Authenticate: Bearer");
+                .any(|(name, value)| name == "www-authenticate" && value == b"Bearer");
+            assert!(
+                has_www_auth,
+                "All OAuth2 errors should have WWW-Authenticate: Bearer"
+            );
         }
     }
 }
@@ -7393,7 +7416,8 @@ mod bearer_token_tests {
         req.headers_mut()
             .insert("authorization", b"Bearer optional_token".to_vec());
 
-        let result = futures_executor::block_on(Option::<BearerToken>::from_request(&ctx, &mut req));
+        let result =
+            futures_executor::block_on(Option::<BearerToken>::from_request(&ctx, &mut req));
         let maybe_token = result.unwrap();
         assert!(maybe_token.is_some());
         assert_eq!(maybe_token.unwrap().token(), "optional_token");
@@ -7405,7 +7429,8 @@ mod bearer_token_tests {
         let mut req = Request::new(Method::Get, "/api/protected");
         // No authorization header
 
-        let result = futures_executor::block_on(Option::<BearerToken>::from_request(&ctx, &mut req));
+        let result =
+            futures_executor::block_on(Option::<BearerToken>::from_request(&ctx, &mut req));
         let maybe_token = result.unwrap();
         assert!(maybe_token.is_none());
     }
@@ -7447,7 +7472,10 @@ mod bearer_token_tests {
 
     #[test]
     fn bearer_token_error_detail() {
-        assert_eq!(BearerTokenError::MissingHeader.detail(), "Not authenticated");
+        assert_eq!(
+            BearerTokenError::MissingHeader.detail(),
+            "Not authenticated"
+        );
         assert_eq!(
             BearerTokenError::InvalidScheme.detail(),
             "Invalid authentication credentials"
@@ -7496,8 +7524,10 @@ mod bearer_token_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/protected");
         let special_token = "abc123!@#$%^&*()_+-=[]{}|;':\",./<>?";
-        req.headers_mut()
-            .insert("authorization", format!("Bearer {}", special_token).into_bytes());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", special_token).into_bytes(),
+        );
 
         let result = futures_executor::block_on(BearerToken::from_request(&ctx, &mut req));
         let token = result.unwrap();
@@ -7509,8 +7539,10 @@ mod bearer_token_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/protected");
         let long_token = "a".repeat(10000);
-        req.headers_mut()
-            .insert("authorization", format!("Bearer {}", long_token).into_bytes());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", long_token).into_bytes(),
+        );
 
         let result = futures_executor::block_on(BearerToken::from_request(&ctx, &mut req));
         let token = result.unwrap();
@@ -7522,8 +7554,10 @@ mod bearer_token_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/protected");
         // Invalid UTF-8 sequence
-        req.headers_mut()
-            .insert("authorization", vec![0x42, 0x65, 0x61, 0x72, 0x65, 0x72, 0x20, 0xFF, 0xFE]);
+        req.headers_mut().insert(
+            "authorization",
+            vec![0x42, 0x65, 0x61, 0x72, 0x65, 0x72, 0x20, 0xFF, 0xFE],
+        );
 
         let result = futures_executor::block_on(BearerToken::from_request(&ctx, &mut req));
         let err = result.unwrap_err();
@@ -7566,7 +7600,11 @@ mod bearer_token_tests {
 
         for err in errors {
             let response = err.into_response();
-            assert_eq!(response.status().as_u16(), 401, "All BearerToken errors should be 401");
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "All BearerToken errors should be 401"
+            );
         }
     }
 
@@ -7584,7 +7622,10 @@ mod bearer_token_tests {
                 .headers()
                 .iter()
                 .any(|(name, value)| name == "www-authenticate" && value == b"Bearer");
-            assert!(has_www_auth, "All BearerToken errors should have WWW-Authenticate: Bearer");
+            assert!(
+                has_www_auth,
+                "All BearerToken errors should have WWW-Authenticate: Bearer"
+            );
         }
     }
 
@@ -7600,10 +7641,19 @@ mod bearer_token_tests {
 
     #[test]
     fn bearer_token_error_equality() {
-        assert_eq!(BearerTokenError::MissingHeader, BearerTokenError::MissingHeader);
-        assert_eq!(BearerTokenError::InvalidScheme, BearerTokenError::InvalidScheme);
+        assert_eq!(
+            BearerTokenError::MissingHeader,
+            BearerTokenError::MissingHeader
+        );
+        assert_eq!(
+            BearerTokenError::InvalidScheme,
+            BearerTokenError::InvalidScheme
+        );
         assert_eq!(BearerTokenError::EmptyToken, BearerTokenError::EmptyToken);
-        assert_ne!(BearerTokenError::MissingHeader, BearerTokenError::InvalidScheme);
+        assert_ne!(
+            BearerTokenError::MissingHeader,
+            BearerTokenError::InvalidScheme
+        );
     }
 
     #[test]
@@ -7643,7 +7693,7 @@ mod basic_auth_tests {
         for chunk in bytes.chunks(3) {
             let mut n: u32 = 0;
             for (i, &byte) in chunk.iter().enumerate() {
-                n |= (byte as u32) << (16 - 8 * i);
+                n |= u32::from(byte) << (16 - 8 * i);
             }
 
             let chars = match chunk.len() {
@@ -7907,9 +7957,7 @@ mod basic_auth_tests {
         let has_json_content_type = response
             .headers()
             .iter()
-            .any(|(name, value)| {
-                name == "content-type" && value == b"application/json"
-            });
+            .any(|(name, value)| name == "content-type" && value == b"application/json");
         assert!(has_json_content_type);
     }
 
@@ -7925,7 +7973,11 @@ mod basic_auth_tests {
 
         for err in errors {
             let response = err.into_response();
-            assert_eq!(response.status().as_u16(), 401, "All BasicAuth errors should be 401");
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "All BasicAuth errors should be 401"
+            );
         }
     }
 
@@ -7945,7 +7997,10 @@ mod basic_auth_tests {
                 .headers()
                 .iter()
                 .any(|(name, value)| name == "www-authenticate" && value == b"Basic");
-            assert!(has_www_auth, "All BasicAuth errors should have WWW-Authenticate: Basic");
+            assert!(
+                has_www_auth,
+                "All BasicAuth errors should have WWW-Authenticate: Basic"
+            );
         }
     }
 
@@ -8612,10 +8667,7 @@ mod pagination_tests {
         let page = Page::with_values(vec![1, 2, 3], 100, 1, 10, "/items");
         let response = page.into_response();
 
-        let link_header = response
-            .headers()
-            .iter()
-            .find(|(name, _)| name == "link");
+        let link_header = response.headers().iter().find(|(name, _)| name == "link");
         assert!(link_header.is_some());
 
         let link_value = String::from_utf8_lossy(&link_header.unwrap().1);
@@ -8716,7 +8768,7 @@ mod pagination_tests {
     fn pagination_copy_clone() {
         let p1 = Pagination::new(2, 10);
         let p2 = p1; // Copy
-        let p3 = p1.clone(); // Clone
+        let p3 = p1; // Copy
 
         assert_eq!(p1, p2);
         assert_eq!(p1, p3);

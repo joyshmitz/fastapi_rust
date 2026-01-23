@@ -63,6 +63,8 @@ impl StatusCode {
     pub const UNSUPPORTED_MEDIA_TYPE: Self = Self(415);
     /// 422 Unprocessable Entity
     pub const UNPROCESSABLE_ENTITY: Self = Self(422);
+    /// 429 Too Many Requests
+    pub const TOO_MANY_REQUESTS: Self = Self(429);
     /// 499 Client Closed Request
     pub const CLIENT_CLOSED_REQUEST: Self = Self(499);
 
@@ -116,6 +118,7 @@ impl StatusCode {
             413 => "Payload Too Large",
             415 => "Unsupported Media Type",
             422 => "Unprocessable Entity",
+            429 => "Too Many Requests",
             499 => "Client Closed Request",
             500 => "Internal Server Error",
             503 => "Service Unavailable",

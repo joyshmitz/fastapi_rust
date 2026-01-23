@@ -266,4 +266,23 @@ mod tests {
         let err = CancelledError;
         assert_eq!(format!("{err}"), "request cancelled");
     }
+
+    #[test]
+    fn checkpoint_returns_error_when_cancel_requested() {
+        let cx = Cx::for_testing();
+        let ctx = RequestContext::new(cx, 1);
+        ctx.cx().set_cancel_requested(true);
+        assert!(ctx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn masked_defers_cancellation_at_checkpoint() {
+        let cx = Cx::for_testing();
+        let ctx = RequestContext::new(cx, 1);
+        ctx.cx().set_cancel_requested(true);
+
+        let result = ctx.masked(|| ctx.checkpoint());
+        assert!(result.is_ok());
+        assert!(ctx.checkpoint().is_err());
+    }
 }

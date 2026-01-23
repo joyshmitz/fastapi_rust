@@ -71,7 +71,10 @@ pub use dependency::{
     DependencyOverrides, DependencyScope, Depends, DependsCleanup, DependsConfig, FromDependency,
     FromDependencyWithCleanup, NoCache,
 };
-pub use error::{HttpError, LocItem, ValidationError, ValidationErrors};
+pub use error::{
+    DebugConfig, DebugInfo, HttpError, LocItem, ValidationError, ValidationErrors,
+    disable_debug_mode, enable_debug_mode, is_debug_mode_enabled,
+};
 pub use extract::{
     Accept, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BasicAuth,
     BasicAuthError, BearerToken, BearerTokenError, ContentType, Cookie, CookiePrefix,
@@ -89,7 +92,7 @@ pub use middleware::{
     RequestId, RequestIdConfig, RequestIdMiddleware, RequestResponseLogger, RequireHeader,
     SecurityHeaders, SecurityHeadersConfig, XFrameOptions,
 };
-pub use request::{Body, Headers, Method, Request};
+pub use request::{Body, Headers, HttpVersion, Method, Request};
 pub use response::{
     BodyStream, FileResponse, Html, IntoResponse, NoContent, Redirect, Response, ResponseBody,
     StatusCode, Text, mime_type_for_extension,
@@ -119,8 +122,9 @@ pub use api_router::{APIRouter, IncludeConfig, ResponseDef, RouterDependency, Ro
 
 // Re-export app utilities
 pub use app::{
-    App, AppBuilder, AppConfig, ConfigError, ExceptionHandlers, RouteEntry, StartupHook,
-    StartupHookError, StartupOutcome, StateContainer,
+    App, AppBuilder, AppConfig, BoxLifespanFn, ConfigError, ExceptionHandlers, HasState,
+    LifespanError, LifespanScope, RequiresState, RouteEntry, StartupHook, StartupHookError,
+    StartupOutcome, StateContainer, StateRegistry,
 };
 
 // Re-export shutdown utilities

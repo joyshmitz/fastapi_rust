@@ -58,6 +58,7 @@
 #![allow(clippy::duplicated_attributes)]
 
 pub mod body;
+pub mod connection;
 mod parser;
 mod query;
 mod response;
@@ -67,6 +68,10 @@ pub mod streaming;
 pub use body::{
     BodyConfig, BodyError, ChunkedReader, ContentLengthReader, DEFAULT_MAX_BODY_SIZE, parse_body,
     parse_body_with_consumed, validate_content_length,
+};
+pub use connection::{
+    ConnectionInfo, STANDARD_HOP_BY_HOP_HEADERS, is_standard_hop_by_hop_header,
+    parse_connection_header, should_keep_alive, strip_hop_by_hop_headers,
 };
 pub use parser::{
     BodyLength, Header, HeadersIter, HeadersParser, ParseError, ParseLimits, ParseStatus, Parser,

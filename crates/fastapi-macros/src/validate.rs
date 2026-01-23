@@ -32,10 +32,10 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, Attribute, Data, DeriveInput, Expr, ExprLit,
-    ExprPath, Field, Fields, Ident, Lit, Meta, MetaList, MetaNameValue, Token,
+    Attribute, Data, DeriveInput, Expr, ExprLit, ExprPath, Field, Fields, Ident, Lit, Meta,
+    MetaList, MetaNameValue, Token, parse_macro_input, punctuated::Punctuated,
 };
 
 /// Parsed validation rules for a field.
@@ -180,7 +180,8 @@ fn parse_nested_validator(list: &MetaList, validators: &mut FieldValidators) {
     match name.as_deref() {
         Some("length") => {
             // Parse length(min = N, max = M)
-            if let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            if let Ok(nested) =
+                list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
             {
                 for item in nested {
                     if let Meta::NameValue(nv) = item {
@@ -200,7 +201,8 @@ fn parse_nested_validator(list: &MetaList, validators: &mut FieldValidators) {
         }
         Some("range") => {
             // Parse range(gt = N, ge = N, lt = N, le = N)
-            if let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            if let Ok(nested) =
+                list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
             {
                 for item in nested {
                     if let Meta::NameValue(nv) = item {
@@ -209,10 +211,10 @@ fn parse_nested_validator(list: &MetaList, validators: &mut FieldValidators) {
                         match key.as_deref() {
                             Some("gt") => validators.range_gt = Some(value),
                             // Also support min as alias for ge
-                            Some("ge") | Some("min") => validators.range_ge = Some(value),
+                            Some("ge" | "min") => validators.range_ge = Some(value),
                             Some("lt") => validators.range_lt = Some(value),
                             // Also support max as alias for le
-                            Some("le") | Some("max") => validators.range_le = Some(value),
+                            Some("le" | "max") => validators.range_le = Some(value),
                             _ => {}
                         }
                     }

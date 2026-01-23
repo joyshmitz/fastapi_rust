@@ -4,6 +4,63 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
 
+/// HTTP version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HttpVersion {
+    /// HTTP/1.0
+    Http10,
+    /// HTTP/1.1 (default)
+    #[default]
+    Http11,
+}
+
+impl HttpVersion {
+    /// Parse HTTP version from string.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "HTTP/1.0" => Some(Self::Http10),
+            "HTTP/1.1" => Some(Self::Http11),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is HTTP/1.1.
+    #[must_use]
+    pub fn is_http11(self) -> bool {
+        matches!(self, Self::Http11)
+    }
+
+    /// Returns true if this is HTTP/1.0.
+    #[must_use]
+    pub fn is_http10(self) -> bool {
+        matches!(self, Self::Http10)
+    }
+
+    /// Returns the version string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http10 => "HTTP/1.0",
+            Self::Http11 => "HTTP/1.1",
+        }
+    }
+}
+
+impl std::str::FromStr for HttpVersion {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(())
+    }
+}
+
+impl fmt::Display for HttpVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// HTTP method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -109,6 +166,19 @@ impl Headers {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Remove a header by name (case-insensitive).
+    ///
+    /// Returns the removed value, if any.
+    pub fn remove(&mut self, name: &str) -> Option<Vec<u8>> {
+        self.inner.remove(&name.to_ascii_lowercase())
+    }
+
+    /// Check if a header exists (case-insensitive).
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner.contains_key(&name.to_ascii_lowercase())
+    }
 }
 
 /// Request body.
@@ -144,6 +214,7 @@ pub struct Request {
     method: Method,
     path: String,
     query: Option<String>,
+    version: HttpVersion,
     headers: Headers,
     body: Body,
     // Extensions for middleware/extractors
@@ -159,10 +230,36 @@ impl Request {
             method,
             path: path.into(),
             query: None,
+            version: HttpVersion::default(),
             headers: Headers::new(),
             body: Body::Empty,
             extensions: HashMap::new(),
         }
+    }
+
+    /// Create a new request with a specific HTTP version.
+    #[must_use]
+    pub fn with_version(method: Method, path: impl Into<String>, version: HttpVersion) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            query: None,
+            version,
+            headers: Headers::new(),
+            body: Body::Empty,
+            extensions: HashMap::new(),
+        }
+    }
+
+    /// Get the HTTP version.
+    #[must_use]
+    pub fn version(&self) -> HttpVersion {
+        self.version
+    }
+
+    /// Set the HTTP version.
+    pub fn set_version(&mut self, version: HttpVersion) {
+        self.version = version;
     }
 
     /// Get the HTTP method.

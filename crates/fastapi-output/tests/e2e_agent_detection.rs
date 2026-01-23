@@ -193,7 +193,7 @@ fn e2e_human_mode_override_beats_ci() {
         eprintln!("[E2E] Set CI=true, FASTAPI_HUMAN_MODE=1");
 
         let mode = OutputMode::auto();
-        eprintln!("[E2E] OutputMode::auto() = {:?}", mode);
+        eprintln!("[E2E] OutputMode::auto() = {mode:?}");
 
         // Human mode override beats CI detection
         // Note: Rich mode depends on feature flag
@@ -227,7 +227,7 @@ fn e2e_force_color_beats_ci() {
         eprintln!("[E2E] Set CI=true, FORCE_COLOR=1");
 
         let mode = OutputMode::auto();
-        eprintln!("[E2E] OutputMode::auto() = {:?}", mode);
+        eprintln!("[E2E] OutputMode::auto() = {mode:?}");
 
         // FORCE_COLOR should prefer rich output
         assert!(!mode.is_agent_friendly());
@@ -255,7 +255,7 @@ fn e2e_plain_mode_output_has_no_ansi() {
             output.info("Listening on port 8000");
         });
 
-        eprintln!("[E2E] Captured output:\n{}", captured);
+        eprintln!("[E2E] Captured output:\n{captured}");
 
         assert_no_ansi(&captured);
         assert_contains(&captured, "[OK]");
@@ -281,7 +281,7 @@ fn e2e_rich_mode_output_has_ansi() {
             output.error("Connection failed");
         });
 
-        eprintln!("[E2E] Captured raw output:\n{}", captured);
+        eprintln!("[E2E] Captured raw output:\n{captured}");
 
         // Rich mode should have ANSI codes
         // Note: capture() returns stripped output, so we need to check raw
@@ -307,7 +307,7 @@ fn e2e_output_prefixes_are_consistent() {
             output.debug("msg5");
         });
 
-        eprintln!("[E2E] Captured:\n{}", captured);
+        eprintln!("[E2E] Captured:\n{captured}");
 
         // All prefixes should be present in order
         assert_contains_in_order(
@@ -352,7 +352,7 @@ fn e2e_global_instance_is_consistent() {
         let mode2 = get_global().mode();
         let mode3 = get_global().mode();
 
-        eprintln!("[E2E] modes: {:?}, {:?}, {:?}", mode1, mode2, mode3);
+        eprintln!("[E2E] modes: {mode1:?}, {mode2:?}, {mode3:?}");
 
         assert_eq!(mode1, mode2);
         assert_eq!(mode2, mode3);
@@ -375,7 +375,7 @@ fn e2e_banner_respects_mode() {
         let info = ServerInfo::new("1.0.0", "localhost", 8000).docs_path("/docs");
         let output = banner.render(&info);
 
-        eprintln!("[E2E] Banner output:\n{}", output);
+        eprintln!("[E2E] Banner output:\n{output}");
 
         assert_no_ansi(&output);
         assert_contains(&output, "FastAPI Rust");
@@ -431,7 +431,7 @@ fn e2e_request_logger_respects_mode() {
             .timing(ResponseTiming::new(std::time::Duration::from_millis(50)));
 
         let output = logger.format(&entry);
-        eprintln!("[E2E] Request log output: {}", output);
+        eprintln!("[E2E] Request log output: {output}");
 
         assert_no_ansi(&output);
         assert_contains(&output, "GET");
@@ -457,7 +457,7 @@ fn e2e_multiple_agent_vars_still_detects() {
         eprintln!("[E2E] Set multiple agent/CI vars");
 
         let result = detect_environment();
-        eprintln!("[E2E] Detection result: {:?}", result);
+        eprintln!("[E2E] Detection result: {result:?}");
 
         assert!(result.is_agent);
         assert!(result.is_ci);

@@ -1,8 +1,311 @@
 //! Error types.
+//!
+//! This module provides error types for HTTP responses with support for
+//! debug mode that can include additional diagnostic information.
+//!
+//! # Debug Mode
+//!
+//! Debug mode can be enabled to include additional diagnostic information
+//! in error responses:
+//!
+//! - Source location (file, line, function)
+//! - Full validation error context
+//! - Handler name and route pattern
+//!
+//! Debug mode is controlled per-error via the `with_debug_info` method,
+//! and should only be enabled when the application is in debug mode AND
+//! the request includes a valid debug token (if configured).
+//!
+//! # Example
+//!
+//! ```
+//! use fastapi_core::error::{HttpError, DebugInfo};
+//!
+//! // Production mode - no debug info
+//! let error = HttpError::not_found().with_detail("User not found");
+//!
+//! // Debug mode - with source location
+//! let error = HttpError::not_found()
+//!     .with_detail("User not found")
+//!     .with_debug_info(DebugInfo::new()
+//!         .with_source_location(file!(), line!(), "get_user")
+//!         .with_route_pattern("/users/{id}"));
+//! ```
 
 use crate::response::{IntoResponse, Response, ResponseBody, StatusCode};
 use serde::{Serialize, Serializer};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ============================================================================
+// Debug Mode Configuration
+// ============================================================================
+
+/// Global flag for thread-local debug mode state.
+/// This is used when debug info needs to be propagated through error creation.
+static DEBUG_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable debug mode globally.
+///
+/// When debug mode is enabled, errors can include additional diagnostic
+/// information in their responses. This should be controlled by the
+/// application configuration and request-level debug token validation.
+pub fn enable_debug_mode() {
+    DEBUG_MODE_ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// Disable debug mode globally.
+pub fn disable_debug_mode() {
+    DEBUG_MODE_ENABLED.store(false, Ordering::SeqCst);
+}
+
+/// Check if debug mode is enabled globally.
+#[must_use]
+pub fn is_debug_mode_enabled() -> bool {
+    DEBUG_MODE_ENABLED.load(Ordering::SeqCst)
+}
+
+/// Debug configuration for secure debug mode access.
+///
+/// This allows configuring a debug header that must be present with a
+/// secret token for debug information to be included in responses.
+///
+/// # Example
+///
+/// ```
+/// use fastapi_core::error::DebugConfig;
+///
+/// // Require X-Debug-Token header with a secret
+/// let config = DebugConfig::new()
+///     .with_debug_header("X-Debug-Token", "my-secret-token");
+///
+/// // Or allow debug mode without authentication (dangerous!)
+/// let config = DebugConfig::new().allow_unauthenticated();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DebugConfig {
+    /// Enable debug mode for the application.
+    pub enabled: bool,
+    /// Header name for debug token authentication.
+    pub debug_header: Option<String>,
+    /// Expected token value for debug access.
+    pub debug_token: Option<String>,
+    /// Allow debug mode without authentication (dangerous in production).
+    pub allow_unauthenticated: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debug_header: None,
+            debug_token: None,
+            allow_unauthenticated: false,
+        }
+    }
+}
+
+impl DebugConfig {
+    /// Create a new debug configuration with debug mode disabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable debug mode.
+    #[must_use]
+    pub fn enable(mut self) -> Self {
+        self.enabled = true;
+        self
+    }
+
+    /// Configure the debug header and token for authenticated debug access.
+    ///
+    /// When configured, debug information will only be included in responses
+    /// if the request includes this header with the expected token value.
+    #[must_use]
+    pub fn with_debug_header(
+        mut self,
+        header_name: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        self.debug_header = Some(header_name.into());
+        self.debug_token = Some(token.into());
+        self
+    }
+
+    /// Allow debug mode without authentication.
+    ///
+    /// # Warning
+    ///
+    /// This is dangerous in production as it exposes internal details
+    /// to anyone. Only use for development/testing.
+    #[must_use]
+    pub fn allow_unauthenticated(mut self) -> Self {
+        self.allow_unauthenticated = true;
+        self
+    }
+
+    /// Check if a request is authorized for debug mode.
+    ///
+    /// Returns true if:
+    /// - Debug mode is disabled (debug info won't be shown anyway)
+    /// - `allow_unauthenticated` is true
+    /// - The request includes the correct debug header/token
+    pub fn is_authorized(&self, request_headers: &[(String, Vec<u8>)]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        if self.allow_unauthenticated {
+            return true;
+        }
+
+        // Check for debug header
+        if let (Some(header_name), Some(expected_token)) = (&self.debug_header, &self.debug_token) {
+            for (name, value) in request_headers {
+                if name.eq_ignore_ascii_case(header_name) {
+                    if let Ok(token) = std::str::from_utf8(value) {
+                        return token == expected_token;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+}
+
+// ============================================================================
+// Debug Information
+// ============================================================================
+
+/// Debug information to include in error responses when debug mode is enabled.
+///
+/// This struct holds diagnostic information that helps developers understand
+/// where and why an error occurred. This information should NEVER be included
+/// in production responses as it can leak sensitive implementation details.
+///
+/// # Fields
+///
+/// - `source_file`: The file where the error originated
+/// - `source_line`: The line number in the source file
+/// - `function_name`: The function or handler that generated the error
+/// - `route_pattern`: The matched route pattern (e.g., "/users/{id}")
+/// - `handler_name`: The name of the handler function
+/// - `extra`: Additional key-value debug information
+///
+/// # Example
+///
+/// ```
+/// use fastapi_core::error::DebugInfo;
+///
+/// let debug = DebugInfo::new()
+///     .with_source_location("src/handlers/user.rs", 42, "get_user")
+///     .with_route_pattern("/users/{id}")
+///     .with_extra("user_id_received", "abc123");
+/// ```
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DebugInfo {
+    /// Source file path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    /// Source line number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_line: Option<u32>,
+    /// Function or handler name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_name: Option<String>,
+    /// Matched route pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_pattern: Option<String>,
+    /// Handler name (may differ from function_name for wrapped handlers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler_name: Option<String>,
+    /// Additional debug context.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, String>,
+}
+
+impl DebugInfo {
+    /// Create empty debug info.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source location.
+    #[must_use]
+    pub fn with_source_location(
+        mut self,
+        file: impl Into<String>,
+        line: u32,
+        function: impl Into<String>,
+    ) -> Self {
+        self.source_file = Some(file.into());
+        self.source_line = Some(line);
+        self.function_name = Some(function.into());
+        self
+    }
+
+    /// Set the route pattern.
+    #[must_use]
+    pub fn with_route_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.route_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Set the handler name.
+    #[must_use]
+    pub fn with_handler_name(mut self, name: impl Into<String>) -> Self {
+        self.handler_name = Some(name.into());
+        self
+    }
+
+    /// Add extra debug information.
+    #[must_use]
+    pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra.insert(key.into(), value.into());
+        self
+    }
+
+    /// Check if this debug info is empty (has no data).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.source_file.is_none()
+            && self.source_line.is_none()
+            && self.function_name.is_none()
+            && self.route_pattern.is_none()
+            && self.handler_name.is_none()
+            && self.extra.is_empty()
+    }
+}
+
+/// Macro to capture the current source location for debug info.
+///
+/// # Example
+///
+/// ```
+/// use fastapi_core::{debug_location, error::DebugInfo};
+///
+/// fn my_handler() -> DebugInfo {
+///     debug_location!()
+/// }
+/// ```
+#[macro_export]
+macro_rules! debug_location {
+    () => {
+        $crate::error::DebugInfo::new().with_source_location(
+            file!(),
+            line!(),
+            // Get a reasonable function name approximation
+            module_path!(),
+        )
+    };
+    ($func_name:expr) => {
+        $crate::error::DebugInfo::new().with_source_location(file!(), line!(), $func_name)
+    };
+}
 
 // ============================================================================
 // Location Types for Validation Errors (FastAPI-compatible)
@@ -212,6 +515,30 @@ pub mod error_types {
 // ============================================================================
 
 /// HTTP error that produces a response.
+///
+/// When debug mode is enabled, errors can include additional diagnostic
+/// information via the `debug_info` field. This information is conditionally
+/// serialized into the response when `is_debug_mode_enabled()` returns true.
+///
+/// # Production Mode (default)
+///
+/// ```json
+/// {"detail": "Not Found"}
+/// ```
+///
+/// # Debug Mode (when enabled)
+///
+/// ```json
+/// {
+///   "detail": "Not Found",
+///   "debug": {
+///     "source_file": "src/handlers/user.rs",
+///     "source_line": 42,
+///     "function_name": "get_user",
+///     "route_pattern": "/users/{id}"
+///   }
+/// }
+/// ```
 #[derive(Debug)]
 pub struct HttpError {
     /// Status code.
@@ -220,6 +547,8 @@ pub struct HttpError {
     pub detail: Option<String>,
     /// Additional headers.
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Debug information (only included in response when debug mode is enabled).
+    pub debug_info: Option<DebugInfo>,
 }
 
 impl HttpError {
@@ -230,6 +559,7 @@ impl HttpError {
             status,
             detail: None,
             headers: Vec::new(),
+            debug_info: None,
         }
     }
 
@@ -245,6 +575,43 @@ impl HttpError {
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
+    }
+
+    /// Add debug information.
+    ///
+    /// This information will only be included in the response when debug mode
+    /// is enabled (via `enable_debug_mode()`).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fastapi_core::error::{HttpError, DebugInfo};
+    ///
+    /// let error = HttpError::not_found()
+    ///     .with_detail("User not found")
+    ///     .with_debug_info(DebugInfo::new()
+    ///         .with_source_location("src/handlers/user.rs", 42, "get_user")
+    ///         .with_route_pattern("/users/{id}"));
+    /// ```
+    #[must_use]
+    pub fn with_debug_info(mut self, debug_info: DebugInfo) -> Self {
+        self.debug_info = Some(debug_info);
+        self
+    }
+
+    /// Add debug information at the current source location.
+    ///
+    /// This is a convenience method that captures the current file and line.
+    /// Note: This captures the location where this method is called, not
+    /// where the error originated. For accurate source tracking, use
+    /// `with_debug_info` with a `DebugInfo` created via the `debug_location!` macro.
+    #[must_use]
+    pub fn with_debug_location(self, function_name: impl Into<String>) -> Self {
+        self.with_debug_info(DebugInfo::new().with_source_location(
+            std::any::type_name::<Self>(),
+            0, // Line unknown when called this way
+            function_name,
+        ))
     }
 
     /// Create a 400 Bad Request error.
@@ -292,17 +659,38 @@ impl HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        #[derive(Serialize)]
-        struct ErrorBody<'a> {
-            detail: &'a str,
-        }
-
         let detail = self
             .detail
             .as_deref()
             .unwrap_or_else(|| self.status.canonical_reason());
 
-        let body = serde_json::to_vec(&ErrorBody { detail }).unwrap_or_default();
+        // Conditionally include debug info based on global debug mode flag
+        let body = if is_debug_mode_enabled() {
+            if let Some(ref debug_info) = self.debug_info {
+                #[derive(Serialize)]
+                struct ErrorBodyWithDebug<'a> {
+                    detail: &'a str,
+                    debug: &'a DebugInfo,
+                }
+                serde_json::to_vec(&ErrorBodyWithDebug {
+                    detail,
+                    debug: debug_info,
+                })
+                .unwrap_or_default()
+            } else {
+                #[derive(Serialize)]
+                struct ErrorBody<'a> {
+                    detail: &'a str,
+                }
+                serde_json::to_vec(&ErrorBody { detail }).unwrap_or_default()
+            }
+        } else {
+            #[derive(Serialize)]
+            struct ErrorBody<'a> {
+                detail: &'a str,
+            }
+            serde_json::to_vec(&ErrorBody { detail }).unwrap_or_default()
+        };
 
         let mut response = Response::with_status(self.status)
             .header("content-type", b"application/json".to_vec())
@@ -543,6 +931,8 @@ pub struct ValidationErrors {
     pub errors: Vec<ValidationError>,
     /// The original input body (if available).
     pub body: Option<serde_json::Value>,
+    /// Debug information (only included in response when debug mode is enabled).
+    pub debug_info: Option<DebugInfo>,
 }
 
 impl ValidationErrors {
@@ -552,6 +942,7 @@ impl ValidationErrors {
         Self {
             errors: Vec::new(),
             body: None,
+            debug_info: None,
         }
     }
 
@@ -561,13 +952,18 @@ impl ValidationErrors {
         Self {
             errors: vec![error],
             body: None,
+            debug_info: None,
         }
     }
 
     /// Create from multiple errors.
     #[must_use]
     pub fn from_errors(errors: Vec<ValidationError>) -> Self {
-        Self { errors, body: None }
+        Self {
+            errors,
+            body: None,
+            debug_info: None,
+        }
     }
 
     /// Add an error.
@@ -584,6 +980,16 @@ impl ValidationErrors {
     #[must_use]
     pub fn with_body(mut self, body: serde_json::Value) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    /// Add debug information.
+    ///
+    /// This information will only be included in the response when debug mode
+    /// is enabled (via `enable_debug_mode()`).
+    #[must_use]
+    pub fn with_debug_info(mut self, debug_info: DebugInfo) -> Self {
+        self.debug_info = Some(debug_info);
         self
     }
 
@@ -637,6 +1043,9 @@ impl ValidationErrors {
         self.errors.extend(other.errors);
         if self.body.is_none() {
             self.body = other.body;
+        }
+        if self.debug_info.is_none() {
+            self.debug_info = other.debug_info;
         }
     }
 
@@ -696,7 +1105,25 @@ impl std::error::Error for ValidationErrors {}
 
 impl IntoResponse for ValidationErrors {
     fn into_response(self) -> Response {
-        let body = self.to_json_bytes();
+        // Conditionally include debug info based on global debug mode flag
+        let body = if is_debug_mode_enabled() {
+            if let Some(ref debug_info) = self.debug_info {
+                #[derive(Serialize)]
+                struct BodyWithDebug<'a> {
+                    detail: &'a [ValidationError],
+                    debug: &'a DebugInfo,
+                }
+                serde_json::to_vec(&BodyWithDebug {
+                    detail: &self.errors,
+                    debug: debug_info,
+                })
+                .unwrap_or_else(|_| b"{\"detail\":[]}".to_vec())
+            } else {
+                self.to_json_bytes()
+            }
+        } else {
+            self.to_json_bytes()
+        };
 
         Response::with_status(StatusCode::UNPROCESSABLE_ENTITY)
             .header("content-type", b"application/json".to_vec())
@@ -1354,7 +1781,7 @@ mod tests {
         let response = error.into_response();
 
         // Extract body
-        let body = match response.body() {
+        let body = match response.body_ref() {
             ResponseBody::Bytes(b) => b.clone(),
             _ => panic!("Expected bytes body"),
         };
@@ -1369,7 +1796,7 @@ mod tests {
         let error = HttpError::not_found();
         let response = error.into_response();
 
-        let body = match response.body() {
+        let body = match response.body_ref() {
             ResponseBody::Bytes(b) => b.clone(),
             _ => panic!("Expected bytes body"),
         };
@@ -1437,7 +1864,7 @@ mod tests {
         for error in errors {
             let status = error.status;
             let response = error.into_response();
-            let body = match response.body() {
+            let body = match response.body_ref() {
                 ResponseBody::Bytes(b) => b.clone(),
                 _ => panic!("Expected bytes body"),
             };
@@ -1468,7 +1895,7 @@ mod tests {
         let error = HttpError::forbidden().with_detail("Insufficient permissions");
         let response = error.into_response();
 
-        let body = match response.body() {
+        let body = match response.body_ref() {
             ResponseBody::Bytes(b) => b.clone(),
             _ => panic!("Expected bytes body"),
         };
@@ -1566,7 +1993,9 @@ mod tests {
         let json = serde_json::to_value(&error).unwrap();
         assert_eq!(
             json["loc"],
-            json!(["body", "data", "users", 0, "profile", "settings", 5, "value"])
+            json!([
+                "body", "data", "users", 0, "profile", "settings", 5, "value"
+            ])
         );
     }
 
@@ -1634,7 +2063,7 @@ mod tests {
         assert_eq!(error.detail, Some(String::new()));
 
         let response = error.into_response();
-        let body = match response.body() {
+        let body = match response.body_ref() {
             ResponseBody::Bytes(b) => b.clone(),
             _ => panic!("Expected bytes body"),
         };
@@ -1650,5 +2079,411 @@ mod tests {
         let error = HttpError::bad_request().with_header("X-Binary", vec![0x00, 0xFF, 0x80]);
 
         assert_eq!(error.headers[0].1, vec![0x00, 0xFF, 0x80]);
+    }
+
+    // ========================================================================
+    // Debug Mode Tests
+    // ========================================================================
+
+    #[test]
+    fn debug_mode_default_disabled() {
+        // Ensure debug mode is disabled by default
+        disable_debug_mode();
+        assert!(!is_debug_mode_enabled());
+    }
+
+    #[test]
+    fn debug_mode_can_be_enabled_and_disabled() {
+        // Start disabled
+        disable_debug_mode();
+        assert!(!is_debug_mode_enabled());
+
+        // Enable
+        enable_debug_mode();
+        assert!(is_debug_mode_enabled());
+
+        // Disable again
+        disable_debug_mode();
+        assert!(!is_debug_mode_enabled());
+    }
+
+    #[test]
+    fn debug_config_default() {
+        let config = DebugConfig::default();
+        assert!(!config.enabled);
+        assert!(config.debug_header.is_none());
+        assert!(config.debug_token.is_none());
+        assert!(!config.allow_unauthenticated);
+    }
+
+    #[test]
+    fn debug_config_builder() {
+        let config = DebugConfig::new()
+            .enable()
+            .with_debug_header("X-Debug-Token", "secret123");
+
+        assert!(config.enabled);
+        assert_eq!(config.debug_header, Some("X-Debug-Token".to_owned()));
+        assert_eq!(config.debug_token, Some("secret123".to_owned()));
+        assert!(!config.allow_unauthenticated);
+    }
+
+    #[test]
+    fn debug_config_allow_unauthenticated() {
+        let config = DebugConfig::new().enable().allow_unauthenticated();
+
+        assert!(config.enabled);
+        assert!(config.allow_unauthenticated);
+    }
+
+    #[test]
+    fn debug_config_is_authorized_when_disabled() {
+        let config = DebugConfig::new();
+        let headers: Vec<(String, Vec<u8>)> = vec![];
+
+        // Not authorized when debug mode is disabled
+        assert!(!config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_config_is_authorized_unauthenticated() {
+        let config = DebugConfig::new().enable().allow_unauthenticated();
+        let headers: Vec<(String, Vec<u8>)> = vec![];
+
+        // Authorized when allow_unauthenticated is true
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_config_is_authorized_with_valid_token() {
+        let config = DebugConfig::new()
+            .enable()
+            .with_debug_header("X-Debug-Token", "my-secret");
+
+        let headers = vec![("X-Debug-Token".to_owned(), b"my-secret".to_vec())];
+
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_config_is_authorized_with_invalid_token() {
+        let config = DebugConfig::new()
+            .enable()
+            .with_debug_header("X-Debug-Token", "my-secret");
+
+        let headers = vec![("X-Debug-Token".to_owned(), b"wrong-secret".to_vec())];
+
+        assert!(!config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_config_is_authorized_missing_header() {
+        let config = DebugConfig::new()
+            .enable()
+            .with_debug_header("X-Debug-Token", "my-secret");
+
+        let headers: Vec<(String, Vec<u8>)> = vec![];
+
+        assert!(!config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_config_header_case_insensitive() {
+        let config = DebugConfig::new()
+            .enable()
+            .with_debug_header("X-Debug-Token", "my-secret");
+
+        let headers = vec![("x-debug-token".to_owned(), b"my-secret".to_vec())];
+
+        assert!(config.is_authorized(&headers));
+    }
+
+    #[test]
+    fn debug_info_new() {
+        let info = DebugInfo::new();
+        assert!(info.is_empty());
+        assert!(info.source_file.is_none());
+        assert!(info.source_line.is_none());
+        assert!(info.function_name.is_none());
+        assert!(info.route_pattern.is_none());
+        assert!(info.handler_name.is_none());
+        assert!(info.extra.is_empty());
+    }
+
+    #[test]
+    fn debug_info_with_source_location() {
+        let info = DebugInfo::new().with_source_location("src/handlers/user.rs", 42, "get_user");
+
+        assert!(!info.is_empty());
+        assert_eq!(info.source_file, Some("src/handlers/user.rs".to_owned()));
+        assert_eq!(info.source_line, Some(42));
+        assert_eq!(info.function_name, Some("get_user".to_owned()));
+    }
+
+    #[test]
+    fn debug_info_with_route_pattern() {
+        let info = DebugInfo::new().with_route_pattern("/users/{id}");
+
+        assert!(!info.is_empty());
+        assert_eq!(info.route_pattern, Some("/users/{id}".to_owned()));
+    }
+
+    #[test]
+    fn debug_info_with_handler_name() {
+        let info = DebugInfo::new().with_handler_name("UserController::get");
+
+        assert!(!info.is_empty());
+        assert_eq!(info.handler_name, Some("UserController::get".to_owned()));
+    }
+
+    #[test]
+    fn debug_info_with_extra() {
+        let info = DebugInfo::new()
+            .with_extra("user_id", "abc123")
+            .with_extra("request_id", "req-456");
+
+        assert!(!info.is_empty());
+        assert_eq!(info.extra.get("user_id"), Some(&"abc123".to_owned()));
+        assert_eq!(info.extra.get("request_id"), Some(&"req-456".to_owned()));
+    }
+
+    #[test]
+    fn debug_info_full_builder() {
+        let info = DebugInfo::new()
+            .with_source_location("src/api/users.rs", 100, "create_user")
+            .with_route_pattern("/api/users")
+            .with_handler_name("UsersHandler::create")
+            .with_extra("method", "POST");
+
+        assert!(!info.is_empty());
+        assert_eq!(info.source_file, Some("src/api/users.rs".to_owned()));
+        assert_eq!(info.source_line, Some(100));
+        assert_eq!(info.function_name, Some("create_user".to_owned()));
+        assert_eq!(info.route_pattern, Some("/api/users".to_owned()));
+        assert_eq!(info.handler_name, Some("UsersHandler::create".to_owned()));
+        assert_eq!(info.extra.get("method"), Some(&"POST".to_owned()));
+    }
+
+    #[test]
+    fn debug_info_serialization() {
+        let info = DebugInfo::new()
+            .with_source_location("src/test.rs", 42, "test_fn")
+            .with_route_pattern("/test");
+
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(json["source_file"], "src/test.rs");
+        assert_eq!(json["source_line"], 42);
+        assert_eq!(json["function_name"], "test_fn");
+        assert_eq!(json["route_pattern"], "/test");
+        // handler_name and extra should be omitted when empty/None
+        assert!(json.get("handler_name").is_none());
+        assert!(json.get("extra").is_none());
+    }
+
+    #[test]
+    fn debug_info_serialization_skip_none() {
+        let info = DebugInfo::new().with_route_pattern("/test");
+
+        let json = serde_json::to_value(&info).unwrap();
+
+        // Only route_pattern should be present
+        assert_eq!(json["route_pattern"], "/test");
+        assert!(json.get("source_file").is_none());
+        assert!(json.get("source_line").is_none());
+        assert!(json.get("function_name").is_none());
+    }
+
+    #[test]
+    fn http_error_with_debug_info() {
+        let debug = DebugInfo::new()
+            .with_source_location("src/handlers.rs", 50, "handle_request")
+            .with_route_pattern("/api/test");
+
+        let error = HttpError::not_found()
+            .with_detail("Resource not found")
+            .with_debug_info(debug);
+
+        assert!(error.debug_info.is_some());
+        let info = error.debug_info.unwrap();
+        assert_eq!(info.source_file, Some("src/handlers.rs".to_owned()));
+        assert_eq!(info.source_line, Some(50));
+    }
+
+    #[test]
+    fn http_error_response_without_debug_mode() {
+        disable_debug_mode();
+
+        let error = HttpError::not_found()
+            .with_detail("User not found")
+            .with_debug_info(
+                DebugInfo::new()
+                    .with_source_location("src/test.rs", 42, "test")
+                    .with_route_pattern("/users/{id}"),
+            );
+
+        let response = error.into_response();
+        let body = match response.body_ref() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should only have detail, no debug info
+        assert_eq!(parsed["detail"], "User not found");
+        assert!(parsed.get("debug").is_none());
+    }
+
+    #[test]
+    fn http_error_response_with_debug_mode() {
+        // Enable debug mode for this test
+        enable_debug_mode();
+
+        let error = HttpError::not_found()
+            .with_detail("User not found")
+            .with_debug_info(
+                DebugInfo::new()
+                    .with_source_location("src/test.rs", 42, "test")
+                    .with_route_pattern("/users/{id}"),
+            );
+
+        let response = error.into_response();
+        let body = match response.body_ref() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should have both detail and debug info
+        assert_eq!(parsed["detail"], "User not found");
+        assert!(parsed.get("debug").is_some());
+        assert_eq!(parsed["debug"]["source_file"], "src/test.rs");
+        assert_eq!(parsed["debug"]["source_line"], 42);
+        assert_eq!(parsed["debug"]["function_name"], "test");
+        assert_eq!(parsed["debug"]["route_pattern"], "/users/{id}");
+
+        // Clean up
+        disable_debug_mode();
+    }
+
+    #[test]
+    fn http_error_response_with_debug_mode_no_debug_info() {
+        // Enable debug mode but don't add debug info
+        enable_debug_mode();
+
+        let error = HttpError::not_found().with_detail("User not found");
+
+        let response = error.into_response();
+        let body = match response.body_ref() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should only have detail, no debug field
+        assert_eq!(parsed["detail"], "User not found");
+        assert!(parsed.get("debug").is_none());
+
+        // Clean up
+        disable_debug_mode();
+    }
+
+    #[test]
+    fn validation_errors_with_debug_info() {
+        let errors = ValidationErrors::single(ValidationError::missing(loc::query("q")))
+            .with_debug_info(
+                DebugInfo::new()
+                    .with_source_location("src/extractors.rs", 100, "extract_query")
+                    .with_handler_name("SearchHandler::search"),
+            );
+
+        assert!(errors.debug_info.is_some());
+    }
+
+    #[test]
+    fn validation_errors_response_without_debug_mode() {
+        disable_debug_mode();
+
+        let errors = ValidationErrors::single(ValidationError::missing(loc::query("q")))
+            .with_debug_info(DebugInfo::new().with_source_location("src/test.rs", 42, "test"));
+
+        let response = errors.into_response();
+        let body = match response.body_ref() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should only have detail array, no debug info
+        assert!(parsed["detail"].is_array());
+        assert!(parsed.get("debug").is_none());
+    }
+
+    #[test]
+    fn validation_errors_response_with_debug_mode() {
+        enable_debug_mode();
+
+        let errors = ValidationErrors::single(ValidationError::missing(loc::query("q")))
+            .with_debug_info(
+                DebugInfo::new()
+                    .with_source_location("src/test.rs", 42, "test")
+                    .with_route_pattern("/search"),
+            );
+
+        let response = errors.into_response();
+        let body = match response.body_ref() {
+            ResponseBody::Bytes(b) => b.clone(),
+            _ => panic!("Expected bytes body"),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should have both detail and debug info
+        assert!(parsed["detail"].is_array());
+        assert!(parsed.get("debug").is_some());
+        assert_eq!(parsed["debug"]["source_file"], "src/test.rs");
+        assert_eq!(parsed["debug"]["route_pattern"], "/search");
+
+        // Clean up
+        disable_debug_mode();
+    }
+
+    #[test]
+    fn validation_errors_merge_preserves_debug_info() {
+        let mut errors1 = ValidationErrors::single(ValidationError::missing(loc::query("q")))
+            .with_debug_info(DebugInfo::new().with_source_location("src/a.rs", 1, "a"));
+
+        let errors2 = ValidationErrors::single(ValidationError::missing(loc::query("page")))
+            .with_debug_info(DebugInfo::new().with_source_location("src/b.rs", 2, "b"));
+
+        errors1.merge(errors2);
+
+        // Should keep the first debug_info
+        assert!(errors1.debug_info.is_some());
+        assert_eq!(
+            errors1.debug_info.as_ref().unwrap().source_file,
+            Some("src/a.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn validation_errors_merge_takes_other_debug_info_if_none() {
+        let mut errors1 = ValidationErrors::single(ValidationError::missing(loc::query("q")));
+
+        let errors2 = ValidationErrors::single(ValidationError::missing(loc::query("page")))
+            .with_debug_info(DebugInfo::new().with_source_location("src/b.rs", 2, "b"));
+
+        errors1.merge(errors2);
+
+        // Should take debug_info from errors2
+        assert!(errors1.debug_info.is_some());
+        assert_eq!(
+            errors1.debug_info.as_ref().unwrap().source_file,
+            Some("src/b.rs".to_owned())
+        );
     }
 }
