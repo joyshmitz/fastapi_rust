@@ -21,3 +21,12 @@ Thumbs.db
 # Source images (webp versions are committed instead)
 *.png
 ._*.png
+
+# Ephemeral/temporary files (agent workflow artifacts)
+RESEARCH_FINDINGS.md
+TOON_INTEGRATION_BRIEF.md
+cov_*.out
+rustc-ice-*.txt
+*.snap.new
+sweep_*.png
+test_screenshot.png
