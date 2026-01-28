@@ -58,6 +58,7 @@ pub struct ParamAttrs {
 
 impl ParamAttrs {
     /// Parse `#[param(...)]` attributes from a list of attributes.
+    #[allow(clippy::too_many_lines)]
     pub fn from_attributes(attrs: &[Attribute]) -> Self {
         let mut result = Self::default();
 

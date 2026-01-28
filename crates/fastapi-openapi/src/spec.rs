@@ -423,8 +423,7 @@ impl ParamMeta {
         // Use the effective serialization name if set, otherwise use the provided name
         let effective_name = self
             .effective_serialization_name()
-            .map(String::from)
-            .unwrap_or_else(|| name.into());
+            .map_or_else(|| name.into(), String::from);
         Parameter {
             name: effective_name,
             location,
@@ -810,6 +809,116 @@ mod param_meta_tests {
         assert_eq!(meta.lt, Some(100.0));
         assert_eq!(meta.ge, Some(1.0));
         assert_eq!(meta.le, Some(99.0));
+    }
+
+    // === Alias Tests ===
+
+    #[test]
+    fn alias_sets_alias() {
+        let meta = ParamMeta::new().alias("q");
+        assert_eq!(meta.alias.as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn validation_alias_sets_validation_alias() {
+        let meta = ParamMeta::new().validation_alias("query_param");
+        assert_eq!(meta.validation_alias.as_deref(), Some("query_param"));
+    }
+
+    #[test]
+    fn serialization_alias_sets_serialization_alias() {
+        let meta = ParamMeta::new().serialization_alias("search_query");
+        assert_eq!(meta.serialization_alias.as_deref(), Some("search_query"));
+    }
+
+    #[test]
+    fn effective_validation_name_uses_validation_alias_first() {
+        let meta = ParamMeta::new()
+            .alias("a")
+            .validation_alias("v");
+        assert_eq!(meta.effective_validation_name(), Some("v"));
+    }
+
+    #[test]
+    fn effective_validation_name_falls_back_to_alias() {
+        let meta = ParamMeta::new().alias("a");
+        assert_eq!(meta.effective_validation_name(), Some("a"));
+    }
+
+    #[test]
+    fn effective_validation_name_returns_none_when_no_alias() {
+        let meta = ParamMeta::new();
+        assert!(meta.effective_validation_name().is_none());
+    }
+
+    #[test]
+    fn effective_serialization_name_uses_serialization_alias_first() {
+        let meta = ParamMeta::new()
+            .alias("a")
+            .serialization_alias("s");
+        assert_eq!(meta.effective_serialization_name(), Some("s"));
+    }
+
+    #[test]
+    fn effective_serialization_name_falls_back_to_alias() {
+        let meta = ParamMeta::new().alias("a");
+        assert_eq!(meta.effective_serialization_name(), Some("a"));
+    }
+
+    #[test]
+    fn effective_serialization_name_returns_none_when_no_alias() {
+        let meta = ParamMeta::new();
+        assert!(meta.effective_serialization_name().is_none());
+    }
+
+    #[test]
+    fn to_parameter_uses_alias_for_name() {
+        let meta = ParamMeta::new().alias("q");
+        let param = meta.to_parameter("query", ParameterLocation::Query, false, None);
+        // Should use alias "q" instead of "query"
+        assert_eq!(param.name, "q");
+    }
+
+    #[test]
+    fn to_parameter_uses_serialization_alias_for_name() {
+        let meta = ParamMeta::new()
+            .alias("a")
+            .serialization_alias("search");
+        let param = meta.to_parameter("query", ParameterLocation::Query, false, None);
+        // Should use serialization_alias "search" (overrides alias)
+        assert_eq!(param.name, "search");
+    }
+
+    #[test]
+    fn to_parameter_uses_original_name_when_no_alias() {
+        let meta = ParamMeta::new();
+        let param = meta.to_parameter("query", ParameterLocation::Query, false, None);
+        assert_eq!(param.name, "query");
+    }
+
+    #[test]
+    fn alias_propagation_rules() {
+        // When alias is set, it should propagate to validation and serialization
+        let meta = ParamMeta::new().alias("q");
+        assert_eq!(meta.effective_validation_name(), Some("q"));
+        assert_eq!(meta.effective_serialization_name(), Some("q"));
+
+        // When explicit aliases are set, they override the general alias
+        let meta2 = ParamMeta::new()
+            .alias("q")
+            .validation_alias("query_input")
+            .serialization_alias("query_output");
+        assert_eq!(meta2.effective_validation_name(), Some("query_input"));
+        assert_eq!(meta2.effective_serialization_name(), Some("query_output"));
+    }
+
+    #[test]
+    fn header_alias_example() {
+        // Example: Accept X-Custom-Token header instead of token
+        let meta = ParamMeta::new().alias("X-Custom-Token");
+        let param = meta.to_parameter("token", ParameterLocation::Header, true, None);
+        assert_eq!(param.name, "X-Custom-Token");
+        assert!(matches!(param.location, ParameterLocation::Header));
     }
 }
 
