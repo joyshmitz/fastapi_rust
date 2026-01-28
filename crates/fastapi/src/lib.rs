@@ -103,7 +103,16 @@ pub use fastapi_core::{
 pub use fastapi_core::{CookieJar, RequestBuilder, TestClient, TestResponse};
 pub use fastapi_macros::{JsonSchema, Validate, delete, get, head, options, patch, post, put};
 pub use fastapi_openapi::{OpenApi, OpenApiBuilder};
-pub use fastapi_router::{Route, Router};
+pub use fastapi_router::{
+    // Core router types
+    Route, Router,
+    // Route matching
+    AllowedMethods, RouteLookup, RouteMatch,
+    // Path parameter types
+    Converter, ConversionError, ParamInfo, ParamValue,
+    // Error types
+    InvalidRouteError, RouteAddError, RouteConflictError,
+};
 
 // Re-export HTTP server types
 pub use fastapi_http::{
@@ -150,5 +159,23 @@ pub mod extractors {
         ContentType, Cookie, Header, HeaderValues, Host, Json, JsonConfig, NamedHeader,
         OAuth2PasswordBearer, Page, Pagination, PaginationConfig, Path, PathParams, Query,
         QueryParams, RequestRef, ResponseMut, ResponseMutations, State, UserAgent, XRequestId,
+    };
+}
+
+/// HTTP server module with server types and configuration.
+pub mod server {
+    pub use fastapi_http::{
+        // Server types
+        Server, ServerConfig, TcpServer,
+        // Server functions
+        serve, serve_with_config,
+        // Error types
+        ServeError, ServerError,
+        // Shutdown coordination
+        GracefulOutcome, ShutdownController, ShutdownReceiver,
+        // Configuration constants
+        DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_KEEP_ALIVE_TIMEOUT_SECS,
+        DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+        DEFAULT_READ_BUFFER_SIZE, DEFAULT_REQUEST_TIMEOUT_SECS,
     };
 }

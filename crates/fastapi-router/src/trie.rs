@@ -258,18 +258,37 @@ pub struct Route {
     pub method: Method,
     /// Operation ID for OpenAPI documentation.
     pub operation_id: String,
+    /// OpenAPI summary (short description).
+    pub summary: Option<String>,
+    /// OpenAPI description (detailed explanation).
+    pub description: Option<String>,
+    /// Tags for grouping routes in OpenAPI documentation.
+    pub tags: Vec<String>,
+    /// Whether this route is deprecated.
+    pub deprecated: bool,
     /// Handler function that processes matching requests.
     handler: Arc<dyn Handler>,
 }
 
 impl fmt::Debug for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Route")
-            .field("path", &self.path)
+        let mut s = f.debug_struct("Route");
+        s.field("path", &self.path)
             .field("method", &self.method)
-            .field("operation_id", &self.operation_id)
-            .field("handler", &"<handler>")
-            .finish()
+            .field("operation_id", &self.operation_id);
+        if let Some(ref summary) = self.summary {
+            s.field("summary", summary);
+        }
+        if let Some(ref desc) = self.description {
+            s.field("description", desc);
+        }
+        if !self.tags.is_empty() {
+            s.field("tags", &self.tags);
+        }
+        if self.deprecated {
+            s.field("deprecated", &self.deprecated);
+        }
+        s.field("handler", &"<handler>").finish()
     }
 }
 
@@ -390,6 +409,10 @@ impl Route {
             path,
             method,
             operation_id,
+            summary: None,
+            description: None,
+            tags: Vec::new(),
+            deprecated: false,
             handler: Arc::new(handler),
         }
     }
@@ -408,6 +431,10 @@ impl Route {
             path,
             method,
             operation_id,
+            summary: None,
+            description: None,
+            tags: Vec::new(),
+            deprecated: false,
             handler,
         }
     }
@@ -428,6 +455,48 @@ impl Route {
     #[must_use]
     pub fn with_placeholder_handler(method: Method, path: impl Into<String>) -> Self {
         Self::new(method, path, PlaceholderHandler)
+    }
+
+    /// Set the summary for OpenAPI documentation.
+    #[must_use]
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Set the description for OpenAPI documentation.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the operation ID for OpenAPI documentation.
+    #[must_use]
+    pub fn operation_id(mut self, operation_id: impl Into<String>) -> Self {
+        self.operation_id = operation_id.into();
+        self
+    }
+
+    /// Add a tag for grouping in OpenAPI documentation.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Set multiple tags for grouping in OpenAPI documentation.
+    #[must_use]
+    pub fn tags(mut self, tags: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.tags.extend(tags.into_iter().map(Into::into));
+        self
+    }
+
+    /// Mark this route as deprecated in OpenAPI documentation.
+    #[must_use]
+    pub fn deprecated(mut self) -> Self {
+        self.deprecated = true;
+        self
     }
 }
 

@@ -12,8 +12,96 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    FnArg, GenericArgument, ItemFn, LitStr, PathArguments, ReturnType, Type, parse_macro_input,
+    Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitStr, PathArguments, ReturnType, Token,
+    Type, parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated,
 };
+
+/// Parsed route attributes from `#[get("/path", summary = "...", ...)]`.
+struct RouteAttrs {
+    /// The route path (required).
+    path: LitStr,
+    /// OpenAPI summary (short description).
+    summary: Option<String>,
+    /// OpenAPI description (detailed explanation).
+    description: Option<String>,
+    /// Custom operation ID.
+    operation_id: Option<String>,
+    /// Tags for grouping routes.
+    tags: Vec<String>,
+    /// Whether the route is deprecated.
+    deprecated: bool,
+}
+
+impl Parse for RouteAttrs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        // First argument must be the path string
+        let path: LitStr = input.parse()?;
+
+        let mut attrs = RouteAttrs {
+            path,
+            summary: None,
+            description: None,
+            operation_id: None,
+            tags: Vec::new(),
+            deprecated: false,
+        };
+
+        // Parse optional comma-separated key=value pairs
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+
+            // Handle trailing comma
+            if input.is_empty() {
+                break;
+            }
+
+            let ident: syn::Ident = input.parse()?;
+            let ident_str = ident.to_string();
+
+            match ident_str.as_str() {
+                "deprecated" => {
+                    // `deprecated` is a flag, no value needed
+                    attrs.deprecated = true;
+                }
+                "summary" | "description" | "operation_id" => {
+                    input.parse::<Token![=]>()?;
+                    let value: LitStr = input.parse()?;
+                    match ident_str.as_str() {
+                        "summary" => attrs.summary = Some(value.value()),
+                        "description" => attrs.description = Some(value.value()),
+                        "operation_id" => attrs.operation_id = Some(value.value()),
+                        _ => unreachable!(),
+                    }
+                }
+                "tags" => {
+                    input.parse::<Token![=]>()?;
+                    // Parse as either a single string or an array of strings
+                    if input.peek(syn::token::Bracket) {
+                        let content;
+                        syn::bracketed!(content in input);
+                        let tags: Punctuated<LitStr, Token![,]> =
+                            content.parse_terminated(LitStr::parse, Token![,])?;
+                        attrs.tags = tags.into_iter().map(|s| s.value()).collect();
+                    } else {
+                        let tag: LitStr = input.parse()?;
+                        attrs.tags.push(tag.value());
+                    }
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!(
+                            "unknown route attribute `{ident_str}`.\n\
+                             Valid attributes: summary, description, operation_id, tags, deprecated"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(attrs)
+    }
+}
 
 /// Extract path parameter names from a route pattern.
 ///
@@ -145,7 +233,7 @@ fn get_return_type(output: &ReturnType) -> Option<proc_macro2::TokenStream> {
 
 #[allow(clippy::too_many_lines)]
 pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
-    let path = parse_macro_input!(attr as LitStr);
+    let attrs = parse_macro_input!(attr as RouteAttrs);
     let input_fn = parse_macro_input!(item as ItemFn);
 
     let fn_name = &input_fn.sig.ident;
@@ -159,6 +247,7 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
     let reg_name = syn::Ident::new(&format!("__FASTAPI_ROUTE_REG_{fn_name}"), fn_name.span());
 
     let method_ident = syn::Ident::new(method, proc_macro2::Span::call_site());
+    let path = &attrs.path;
     let path_str = path.value();
 
     // =========================================================================
@@ -300,6 +389,32 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
         None // impl IntoResponse or similar - compiler will validate
     };
 
+    // Generate metadata builder calls
+    let summary_call = attrs.summary.as_ref().map(|s| {
+        quote! { .summary(#s) }
+    });
+
+    let description_call = attrs.description.as_ref().map(|d| {
+        quote! { .description(#d) }
+    });
+
+    let operation_id_call = attrs.operation_id.as_ref().map(|id| {
+        quote! { .operation_id(#id) }
+    });
+
+    let tags = &attrs.tags;
+    let tags_call = if tags.is_empty() {
+        None
+    } else {
+        Some(quote! { .tags([#(#tags),*]) })
+    };
+
+    let deprecated_call = if attrs.deprecated {
+        Some(quote! { .deprecated() })
+    } else {
+        None
+    };
+
     // Generate the expanded code
     let expanded = quote! {
         #fn_vis #fn_asyncness fn #fn_name(#fn_inputs) #fn_output #fn_block
@@ -317,6 +432,11 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
                 fastapi_core::Method::#method_ident,
                 #path_str,
             )
+            #summary_call
+            #description_call
+            #operation_id_call
+            #tags_call
+            #deprecated_call
         }
 
         #[doc(hidden)]
