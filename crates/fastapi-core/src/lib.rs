@@ -97,7 +97,8 @@ pub use extract::{
     Page, Pagination,
     PaginationConfig, Path, PathExtractError, PathParams, Query, QueryExtractError, QueryParams,
     RawBodyConfig, RawBodyError, RequestCookie, RequestCookies, RequestRef, ResponseMut,
-    ResponseMutations, SameSite, SecureCompare, SessionIdCookie, State, StateExtractError,
+    ResponseMutations, SameSite, SecureCompare, SecurityScopes, SecurityScopesError,
+    SessionIdCookie, State, StateExtractError,
     StringBody, UploadedFile, UserAgent, XRequestId, constant_time_eq, constant_time_str_eq,
     snake_to_header_case,
 };

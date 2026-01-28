@@ -9093,6 +9093,365 @@ mod oauth2_authcode_bearer_tests {
 }
 
 // ============================================================================
+// Security Scopes
+// ============================================================================
+
+/// Required OAuth2 security scopes for a handler.
+///
+/// `SecurityScopes` aggregates the scopes required by the current handler's
+/// security dependency chain. It is typically injected alongside a bearer token
+/// extractor so the handler can verify that the token grants the required
+/// scopes.
+///
+/// In Python FastAPI, `SecurityScopes` is automatically populated from the
+/// `scopes` parameter on `Security(...)` dependencies. In this Rust
+/// implementation, scopes are set via request extensions (populated by
+/// middleware or route configuration) and read by the `FromRequest` impl.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{SecurityScopes, BearerToken};
+///
+/// async fn get_admin(
+///     token: BearerToken,
+///     scopes: SecurityScopes,
+/// ) -> impl IntoResponse {
+///     // scopes.scopes() returns ["admin", "users:read"]
+///     // Verify the token grants all required scopes
+///     for scope in scopes.scopes() {
+///         // check token has scope...
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct SecurityScopes {
+    /// Required scopes (order preserved, no duplicates).
+    scopes: Vec<String>,
+    /// Space-separated scope string.
+    scope_str: String,
+}
+
+impl SecurityScopes {
+    /// Create empty security scopes (no scopes required).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            scopes: Vec::new(),
+            scope_str: String::new(),
+        }
+    }
+
+    /// Create from a list of scope strings.
+    ///
+    /// Duplicates are removed while preserving order.
+    #[must_use]
+    pub fn from_scopes(scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<String> = scopes
+            .into_iter()
+            .map(Into::into)
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        let scope_str = deduped.join(" ");
+        Self {
+            scopes: deduped,
+            scope_str,
+        }
+    }
+
+    /// Create from a space-separated scope string.
+    ///
+    /// The string is split on spaces, empty segments are ignored, and
+    /// duplicates are removed while preserving order.
+    #[must_use]
+    pub fn from_scope_str(scope_str: &str) -> Self {
+        let parts = scope_str
+            .split(' ')
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Self::from_scopes(parts)
+    }
+
+    /// Get the required scopes as a slice.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    /// Get the space-separated scope string.
+    #[must_use]
+    pub fn scope_str(&self) -> &str {
+        &self.scope_str
+    }
+
+    /// Check if a specific scope is required.
+    #[must_use]
+    pub fn contains(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+
+    /// Returns true if no scopes are required.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// Returns the number of required scopes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Merge another set of scopes into this one.
+    ///
+    /// New scopes are appended, preserving order and deduplicating.
+    pub fn merge(&mut self, other: &SecurityScopes) {
+        let mut seen: std::collections::HashSet<&str> =
+            self.scopes.iter().map(String::as_str).collect();
+        for scope in &other.scopes {
+            if seen.insert(scope.as_str()) {
+                self.scopes.push(scope.clone());
+            }
+        }
+        self.scope_str = self.scopes.join(" ");
+    }
+
+    /// Create a new `SecurityScopes` by merging two sets.
+    #[must_use]
+    pub fn merged(&self, other: &SecurityScopes) -> Self {
+        let mut result = self.clone();
+        result.merge(other);
+        result
+    }
+}
+
+impl Default for SecurityScopes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SecurityScopes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.scope_str)
+    }
+}
+
+/// Error when SecurityScopes extraction fails.
+///
+/// This occurs when no security scopes have been configured for the route
+/// (i.e., no `SecurityScopesData` extension exists on the request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityScopesError;
+
+impl std::fmt::Display for SecurityScopesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "No security scopes configured for this route")
+    }
+}
+
+impl std::error::Error for SecurityScopesError {}
+
+impl IntoResponse for SecurityScopesError {
+    fn into_response(self) -> Response {
+        HttpError::internal_server_error()
+            .with_detail("Security scopes not configured")
+            .into_response()
+    }
+}
+
+impl FromRequest for SecurityScopes {
+    type Error = SecurityScopesError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Look for SecurityScopes stored as a request extension.
+        // Middleware or route configuration should populate this before the handler runs.
+        if let Some(scopes) = req.get_extension::<SecurityScopes>() {
+            Ok(scopes.clone())
+        } else {
+            // If no scopes extension exists, return empty scopes (no scopes required).
+            // This is lenient — handlers that don't configure scopes get an empty set.
+            Ok(SecurityScopes::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_scopes_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    // ---- Construction tests ----
+
+    #[test]
+    fn new_is_empty() {
+        let scopes = SecurityScopes::new();
+        assert!(scopes.is_empty());
+        assert_eq!(scopes.len(), 0);
+        assert_eq!(scopes.scope_str(), "");
+        assert!(scopes.scopes().is_empty());
+    }
+
+    #[test]
+    fn default_is_empty() {
+        let scopes = SecurityScopes::default();
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn from_scopes_preserves_order() {
+        let scopes = SecurityScopes::from_scopes(["read", "write", "admin"]);
+        assert_eq!(scopes.scopes(), &["read", "write", "admin"]);
+        assert_eq!(scopes.scope_str(), "read write admin");
+        assert_eq!(scopes.len(), 3);
+    }
+
+    #[test]
+    fn from_scopes_deduplicates() {
+        let scopes = SecurityScopes::from_scopes(["read", "write", "read", "admin", "write"]);
+        assert_eq!(scopes.scopes(), &["read", "write", "admin"]);
+        assert_eq!(scopes.scope_str(), "read write admin");
+    }
+
+    #[test]
+    fn from_scope_str() {
+        let scopes = SecurityScopes::from_scope_str("read write admin");
+        assert_eq!(scopes.scopes(), &["read", "write", "admin"]);
+        assert_eq!(scopes.scope_str(), "read write admin");
+    }
+
+    #[test]
+    fn from_scope_str_deduplicates() {
+        let scopes = SecurityScopes::from_scope_str("read write read admin");
+        assert_eq!(scopes.scopes(), &["read", "write", "admin"]);
+    }
+
+    #[test]
+    fn from_scope_str_ignores_empty_segments() {
+        let scopes = SecurityScopes::from_scope_str("read  write   admin");
+        assert_eq!(scopes.scopes(), &["read", "write", "admin"]);
+    }
+
+    #[test]
+    fn from_empty_scope_str() {
+        let scopes = SecurityScopes::from_scope_str("");
+        assert!(scopes.is_empty());
+        assert_eq!(scopes.scope_str(), "");
+    }
+
+    // ---- Query methods ----
+
+    #[test]
+    fn contains_scope() {
+        let scopes = SecurityScopes::from_scopes(["read", "write"]);
+        assert!(scopes.contains("read"));
+        assert!(scopes.contains("write"));
+        assert!(!scopes.contains("admin"));
+    }
+
+    #[test]
+    fn display_format() {
+        let scopes = SecurityScopes::from_scopes(["read", "write"]);
+        assert_eq!(format!("{scopes}"), "read write");
+
+        let empty = SecurityScopes::new();
+        assert_eq!(format!("{empty}"), "");
+    }
+
+    // ---- Merge tests ----
+
+    #[test]
+    fn merge_appends_new_scopes() {
+        let mut base = SecurityScopes::from_scopes(["read"]);
+        let other = SecurityScopes::from_scopes(["write", "admin"]);
+        base.merge(&other);
+
+        assert_eq!(base.scopes(), &["read", "write", "admin"]);
+        assert_eq!(base.scope_str(), "read write admin");
+    }
+
+    #[test]
+    fn merge_deduplicates() {
+        let mut base = SecurityScopes::from_scopes(["read", "write"]);
+        let other = SecurityScopes::from_scopes(["write", "admin"]);
+        base.merge(&other);
+
+        assert_eq!(base.scopes(), &["read", "write", "admin"]);
+    }
+
+    #[test]
+    fn merge_empty_into_nonempty() {
+        let mut base = SecurityScopes::from_scopes(["read"]);
+        let other = SecurityScopes::new();
+        base.merge(&other);
+
+        assert_eq!(base.scopes(), &["read"]);
+    }
+
+    #[test]
+    fn merge_nonempty_into_empty() {
+        let mut base = SecurityScopes::new();
+        let other = SecurityScopes::from_scopes(["read", "write"]);
+        base.merge(&other);
+
+        assert_eq!(base.scopes(), &["read", "write"]);
+    }
+
+    #[test]
+    fn merged_returns_new_instance() {
+        let base = SecurityScopes::from_scopes(["read"]);
+        let other = SecurityScopes::from_scopes(["write"]);
+        let combined = base.merged(&other);
+
+        assert_eq!(combined.scopes(), &["read", "write"]);
+        // Original unchanged
+        assert_eq!(base.scopes(), &["read"]);
+    }
+
+    // ---- FromRequest tests ----
+
+    #[test]
+    fn extract_with_extension() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.insert_extension(SecurityScopes::from_scopes(["admin", "users:read"]));
+
+        let scopes = futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
+        assert_eq!(scopes.scopes(), &["admin", "users:read"]);
+        assert_eq!(scopes.scope_str(), "admin users:read");
+    }
+
+    #[test]
+    fn extract_without_extension_returns_empty() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/public");
+
+        let scopes = futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
+        assert!(scopes.is_empty());
+    }
+
+    // ---- Error tests ----
+
+    #[test]
+    fn error_display() {
+        let err = SecurityScopesError;
+        assert!(err.to_string().contains("security scopes"));
+    }
+
+    #[test]
+    fn error_into_response_is_500() {
+        let resp = SecurityScopesError.into_response();
+        assert_eq!(resp.status().as_u16(), 500);
+    }
+}
+
+// ============================================================================
 // HTTP Bearer Token Extractor
 // ============================================================================
 

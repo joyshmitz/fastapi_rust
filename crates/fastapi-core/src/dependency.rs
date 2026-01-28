@@ -932,7 +932,7 @@ mod tests {
             .expect("nested resolution failed");
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct OverrideDep {
         value: usize,
     }
@@ -1569,6 +1569,249 @@ mod tests {
             .expect("dynamic override failed");
 
         assert_eq!(dep.value, 100);
+    }
+
+    // ---- Comprehensive DependencyOverrides tests (bd-3pbd) ----
+
+    #[test]
+    fn overrides_new_is_empty() {
+        let overrides = DependencyOverrides::new();
+        assert!(overrides.is_empty());
+        assert_eq!(overrides.len(), 0);
+    }
+
+    #[test]
+    fn overrides_default_is_empty() {
+        let overrides = DependencyOverrides::default();
+        assert!(overrides.is_empty());
+        assert_eq!(overrides.len(), 0);
+    }
+
+    #[test]
+    fn overrides_debug_format() {
+        let overrides = DependencyOverrides::new();
+        let debug = format!("{:?}", overrides);
+        assert!(debug.contains("DependencyOverrides"));
+        assert!(debug.contains("size"));
+    }
+
+    #[test]
+    fn overrides_insert_value_increments_len() {
+        let overrides = DependencyOverrides::new();
+        assert_eq!(overrides.len(), 0);
+
+        overrides.insert_value(OverrideDep { value: 42 });
+        assert_eq!(overrides.len(), 1);
+        assert!(!overrides.is_empty());
+    }
+
+    #[test]
+    fn overrides_multiple_types_registered() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 10 });
+        overrides.insert_value(NestedInnerDep {
+            value: "mocked".to_string(),
+        });
+        assert_eq!(overrides.len(), 2);
+
+        // Resolve each type independently
+        let ctx = test_context(Some(overrides.clone()));
+        let mut req = empty_request();
+
+        let dep1 =
+            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+                .expect("OverrideDep override failed");
+        assert_eq!(dep1.value, 10);
+
+        let mut req2 = empty_request();
+        let dep2 =
+            futures_executor::block_on(Depends::<NestedInnerDep>::from_request(&ctx, &mut req2))
+                .expect("NestedInnerDep override failed");
+        assert_eq!(dep2.value, "mocked");
+    }
+
+    #[test]
+    fn overrides_replace_same_type() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 1 });
+        assert_eq!(overrides.len(), 1);
+
+        // Replace with a different value
+        overrides.insert_value(OverrideDep { value: 999 });
+        assert_eq!(overrides.len(), 1); // Still 1, replaced
+
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("override resolution failed");
+        assert_eq!(dep.value, 999);
+    }
+
+    #[test]
+    fn overrides_clear_removes_all() {
+        let overrides = DependencyOverrides::new();
+        overrides.insert_value(OverrideDep { value: 42 });
+        overrides.insert_value(NestedInnerDep {
+            value: "mock".to_string(),
+        });
+        assert_eq!(overrides.len(), 2);
+
+        overrides.clear();
+        assert!(overrides.is_empty());
+        assert_eq!(overrides.len(), 0);
+    }
+
+    #[test]
+    fn overrides_resolve_returns_none_for_unregistered_type() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        // Only register OverrideDep
+        overrides.insert_value(OverrideDep { value: 42 });
+
+        let ctx = test_context(Some(overrides.clone()));
+        let mut req = empty_request();
+
+        // NestedInnerDep is NOT overridden, resolve should return None
+        let result = futures_executor::block_on(overrides.resolve::<NestedInnerDep>(&ctx, &mut req));
+        assert!(result.is_none(), "Unregistered type should resolve to None");
+    }
+
+    #[test]
+    fn overrides_resolve_some_for_registered_type() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 77 });
+
+        let ctx = test_context(Some(overrides.clone()));
+        let mut req = empty_request();
+
+        let result = futures_executor::block_on(overrides.resolve::<OverrideDep>(&ctx, &mut req));
+        assert!(result.is_some());
+        let dep = result.unwrap().expect("resolve should succeed");
+        assert_eq!(dep.value, 77);
+    }
+
+    #[test]
+    fn overrides_not_affect_unrelated_dependency() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        // Override only NestedInnerDep
+        overrides.insert_value(NestedInnerDep {
+            value: "overridden".to_string(),
+        });
+
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+
+        // OverrideDep should still use its real implementation (returns value: 1)
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("should resolve from real implementation");
+        assert_eq!(dep.value, 1, "Unoverridden dep should use real implementation");
+    }
+
+    #[test]
+    fn overrides_take_precedence_over_cache() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 42 });
+        let ctx = test_context(Some(overrides));
+
+        // Pre-populate cache with a different value
+        ctx.dependency_cache().insert(OverrideDep { value: 999 });
+
+        let mut req = empty_request();
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("override should take precedence");
+
+        // Override should win over cache
+        assert_eq!(dep.value, 42, "Override should take precedence over cache");
+    }
+
+    #[test]
+    fn overrides_dynamic_resolver_can_return_error() {
+        let overrides = Arc::new(DependencyOverrides::new());
+
+        overrides.insert::<OverrideDep, _, _>(|_ctx, _req| async move {
+            Err(HttpError::new(crate::response::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_detail("override error"))
+        });
+
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+
+        let err =
+            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+                .expect_err("override should return error");
+        assert_eq!(err.status.as_u16(), 500);
+    }
+
+    #[test]
+    fn overrides_insert_value_works_for_multiple_resolves() {
+        // insert_value uses Clone, so the value should work for multiple resolves
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 7 });
+
+        let ctx = test_context(Some(overrides));
+
+        for _ in 0..5 {
+            let mut req = empty_request();
+            let dep =
+                futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+                    .expect("repeated resolve should work");
+            assert_eq!(dep.value, 7);
+        }
+    }
+
+    #[test]
+    fn overrides_dynamic_resolver_accesses_request() {
+        let overrides = Arc::new(DependencyOverrides::new());
+
+        // Dynamic resolver that reads from request extensions
+        overrides.insert::<OverrideDep, _, _>(|_ctx, req| {
+            let value = req
+                .get_extension::<usize>()
+                .copied()
+                .unwrap_or(0);
+            async move { Ok(OverrideDep { value }) }
+        });
+
+        let ctx = test_context(Some(overrides));
+        let mut req = empty_request();
+        req.insert_extension(42usize);
+
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("dynamic resolver with request access failed");
+        assert_eq!(dep.value, 42, "Dynamic resolver should read from request");
+    }
+
+    #[test]
+    fn overrides_after_clear_fall_back_to_real_dependency() {
+        let overrides = Arc::new(DependencyOverrides::new());
+        overrides.insert_value(OverrideDep { value: 999 });
+
+        // Verify override works
+        let ctx = test_context(Some(overrides.clone()));
+        let mut req = empty_request();
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .unwrap();
+        assert_eq!(dep.value, 999);
+
+        // Clear and verify fallback to real dependency
+        overrides.clear();
+        let ctx2 = test_context(Some(overrides));
+        let mut req2 = empty_request();
+        let dep2 =
+            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx2, &mut req2))
+                .unwrap();
+        assert_eq!(dep2.value, 1, "After clear, real dependency should be used");
+    }
+
+    #[test]
+    fn overrides_without_overrides_use_real_dependency() {
+        // No overrides at all
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .unwrap();
+        assert_eq!(dep.value, 1, "Without overrides, real dependency should be used");
     }
 
     // Test: ResolutionGuard properly cleans up on drop
