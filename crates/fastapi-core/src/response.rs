@@ -1608,7 +1608,10 @@ mod tests {
 
     #[test]
     fn status_code_partial_content_canonical_reason() {
-        assert_eq!(StatusCode::PARTIAL_CONTENT.canonical_reason(), "Partial Content");
+        assert_eq!(
+            StatusCode::PARTIAL_CONTENT.canonical_reason(),
+            "Partial Content"
+        );
     }
 
     #[test]

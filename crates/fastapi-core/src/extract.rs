@@ -565,6 +565,233 @@ mod tests {
 }
 
 // ============================================================================
+// Form Body Extractor
+// ============================================================================
+
+/// Default maximum form body size (1MB).
+pub const DEFAULT_FORM_LIMIT: usize = 1024 * 1024;
+
+/// Configuration for form extraction.
+#[derive(Debug, Clone)]
+pub struct FormConfig {
+    limit: usize,
+}
+
+impl Default for FormConfig {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_FORM_LIMIT,
+        }
+    }
+}
+
+impl FormConfig {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn get_limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Form body extractor for `application/x-www-form-urlencoded`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Form<T>(pub T);
+
+impl<T> Form<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> Deref for Form<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Form<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Error for form extraction failures.
+#[derive(Debug)]
+pub enum FormExtractError {
+    UnsupportedMediaType { actual: Option<String> },
+    PayloadTooLarge { size: usize, limit: usize },
+    DeserializeError { message: String },
+    StreamingNotSupported,
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for FormExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedMediaType { actual } => {
+                if let Some(ct) = actual {
+                    write!(f, "Expected application/x-www-form-urlencoded, got: {ct}")
+                } else {
+                    write!(f, "Missing Content-Type header")
+                }
+            }
+            Self::PayloadTooLarge { size, limit } => {
+                write!(f, "Body too large: {size} > {limit}")
+            }
+            Self::DeserializeError { message } => write!(f, "Form error: {message}"),
+            Self::StreamingNotSupported => write!(f, "Streaming not supported"),
+            Self::InvalidUtf8 => write!(f, "Invalid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for FormExtractError {}
+
+impl IntoResponse for FormExtractError {
+    fn into_response(self) -> Response {
+        match &self {
+            FormExtractError::UnsupportedMediaType { .. } => {
+                HttpError::unsupported_media_type().into_response()
+            }
+            FormExtractError::PayloadTooLarge { size, limit } => HttpError::payload_too_large()
+                .with_detail(format!("Body {size} > {limit}"))
+                .into_response(),
+            FormExtractError::DeserializeError { message } => {
+                use crate::error::error_types;
+                ValidationErrors::single(
+                    ValidationError::new(
+                        error_types::VALUE_ERROR,
+                        vec![crate::error::LocItem::field("body")],
+                    )
+                    .with_msg(message.clone()),
+                )
+                .into_response()
+            }
+            FormExtractError::StreamingNotSupported => HttpError::bad_request().into_response(),
+            FormExtractError::InvalidUtf8 => HttpError::bad_request()
+                .with_detail("Invalid UTF-8")
+                .into_response(),
+        }
+    }
+}
+
+impl<T: DeserializeOwned> FromRequest for Form<T> {
+    type Error = FormExtractError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let ct = req
+            .headers()
+            .get("content-type")
+            .and_then(|v| std::str::from_utf8(v).ok());
+        let is_form = ct.is_some_and(|c| {
+            c.to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        });
+        if !is_form {
+            return Err(FormExtractError::UnsupportedMediaType {
+                actual: ct.map(String::from),
+            });
+        }
+        let _ = ctx.checkpoint();
+        let body = req.take_body();
+        let bytes = match body {
+            Body::Empty => Vec::new(),
+            Body::Bytes(b) => b,
+            Body::Stream(_) => return Err(FormExtractError::StreamingNotSupported),
+        };
+        let limit = ctx.max_body_size();
+        if bytes.len() > limit {
+            return Err(FormExtractError::PayloadTooLarge {
+                size: bytes.len(),
+                limit,
+            });
+        }
+        let _ = ctx.checkpoint();
+        let body_str = std::str::from_utf8(&bytes).map_err(|_| FormExtractError::InvalidUtf8)?;
+        let params = QueryParams::parse(body_str);
+        let value = T::deserialize(QueryDeserializer::new(&params)).map_err(|e| {
+            FormExtractError::DeserializeError {
+                message: e.to_string(),
+            }
+        })?;
+        let _ = ctx.checkpoint();
+        Ok(Form(value))
+    }
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    fn form_request(body: &str) -> Request {
+        let mut req = Request::new(Method::Post, "/test");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+        req.set_body(Body::Bytes(body.as_bytes().to_vec()));
+        req
+    }
+
+    #[test]
+    fn form_extract_success() {
+        use serde::Deserialize;
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Login {
+            username: String,
+            password: String,
+        }
+        let ctx = test_context();
+        let mut req = form_request("username=alice&password=secret");
+        let result = futures_executor::block_on(Form::<Login>::from_request(&ctx, &mut req));
+        let Form(form) = result.unwrap();
+        assert_eq!(form.username, "alice");
+        assert_eq!(form.password, "secret");
+    }
+
+    #[test]
+    fn form_wrong_content_type() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct T {
+            #[allow(dead_code)]
+            x: String,
+        }
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/test");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Bytes(b"x=1".to_vec()));
+        let result = futures_executor::block_on(Form::<T>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(FormExtractError::UnsupportedMediaType { .. })
+        ));
+    }
+}
+
+// ============================================================================
 // Path Parameter Extractor
 // ============================================================================
 
@@ -6365,6 +6592,285 @@ impl FromRequest for BearerToken {
         }
 
         Ok(BearerToken::new(token))
+    }
+}
+
+// ============================================================================
+// API Key Header Extractor
+// ============================================================================
+
+/// Default header name for API key extraction.
+pub const DEFAULT_API_KEY_HEADER: &str = "x-api-key";
+
+/// Configuration for API key header extraction.
+#[derive(Debug, Clone)]
+pub struct ApiKeyHeaderConfig {
+    /// Header name to extract API key from (case-insensitive).
+    header_name: String,
+}
+
+impl Default for ApiKeyHeaderConfig {
+    fn default() -> Self {
+        Self {
+            header_name: DEFAULT_API_KEY_HEADER.to_string(),
+        }
+    }
+}
+
+impl ApiKeyHeaderConfig {
+    /// Create a new configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the header name to extract API key from.
+    #[must_use]
+    pub fn header_name(mut self, name: impl Into<String>) -> Self {
+        self.header_name = name.into();
+        self
+    }
+
+    /// Get the configured header name.
+    #[must_use]
+    pub fn get_header_name(&self) -> &str {
+        &self.header_name
+    }
+}
+
+/// API key extracted from a request header.
+///
+/// Extracts an API key from a configurable header (default: `X-API-Key`).
+/// Returns 401 Unauthorized if the header is missing or empty.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::ApiKeyHeader;
+///
+/// async fn protected_route(api_key: ApiKeyHeader) -> impl IntoResponse {
+///     // Validate the API key against your database/config
+///     if is_valid_key(api_key.key()) {
+///         "Access granted".to_string()
+///     } else {
+///         // Return error response
+///     }
+/// }
+/// ```
+///
+/// # Custom Header Name
+///
+/// Configure a custom header name by adding `ApiKeyHeaderConfig` to request extensions:
+///
+/// ```ignore
+/// // In middleware or app setup:
+/// req.insert_extension(ApiKeyHeaderConfig::new().header_name("Authorization"));
+/// ```
+///
+/// # OpenAPI Security Scheme
+///
+/// This generates the following OpenAPI security scheme:
+/// ```yaml
+/// securitySchemes:
+///   ApiKeyHeader:
+///     type: apiKey
+///     in: header
+///     name: X-API-Key
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyHeader {
+    /// The extracted API key value.
+    key: String,
+    /// The header name it was extracted from.
+    header_name: String,
+}
+
+impl ApiKeyHeader {
+    /// Create a new ApiKeyHeader with the given key.
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            header_name: DEFAULT_API_KEY_HEADER.to_string(),
+        }
+    }
+
+    /// Create a new ApiKeyHeader with a custom header name.
+    #[must_use]
+    pub fn with_header_name(key: impl Into<String>, header_name: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            header_name: header_name.into(),
+        }
+    }
+
+    /// Get the API key value.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Get the header name the key was extracted from.
+    #[must_use]
+    pub fn header_name(&self) -> &str {
+        &self.header_name
+    }
+
+    /// Consume self and return the key string.
+    #[must_use]
+    pub fn into_key(self) -> String {
+        self.key
+    }
+}
+
+impl Deref for ApiKeyHeader {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+impl AsRef<str> for ApiKeyHeader {
+    fn as_ref(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Implement SecureCompare for timing-safe API key validation.
+impl SecureCompare for ApiKeyHeader {
+    fn secure_eq(&self, other: &str) -> bool {
+        constant_time_str_eq(&self.key, other)
+    }
+
+    fn secure_eq_bytes(&self, other: &[u8]) -> bool {
+        constant_time_eq(self.key.as_bytes(), other)
+    }
+}
+
+/// Error returned when API key header extraction fails.
+#[derive(Debug, Clone)]
+pub enum ApiKeyHeaderError {
+    /// The API key header is missing.
+    MissingHeader {
+        /// Name of the expected header.
+        header_name: String,
+    },
+    /// The API key header is empty.
+    EmptyKey {
+        /// Name of the header.
+        header_name: String,
+    },
+    /// The header value is not valid UTF-8.
+    InvalidUtf8 {
+        /// Name of the header.
+        header_name: String,
+    },
+}
+
+impl ApiKeyHeaderError {
+    /// Create a missing header error.
+    #[must_use]
+    pub fn missing_header(header_name: impl Into<String>) -> Self {
+        Self::MissingHeader {
+            header_name: header_name.into(),
+        }
+    }
+
+    /// Create an empty key error.
+    #[must_use]
+    pub fn empty_key(header_name: impl Into<String>) -> Self {
+        Self::EmptyKey {
+            header_name: header_name.into(),
+        }
+    }
+
+    /// Create an invalid UTF-8 error.
+    #[must_use]
+    pub fn invalid_utf8(header_name: impl Into<String>) -> Self {
+        Self::InvalidUtf8 {
+            header_name: header_name.into(),
+        }
+    }
+
+    /// Get a human-readable description of this error.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::MissingHeader { header_name } => {
+                format!("Missing required header: {header_name}")
+            }
+            Self::EmptyKey { header_name } => {
+                format!("Empty API key in header: {header_name}")
+            }
+            Self::InvalidUtf8 { header_name } => {
+                format!("Invalid API key encoding in header: {header_name}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ApiKeyHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHeader { header_name } => {
+                write!(f, "Missing API key header: {header_name}")
+            }
+            Self::EmptyKey { header_name } => {
+                write!(f, "Empty API key in header: {header_name}")
+            }
+            Self::InvalidUtf8 { header_name } => {
+                write!(f, "Invalid UTF-8 in header: {header_name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyHeaderError {}
+
+impl IntoResponse for ApiKeyHeaderError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        let body = serde_json::json!({
+            "detail": self.detail()
+        });
+
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+impl FromRequest for ApiKeyHeader {
+    type Error = ApiKeyHeaderError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get config from request extensions or use default
+        let header_name = req
+            .get_extension::<ApiKeyHeaderConfig>()
+            .map_or_else(
+                || DEFAULT_API_KEY_HEADER.to_string(),
+                |c| c.get_header_name().to_string(),
+            );
+
+        // Get the API key header (case-insensitive lookup)
+        let key_header = req
+            .headers()
+            .get(&header_name)
+            .ok_or_else(|| ApiKeyHeaderError::missing_header(&header_name))?;
+
+        // Convert to string
+        let key_str = std::str::from_utf8(key_header)
+            .map_err(|_| ApiKeyHeaderError::invalid_utf8(&header_name))?;
+
+        // Trim whitespace and check for empty key
+        let key = key_str.trim();
+        if key.is_empty() {
+            return Err(ApiKeyHeaderError::empty_key(&header_name));
+        }
+
+        Ok(ApiKeyHeader::with_header_name(key, header_name))
     }
 }
 

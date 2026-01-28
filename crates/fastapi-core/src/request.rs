@@ -525,6 +525,14 @@ impl Request {
         &self.path
     }
 
+    /// Set the request path.
+    ///
+    /// This is used internally for mounted sub-applications, where the
+    /// mount prefix is stripped from the path before forwarding.
+    pub fn set_path(&mut self, path: String) {
+        self.path = path;
+    }
+
     /// Get the query string.
     #[must_use]
     pub fn query(&self) -> Option<&str> {
