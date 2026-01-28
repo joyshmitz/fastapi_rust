@@ -1243,6 +1243,17 @@ impl OpenApiBuilder {
             },
         );
 
+        // Convert route security requirements to OpenAPI format
+        let security: Vec<SecurityRequirement> = route
+            .security
+            .iter()
+            .map(|req| {
+                let mut sec_req = SecurityRequirement::new();
+                sec_req.insert(req.scheme.clone(), req.scopes.clone());
+                sec_req
+            })
+            .collect();
+
         Operation {
             operation_id: if route.operation_id.is_empty() {
                 None
@@ -1256,7 +1267,7 @@ impl OpenApiBuilder {
             request_body,
             responses,
             deprecated: route.deprecated,
-            security: Vec::new(),
+            security,
         }
     }
 
@@ -2174,5 +2185,86 @@ mod security_tests {
         assert!(json.contains(r#""api_key""#));
         assert!(json.contains(r#""bearer""#));
         assert!(json.contains(r#""security""#));
+    }
+
+    #[test]
+    fn route_with_security_scheme() {
+        let route = Route::with_placeholder_handler(Method::Get, "/protected")
+            .operation_id("get_protected")
+            .security_scheme("bearer");
+
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
+        builder.add_route(&route);
+        let doc = builder.build();
+
+        let op = doc.paths["/protected"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("bearer"));
+        assert!(op.security[0].get("bearer").unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_with_security_and_scopes() {
+        let route = Route::with_placeholder_handler(Method::Post, "/users")
+            .operation_id("create_user")
+            .security("oauth2", vec!["write:users"]);
+
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
+        builder.add_route(&route);
+        let doc = builder.build();
+
+        let op = doc.paths["/users"].post.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        let scopes = op.security[0].get("oauth2").unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0], "write:users");
+    }
+
+    #[test]
+    fn route_with_multiple_security_options() {
+        let route = Route::with_placeholder_handler(Method::Get, "/data")
+            .operation_id("get_data")
+            .security_scheme("api_key")
+            .security_scheme("bearer");
+
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
+        builder.add_route(&route);
+        let doc = builder.build();
+
+        let op = doc.paths["/data"].get.as_ref().unwrap();
+        // Multiple security requirements means OR logic
+        assert_eq!(op.security.len(), 2);
+        assert!(op.security[0].contains_key("api_key"));
+        assert!(op.security[1].contains_key("bearer"));
+    }
+
+    #[test]
+    fn route_security_serializes_correctly() {
+        let route = Route::with_placeholder_handler(Method::Get, "/protected")
+            .operation_id("protected")
+            .security("oauth2", vec!["read:data", "write:data"]);
+
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
+        builder.add_route(&route);
+        let doc = builder.build();
+
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains(r#""security""#));
+        assert!(json.contains(r#""oauth2""#));
+        assert!(json.contains(r#""read:data""#));
+        assert!(json.contains(r#""write:data""#));
+    }
+
+    #[test]
+    fn route_without_security_has_empty_security() {
+        let route = Route::with_placeholder_handler(Method::Get, "/public")
+            .operation_id("public");
+
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
+        builder.add_route(&route);
+        let doc = builder.build();
+
+        let op = doc.paths["/public"].get.as_ref().unwrap();
+        assert!(op.security.is_empty());
     }
 }

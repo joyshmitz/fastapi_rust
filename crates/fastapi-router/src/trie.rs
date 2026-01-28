@@ -1,5 +1,31 @@
 //! Radix trie router implementation.
 //!
+//! # Route Matching Priority
+//!
+//! Routes are matched according to these priority rules (highest to lowest):
+//!
+//! 1. **Static segments** - Exact literal matches (`/users/me`)
+//! 2. **Named parameters** - Single-segment captures (`/users/{id}`)
+//! 3. **Wildcards** - Multi-segment catch-alls (`/files/{*path}`)
+//!
+//! ## Examples
+//!
+//! Given these routes:
+//! - `/users/me` (static)
+//! - `/users/{id}` (named param)
+//! - `/{*path}` (wildcard)
+//!
+//! Requests match as follows:
+//! - `/users/me` → `/users/me` (static wins over param)
+//! - `/users/123` → `/users/{id}` (param wins over wildcard)
+//! - `/other/path` → `/{*path}` (wildcard catches the rest)
+//!
+//! ## Conflict Detection
+//!
+//! Routes that would be ambiguous are rejected at registration:
+//! - `/files/{name}` and `/files/{*path}` conflict (both match `/files/foo`)
+//! - `/api/{a}` and `/api/{b}` conflict (same structure, different names)
+//!
 //! # Wildcard Catch-All Routes
 //!
 //! The router supports catch-all wildcard routes using two equivalent syntaxes:
@@ -357,6 +383,40 @@ pub fn extract_path_params(path: &str) -> Vec<ParamInfo> {
         .collect()
 }
 
+/// Security requirement for a route.
+///
+/// Specifies a security scheme and optional scopes required to access a route.
+#[derive(Debug, Clone, Default)]
+pub struct RouteSecurityRequirement {
+    /// Name of the security scheme (must match a scheme in OpenAPI components).
+    pub scheme: String,
+    /// Required scopes for this scheme (empty for schemes that don't use scopes).
+    pub scopes: Vec<String>,
+}
+
+impl RouteSecurityRequirement {
+    /// Create a new security requirement with no scopes.
+    #[must_use]
+    pub fn new(scheme: impl Into<String>) -> Self {
+        Self {
+            scheme: scheme.into(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Create a new security requirement with scopes.
+    #[must_use]
+    pub fn with_scopes(
+        scheme: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            scheme: scheme.into(),
+            scopes: scopes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 /// A route definition with handler for request processing.
 ///
 /// Routes are created with a path pattern, HTTP method, and a handler function.
@@ -393,6 +453,11 @@ pub struct Route {
     pub request_body_content_type: Option<String>,
     /// Whether the request body is required.
     pub request_body_required: bool,
+    /// Security requirements for this route.
+    ///
+    /// Each requirement specifies a security scheme name and optional scopes.
+    /// Multiple requirements means any one of them can be used (OR logic).
+    pub security: Vec<RouteSecurityRequirement>,
     /// Handler function that processes matching requests.
     handler: Arc<dyn Handler>,
 }
@@ -426,6 +491,9 @@ impl fmt::Debug for Route {
         }
         if self.request_body_required {
             s.field("request_body_required", &self.request_body_required);
+        }
+        if !self.security.is_empty() {
+            s.field("security", &self.security);
         }
         s.field("handler", &"<handler>").finish()
     }
@@ -557,6 +625,7 @@ impl Route {
             request_body_schema: None,
             request_body_content_type: None,
             request_body_required: false,
+            security: Vec::new(),
             handler: Arc::new(handler),
         }
     }
@@ -584,6 +653,7 @@ impl Route {
             request_body_schema: None,
             request_body_content_type: None,
             request_body_required: false,
+            security: Vec::new(),
             handler,
         }
     }
@@ -665,6 +735,58 @@ impl Route {
         self
     }
 
+    /// Add a security requirement for this route.
+    ///
+    /// Each call adds an alternative security requirement (OR logic).
+    /// The scheme name must match a security scheme defined in the OpenAPI
+    /// components section.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_router::Route;
+    /// use fastapi_core::Method;
+    ///
+    /// // Route requires bearer token authentication
+    /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
+    ///     .security("bearer", vec![]);
+    ///
+    /// // Route requires OAuth2 with specific scopes
+    /// let route = Route::with_placeholder_handler(Method::Post, "/users")
+    ///     .security("oauth2", vec!["write:users"]);
+    /// ```
+    #[must_use]
+    pub fn security(
+        mut self,
+        scheme: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.security.push(RouteSecurityRequirement::with_scopes(
+            scheme,
+            scopes,
+        ));
+        self
+    }
+
+    /// Add a security requirement without scopes.
+    ///
+    /// Convenience method for schemes that don't use scopes (e.g., API key, bearer token).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_router::Route;
+    /// use fastapi_core::Method;
+    ///
+    /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
+    ///     .security_scheme("api_key");
+    /// ```
+    #[must_use]
+    pub fn security_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.security.push(RouteSecurityRequirement::new(scheme));
+        self
+    }
+
     /// Check if this route has a request body defined.
     #[must_use]
     pub fn has_request_body(&self) -> bool {
@@ -675,6 +797,12 @@ impl Route {
     #[must_use]
     pub fn has_path_params(&self) -> bool {
         !self.path_params.is_empty()
+    }
+
+    /// Check if this route has security requirements.
+    #[must_use]
+    pub fn has_security(&self) -> bool {
+        !self.security.is_empty()
     }
 }
 
@@ -903,6 +1031,7 @@ impl Router {
                 request_body_schema: route.request_body_schema,
                 request_body_content_type: route.request_body_content_type,
                 request_body_required: route.request_body_required,
+                security: route.security,
                 handler: route.handler,
             };
 
@@ -2426,6 +2555,135 @@ mod tests {
 
         let m = router.match_path("/files/a/b/c", Method::Delete).unwrap();
         assert_eq!(m.route.method, Method::Delete);
+    }
+
+    // =========================================================================
+    // ROUTE PRIORITY AND ORDERING TESTS (fastapi_rust-2dh)
+    // =========================================================================
+    //
+    // Route matching follows strict priority rules:
+    // 1. Static segments match before parameters
+    // 2. Named parameters match before wildcards
+    // 3. Registration order is the tiebreaker for equal priority
+    //
+    // This ensures predictable matching without ambiguity.
+    // =========================================================================
+
+    #[test]
+    fn priority_static_before_param() {
+        // /users/me (static) has priority over /users/{id} (param)
+        let mut router = Router::new();
+        router.add(route(Method::Get, "/users/{id}")).unwrap();
+        router.add(route(Method::Get, "/users/me")).unwrap();
+
+        // Even though param was added first, static wins
+        let m = router.match_path("/users/me", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/users/me");
+        assert!(m.params.is_empty());
+
+        // Other paths still match param
+        let m = router.match_path("/users/123", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/users/{id}");
+        assert_eq!(m.params[0], ("id", "123"));
+    }
+
+    #[test]
+    fn priority_named_param_vs_wildcard_conflict() {
+        // Named params and wildcards at same position conflict
+        // because they both capture the segment
+        let mut router = Router::new();
+        router.add(route(Method::Get, "/files/{name}")).unwrap();
+
+        // Adding wildcard at same position conflicts
+        let result = router.add(route(Method::Get, "/files/{*path}"));
+        assert!(
+            matches!(result, Err(RouteAddError::Conflict(_))),
+            "Named param and wildcard at same position should conflict"
+        );
+    }
+
+    #[test]
+    fn priority_different_prefixes_no_conflict() {
+        // Different static prefixes allow coexistence
+        let mut router = Router::new();
+        router.add(route(Method::Get, "/files/{name}")).unwrap();
+        router.add(route(Method::Get, "/static/{*path}")).unwrap();
+
+        // Single segment matches named param
+        let m = router.match_path("/files/foo.txt", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/files/{name}");
+
+        // Multi-segment matches wildcard
+        let m = router.match_path("/static/css/main.css", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/static/{*path}");
+    }
+
+    #[test]
+    fn priority_nested_param_before_shallow_wildcard() {
+        // Deeper static paths take priority over shallow wildcards
+        let mut router = Router::new();
+        router.add(route(Method::Get, "/{*path}")).unwrap();
+        router.add(route(Method::Get, "/api/users")).unwrap();
+
+        // Static path wins even though wildcard registered first
+        let m = router.match_path("/api/users", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/api/users");
+
+        // Wildcard catches everything else
+        let m = router.match_path("/other/path", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/{*path}");
+    }
+
+    #[test]
+    fn priority_multiple_static_depths() {
+        // More specific static paths win
+        let mut router = Router::new();
+        router.add(route(Method::Get, "/api/{*rest}")).unwrap();
+        router.add(route(Method::Get, "/api/v1/users")).unwrap();
+        router.add(route(Method::Get, "/api/v1/{resource}")).unwrap();
+
+        // Most specific static path wins
+        let m = router.match_path("/api/v1/users", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/api/v1/users");
+
+        // Named param at same depth
+        let m = router.match_path("/api/v1/items", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/api/v1/{resource}");
+
+        // Wildcard catches the rest
+        let m = router.match_path("/api/v2/anything/deep", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/api/{*rest}");
+    }
+
+    #[test]
+    fn priority_complex_route_set() {
+        // Complex scenario matching FastAPI behavior
+        let mut router = Router::new();
+
+        // In order of generality (most specific first)
+        router.add(route(Method::Get, "/users/me")).unwrap();
+        router.add(route(Method::Get, "/users/{user_id}/profile")).unwrap();
+        router.add(route(Method::Get, "/users/{user_id}")).unwrap();
+        router.add(route(Method::Get, "/{*path}")).unwrap();
+
+        // /users/me -> exact match
+        let m = router.match_path("/users/me", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/users/me");
+
+        // /users/123 -> param match
+        let m = router.match_path("/users/123", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/users/{user_id}");
+        assert_eq!(m.params[0], ("user_id", "123"));
+
+        // /users/123/profile -> deeper param match
+        let m = router.match_path("/users/123/profile", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/users/{user_id}/profile");
+        assert_eq!(m.params[0], ("user_id", "123"));
+
+        // /anything/else -> wildcard catch-all
+        let m = router.match_path("/anything/else", Method::Get).unwrap();
+        assert_eq!(m.route.path, "/{*path}");
+        assert_eq!(m.params[0], ("path", "anything/else"));
     }
 
     // =========================================================================
