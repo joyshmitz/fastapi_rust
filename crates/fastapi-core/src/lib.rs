@@ -71,9 +71,9 @@ pub use context::{
     BodyLimitConfig, CancelledError, DEFAULT_MAX_BODY_SIZE, IntoOutcome, RequestContext,
 };
 pub use dependency::{
-    CleanupFn, CleanupStack, DefaultConfig, DefaultDependencyConfig, DependencyCache,
-    DependencyOverrides, DependencyScope, Depends, DependsCleanup, DependsConfig, FromDependency,
-    FromDependencyWithCleanup, NoCache,
+    CircularDependencyError, CleanupFn, CleanupStack, DefaultConfig, DefaultDependencyConfig,
+    DependencyCache, DependencyOverrides, DependencyScope, DependencyScopeError, Depends,
+    DependsCleanup, DependsConfig, FromDependency, FromDependencyWithCleanup, NoCache,
 };
 pub use error::{
     DebugConfig, DebugInfo, HttpError, LocItem, ResponseValidationError, ValidationError,

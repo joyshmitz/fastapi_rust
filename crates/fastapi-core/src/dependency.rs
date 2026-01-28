@@ -296,8 +296,13 @@ where
             panic!("{}", err);
         }
 
+        // Check for scope violation: request-scoped cannot depend on function-scoped
+        if let Some(scope_err) = ctx.resolution_stack().check_scope_violation(type_name, scope) {
+            panic!("{}", scope_err);
+        }
+
         // Push onto resolution stack
-        ctx.resolution_stack().push::<T>(type_name);
+        ctx.resolution_stack().push::<T>(type_name, scope);
         let _guard = ResolutionGuard::new(ctx.resolution_stack());
 
         // Setup the dependency
@@ -369,6 +374,42 @@ pub struct CircularDependencyError {
     pub cycle: Vec<String>,
 }
 
+/// Error returned when a dependency scope constraint is violated.
+///
+/// This occurs when a request-scoped dependency depends on a function-scoped
+/// dependency. Since request-scoped dependencies are cached for the lifetime
+/// of the request, they would hold stale values from function-scoped
+/// dependencies (which should be resolved fresh on each call).
+///
+/// # Example
+///
+/// ```text
+/// Dependency scope violation: request-scoped 'CachedUser' depends on
+/// function-scoped 'DbConnection'. Request-scoped dependencies cannot
+/// depend on function-scoped dependencies because the cached value
+/// would become stale.
+/// ```
+///
+/// # Why This Matters
+///
+/// Consider this scenario:
+/// - `CachedUser` is request-scoped (cached for the request)
+/// - `DbConnection` is function-scoped (fresh connection each call)
+///
+/// If `CachedUser` depends on `DbConnection`:
+/// 1. First request: `CachedUser` resolved, caches `DbConnection` value
+/// 2. Later in same request: `CachedUser` retrieved from cache
+/// 3. Problem: The cached `CachedUser` holds a stale `DbConnection`
+///
+/// This violates the contract that function-scoped dependencies are fresh.
+#[derive(Debug, Clone)]
+pub struct DependencyScopeError {
+    /// The name of the request-scoped dependency (the outer one).
+    pub request_scoped_type: String,
+    /// The name of the function-scoped dependency (the inner one).
+    pub function_scoped_type: String,
+}
+
 impl CircularDependencyError {
     /// Create a new circular dependency error with the given cycle path.
     #[must_use]
@@ -403,14 +444,52 @@ impl IntoResponse for CircularDependencyError {
     }
 }
 
-/// Tracks which types are currently being resolved to detect cycles.
+impl DependencyScopeError {
+    /// Create a new scope violation error.
+    #[must_use]
+    pub fn new(request_scoped_type: String, function_scoped_type: String) -> Self {
+        Self {
+            request_scoped_type,
+            function_scoped_type,
+        }
+    }
+}
+
+impl std::fmt::Display for DependencyScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Dependency scope violation: request-scoped '{}' depends on function-scoped '{}'. \
+             Request-scoped dependencies cannot depend on function-scoped dependencies \
+             because the cached value would become stale.",
+            self.request_scoped_type, self.function_scoped_type
+        )
+    }
+}
+
+impl std::error::Error for DependencyScopeError {}
+
+impl IntoResponse for DependencyScopeError {
+    fn into_response(self) -> Response {
+        let body = format!(
+            r#"{{"detail":"Dependency scope violation: request-scoped '{}' depends on function-scoped '{}'. Request-scoped dependencies cannot depend on function-scoped dependencies."}}"#,
+            self.request_scoped_type, self.function_scoped_type
+        );
+        Response::with_status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.into_bytes()))
+    }
+}
+
+/// Tracks which types are currently being resolved to detect cycles and scope violations.
 ///
 /// This uses a stack-based approach: when we start resolving a type, we push
-/// its `TypeId` and name onto the stack. If we see the same `TypeId` again
-/// before finishing, we have a cycle.
+/// its `TypeId`, name, and scope onto the stack. If we see the same `TypeId` again
+/// before finishing, we have a cycle. Additionally, if a request-scoped dependency
+/// tries to resolve a function-scoped dependency, we detect a scope violation.
 pub struct ResolutionStack {
-    /// Stack of (TypeId, type_name) pairs currently being resolved.
-    stack: RwLock<Vec<(TypeId, String)>>,
+    /// Stack of (TypeId, type_name, scope) tuples currently being resolved.
+    stack: RwLock<Vec<(TypeId, String, DependencyScope)>>,
 }
 
 impl ResolutionStack {
@@ -431,10 +510,10 @@ impl ResolutionStack {
         let guard = self.stack.read().expect("resolution stack poisoned");
 
         // Check if this type is already being resolved
-        if let Some(pos) = guard.iter().position(|(id, _)| *id == type_id) {
+        if let Some(pos) = guard.iter().position(|(id, _, _)| *id == type_id) {
             // Build the cycle path from the position where we first saw this type
             let mut cycle: Vec<String> =
-                guard[pos..].iter().map(|(_, name)| name.clone()).collect();
+                guard[pos..].iter().map(|(_, name, _)| name.clone()).collect();
             // Add the current type to complete the cycle
             cycle.push(type_name.to_owned());
             return Some(cycle);
@@ -443,12 +522,49 @@ impl ResolutionStack {
         None
     }
 
-    /// Push a type onto the resolution stack.
+    /// Check for scope violations.
+    ///
+    /// Returns `Some(DependencyScopeError)` if there is a request-scoped dependency
+    /// on the stack and we're trying to resolve a function-scoped dependency.
+    ///
+    /// # Scope Rules
+    ///
+    /// - Request-scoped can depend on request-scoped (both cached, OK)
+    /// - Function-scoped can depend on function-scoped (both fresh, OK)
+    /// - Function-scoped can depend on request-scoped (inner cached, outer fresh, OK)
+    /// - Request-scoped CANNOT depend on function-scoped (outer cached with stale inner, BAD)
+    pub fn check_scope_violation(
+        &self,
+        type_name: &str,
+        scope: DependencyScope,
+    ) -> Option<DependencyScopeError> {
+        // Only check if we're resolving a function-scoped dependency
+        if scope != DependencyScope::Function {
+            return None;
+        }
+
+        let guard = self.stack.read().expect("resolution stack poisoned");
+
+        // Find any request-scoped dependency on the stack
+        // (i.e., an outer request-scoped dependency trying to use this function-scoped one)
+        for (_, name, dep_scope) in guard.iter().rev() {
+            if *dep_scope == DependencyScope::Request {
+                return Some(DependencyScopeError::new(
+                    name.clone(),
+                    type_name.to_owned(),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Push a type onto the resolution stack with its scope.
     ///
     /// Call this when starting to resolve a dependency.
-    pub fn push<T: 'static>(&self, type_name: &str) {
+    pub fn push<T: 'static>(&self, type_name: &str, scope: DependencyScope) {
         let mut guard = self.stack.write().expect("resolution stack poisoned");
-        guard.push((TypeId::of::<T>(), type_name.to_owned()));
+        guard.push((TypeId::of::<T>(), type_name.to_owned(), scope));
     }
 
     /// Pop a type from the resolution stack.
@@ -488,7 +604,7 @@ impl std::fmt::Debug for ResolutionStack {
                 "types",
                 &guard
                     .iter()
-                    .map(|(_, name)| name.as_str())
+                    .map(|(_, name, scope)| format!("{}({:?})", name, scope))
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -593,8 +709,13 @@ where
             panic!("{}", err);
         }
 
+        // Check for scope violation: request-scoped cannot depend on function-scoped
+        if let Some(scope_err) = ctx.resolution_stack().check_scope_violation(type_name, scope) {
+            panic!("{}", scope_err);
+        }
+
         // Push onto resolution stack and create guard for automatic cleanup
-        ctx.resolution_stack().push::<T>(type_name);
+        ctx.resolution_stack().push::<T>(type_name, scope);
         let _guard = ResolutionGuard::new(ctx.resolution_stack());
 
         // Resolve the dependency
@@ -1031,11 +1152,11 @@ mod tests {
         // Simulate: A starts resolving
         // Before pushing, check that TypeA is not on stack
         assert!(stack.check_cycle::<TypeA>("TypeA").is_none());
-        stack.push::<TypeA>("TypeA");
+        stack.push::<TypeA>("TypeA", DependencyScope::Request);
 
         // Simulate: A resolves B (different type, should not detect cycle)
         assert!(stack.check_cycle::<TypeB>("TypeB").is_none());
-        stack.push::<TypeB>("TypeB");
+        stack.push::<TypeB>("TypeB", DependencyScope::Request);
 
         // Simulate: B tries to resolve A (cycle!)
         let cycle = stack.check_cycle::<TypeA>("TypeA");
@@ -1059,10 +1180,10 @@ mod tests {
         let stack = ResolutionStack::new();
 
         // Simulate: A -> B -> C -> D -> A
-        stack.push::<TypeA>("TypeA");
-        stack.push::<TypeB>("TypeB");
-        stack.push::<TypeC>("TypeC");
-        stack.push::<TypeD>("TypeD");
+        stack.push::<TypeA>("TypeA", DependencyScope::Request);
+        stack.push::<TypeB>("TypeB", DependencyScope::Request);
+        stack.push::<TypeC>("TypeC", DependencyScope::Request);
+        stack.push::<TypeD>("TypeD", DependencyScope::Request);
 
         // D tries to resolve A (cycle!)
         let cycle = stack.check_cycle::<TypeA>("TypeA");
@@ -1084,20 +1205,20 @@ mod tests {
         let stack = ResolutionStack::new();
 
         // Simulate: Top -> Left -> Bottom (complete Left branch)
-        stack.push::<Top>("Top");
-        stack.push::<Left>("Left");
-        stack.push::<Bottom>("Bottom");
+        stack.push::<Top>("Top", DependencyScope::Request);
+        stack.push::<Left>("Left", DependencyScope::Request);
+        stack.push::<Bottom>("Bottom", DependencyScope::Request);
         stack.pop(); // Bottom done
         stack.pop(); // Left done
 
         // Simulate: Top -> Right -> Bottom (Right branch)
-        stack.push::<Right>("Right");
+        stack.push::<Right>("Right", DependencyScope::Request);
         // Bottom again - but it's NOT a cycle because we popped it
         assert!(
             stack.check_cycle::<Bottom>("Bottom").is_none(),
             "Diamond pattern should not be detected as a cycle"
         );
-        stack.push::<Bottom>("Bottom");
+        stack.push::<Bottom>("Bottom", DependencyScope::Request);
         stack.pop(); // Bottom done
         stack.pop(); // Right done
         stack.pop(); // Top done
@@ -1111,7 +1232,7 @@ mod tests {
         struct SelfRef;
 
         let stack = ResolutionStack::new();
-        stack.push::<SelfRef>("SelfRef");
+        stack.push::<SelfRef>("SelfRef", DependencyScope::Request);
 
         // Try to resolve same type again (self-cycle!)
         let cycle = stack.check_cycle::<SelfRef>("SelfRef");
@@ -1129,7 +1250,7 @@ mod tests {
         assert!(stack.is_empty());
         assert_eq!(stack.depth(), 0);
 
-        stack.push::<CounterDep>("CounterDep");
+        stack.push::<CounterDep>("CounterDep", DependencyScope::Request);
         assert!(!stack.is_empty());
         assert_eq!(stack.depth(), 1);
 
@@ -1137,7 +1258,7 @@ mod tests {
         assert!(stack.check_cycle::<ErrorDep>("ErrorDep").is_none());
 
         // Push another type
-        stack.push::<ErrorDep>("ErrorDep");
+        stack.push::<ErrorDep>("ErrorDep", DependencyScope::Request);
         assert_eq!(stack.depth(), 2);
 
         // Check for cycle with first type - should detect it
@@ -1822,13 +1943,13 @@ mod tests {
     #[test]
     fn resolution_guard_cleanup() {
         let stack = ResolutionStack::new();
-        stack.push::<CounterDep>("CounterDep");
+        stack.push::<CounterDep>("CounterDep", DependencyScope::Request);
         assert_eq!(stack.depth(), 1);
 
         {
             // Create guard within a scope
             let _guard = ResolutionGuard::new(&stack);
-            stack.push::<ErrorDep>("ErrorDep");
+            stack.push::<ErrorDep>("ErrorDep", DependencyScope::Request);
             assert_eq!(stack.depth(), 2);
             // _guard will pop when dropped
         }
@@ -2165,5 +2286,202 @@ mod tests {
         // Setup should only run once
         let events = tracker.lock().clone();
         assert_eq!(events, vec!["setup:resource"]);
+    }
+
+    // ========================================================================
+    // Scope Constraint Validation Tests (fastapi_rust-kpe)
+    // ========================================================================
+
+    // Test: DependencyScopeError formatting
+    #[test]
+    fn scope_error_formatting() {
+        let err = DependencyScopeError::new(
+            "CachedUser".to_string(),
+            "DbConnection".to_string(),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Dependency scope violation"));
+        assert!(msg.contains("request-scoped 'CachedUser'"));
+        assert!(msg.contains("function-scoped 'DbConnection'"));
+        assert!(msg.contains("cached value would become stale"));
+    }
+
+    // Test: DependencyScopeError into_response
+    #[test]
+    fn scope_error_into_response() {
+        let err = DependencyScopeError::new("A".to_string(), "B".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status().as_u16(), 500);
+    }
+
+    // Test: ResolutionStack detects request -> function scope violation
+    #[test]
+    fn resolution_stack_detects_scope_violation() {
+        struct RequestScoped;
+        struct FunctionScoped;
+
+        let stack = ResolutionStack::new();
+
+        // Push request-scoped dependency
+        stack.push::<RequestScoped>("RequestScoped", DependencyScope::Request);
+
+        // Now try to resolve function-scoped - should detect violation
+        let violation = stack.check_scope_violation("FunctionScoped", DependencyScope::Function);
+        assert!(
+            violation.is_some(),
+            "Should detect request -> function scope violation"
+        );
+        let err = violation.unwrap();
+        assert_eq!(err.request_scoped_type, "RequestScoped");
+        assert_eq!(err.function_scoped_type, "FunctionScoped");
+    }
+
+    // Test: ResolutionStack allows request -> request (valid)
+    #[test]
+    fn resolution_stack_allows_request_to_request() {
+        struct RequestA;
+        struct RequestB;
+
+        let stack = ResolutionStack::new();
+
+        // Push request-scoped dependency
+        stack.push::<RequestA>("RequestA", DependencyScope::Request);
+
+        // Another request-scoped is OK
+        let violation = stack.check_scope_violation("RequestB", DependencyScope::Request);
+        assert!(
+            violation.is_none(),
+            "Request -> Request should be allowed"
+        );
+    }
+
+    // Test: ResolutionStack allows function -> function (valid)
+    #[test]
+    fn resolution_stack_allows_function_to_function() {
+        struct FunctionA;
+        struct FunctionB;
+
+        let stack = ResolutionStack::new();
+
+        // Push function-scoped dependency
+        stack.push::<FunctionA>("FunctionA", DependencyScope::Function);
+
+        // Another function-scoped is OK
+        let violation = stack.check_scope_violation("FunctionB", DependencyScope::Function);
+        assert!(
+            violation.is_none(),
+            "Function -> Function should be allowed"
+        );
+    }
+
+    // Test: ResolutionStack allows function -> request (valid)
+    #[test]
+    fn resolution_stack_allows_function_to_request() {
+        struct FunctionScoped;
+        struct RequestScoped;
+
+        let stack = ResolutionStack::new();
+
+        // Push function-scoped dependency
+        stack.push::<FunctionScoped>("FunctionScoped", DependencyScope::Function);
+
+        // Request-scoped inner is OK (cached inner is fine for fresh outer)
+        let violation = stack.check_scope_violation("RequestScoped", DependencyScope::Request);
+        assert!(
+            violation.is_none(),
+            "Function -> Request should be allowed"
+        );
+    }
+
+    // Test: Nested scope violation detection (A(request) -> B(request) -> C(function))
+    #[test]
+    fn resolution_stack_nested_scope_violation() {
+        struct OuterRequest;
+        struct MiddleRequest;
+        struct InnerFunction;
+
+        let stack = ResolutionStack::new();
+
+        // Push request -> request -> function
+        stack.push::<OuterRequest>("OuterRequest", DependencyScope::Request);
+        stack.push::<MiddleRequest>("MiddleRequest", DependencyScope::Request);
+
+        // Inner function-scoped should fail because there's a request-scoped in the chain
+        let violation = stack.check_scope_violation("InnerFunction", DependencyScope::Function);
+        assert!(
+            violation.is_some(),
+            "Should detect nested scope violation"
+        );
+        let err = violation.unwrap();
+        // Should report the closest request-scoped (MiddleRequest)
+        assert_eq!(err.request_scoped_type, "MiddleRequest");
+        assert_eq!(err.function_scoped_type, "InnerFunction");
+    }
+
+    // Test: Empty stack has no scope violation
+    #[test]
+    fn resolution_stack_empty_no_scope_violation() {
+        let stack = ResolutionStack::new();
+
+        // Empty stack should allow any scope
+        let violation_fn = stack.check_scope_violation("SomeDep", DependencyScope::Function);
+        let violation_req = stack.check_scope_violation("SomeDep", DependencyScope::Request);
+
+        assert!(violation_fn.is_none(), "Empty stack should allow function scope");
+        assert!(violation_req.is_none(), "Empty stack should allow request scope");
+    }
+
+    // Test: Scope violation in runtime dependency resolution (integration test)
+    // This test verifies the actual panic behavior when scope rules are violated.
+    //
+    // NOTE: We can't easily test the panic in normal unit tests because catch_unwind
+    // doesn't work well with async. Instead, we test the check_scope_violation method
+    // directly in the tests above. The actual panic behavior is tested via the
+    // Depends::from_request implementation.
+
+    // Test: Function-scoped dependency works correctly (NoCache config)
+    #[test]
+    fn function_scoped_resolves_fresh_each_time() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        // Use NoCache (function scope)
+        let _ = futures_executor::block_on(Depends::<CountingDep, NoCache>::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
+
+        let _ = futures_executor::block_on(Depends::<CountingDep, NoCache>::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
+
+        let counter = ctx.dependency_cache().get::<Arc<AtomicUsize>>().unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "Function-scoped should resolve 2 times (not cached)"
+        );
+    }
+
+    // Test: Request-scoped dependency is cached correctly
+    #[test]
+    fn request_scoped_cached_within_request() {
+        let ctx = test_context(None);
+        let mut req = empty_request();
+
+        // Use default config (request scope)
+        let _ = futures_executor::block_on(Depends::<CountingDep>::from_request(&ctx, &mut req))
+            .unwrap();
+
+        let _ = futures_executor::block_on(Depends::<CountingDep>::from_request(&ctx, &mut req))
+            .unwrap();
+
+        let counter = ctx.dependency_cache().get::<Arc<AtomicUsize>>().unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Request-scoped should resolve only once (cached)"
+        );
     }
 }
