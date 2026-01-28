@@ -726,8 +726,7 @@ mod tests {
         std::fs::write(&test_file, b"Hello, streaming world!").unwrap();
 
         let cx = Cx::for_testing();
-        let response =
-            fastapi_core::Response::stream_file(&test_file, cx, b"text/plain").unwrap();
+        let response = fastapi_core::Response::stream_file(&test_file, cx, b"text/plain").unwrap();
 
         let accept_ranges = response
             .headers()

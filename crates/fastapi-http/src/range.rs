@@ -101,7 +101,10 @@ impl fmt::Display for RangeError {
             Self::InvalidSyntax(msg) => write!(f, "invalid range syntax: {msg}"),
             Self::UnsupportedUnit(unit) => write!(f, "unsupported range unit: {unit}"),
             Self::NotSatisfiable { resource_size } => {
-                write!(f, "range not satisfiable for resource of size {resource_size}")
+                write!(
+                    f,
+                    "range not satisfiable for resource of size {resource_size}"
+                )
             }
             Self::MultipleRangesNotSupported => write!(f, "multiple ranges not supported"),
         }
@@ -465,7 +468,10 @@ mod tests {
     #[test]
     fn range_spec_from_to_clamped() {
         // End exceeds resource size, should be clamped
-        let spec = RangeSpec::FromTo { start: 0, end: 9999 };
+        let spec = RangeSpec::FromTo {
+            start: 0,
+            end: 9999,
+        };
         let range = spec.resolve(1000).unwrap();
         assert_eq!(range.start, 0);
         assert_eq!(range.end, 999);
@@ -473,9 +479,17 @@ mod tests {
 
     #[test]
     fn range_spec_from_to_not_satisfiable() {
-        let spec = RangeSpec::FromTo { start: 1000, end: 1500 };
+        let spec = RangeSpec::FromTo {
+            start: 1000,
+            end: 1500,
+        };
         let err = spec.resolve(1000).unwrap_err();
-        assert_eq!(err, RangeError::NotSatisfiable { resource_size: 1000 });
+        assert_eq!(
+            err,
+            RangeError::NotSatisfiable {
+                resource_size: 1000
+            }
+        );
     }
 
     #[test]
@@ -490,7 +504,12 @@ mod tests {
     fn range_spec_from_not_satisfiable() {
         let spec = RangeSpec::From { start: 1000 };
         let err = spec.resolve(1000).unwrap_err();
-        assert_eq!(err, RangeError::NotSatisfiable { resource_size: 1000 });
+        assert_eq!(
+            err,
+            RangeError::NotSatisfiable {
+                resource_size: 1000
+            }
+        );
     }
 
     #[test]
@@ -514,7 +533,12 @@ mod tests {
     fn range_spec_suffix_zero() {
         let spec = RangeSpec::Suffix { length: 0 };
         let err = spec.resolve(1000).unwrap_err();
-        assert_eq!(err, RangeError::NotSatisfiable { resource_size: 1000 });
+        assert_eq!(
+            err,
+            RangeError::NotSatisfiable {
+                resource_size: 1000
+            }
+        );
     }
 
     #[test]

@@ -44,16 +44,14 @@ pub use schema::{
 pub use spec::{
     // Security types
     ApiKeyLocation,
-    OAuth2Flow,
-    OAuth2Flows,
-    SecurityRequirement,
-    SecurityScheme,
     // Core document types
     Components,
     Example,
     HasParamMeta,
     Info,
     MediaType,
+    OAuth2Flow,
+    OAuth2Flows,
     OpenApi,
     OpenApiBuilder,
     Operation,
@@ -63,6 +61,8 @@ pub use spec::{
     PathItem,
     RequestBody,
     Response,
+    SecurityRequirement,
+    SecurityScheme,
     Server,
     Tag,
     // Path parameter generation

@@ -761,10 +761,8 @@ impl Route {
         scheme: impl Into<String>,
         scopes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.security.push(RouteSecurityRequirement::with_scopes(
-            scheme,
-            scopes,
-        ));
+        self.security
+            .push(RouteSecurityRequirement::with_scopes(scheme, scopes));
         self
     }
 
@@ -2614,7 +2612,9 @@ mod tests {
         assert_eq!(m.route.path, "/files/{name}");
 
         // Multi-segment matches wildcard
-        let m = router.match_path("/static/css/main.css", Method::Get).unwrap();
+        let m = router
+            .match_path("/static/css/main.css", Method::Get)
+            .unwrap();
         assert_eq!(m.route.path, "/static/{*path}");
     }
 
@@ -2640,7 +2640,9 @@ mod tests {
         let mut router = Router::new();
         router.add(route(Method::Get, "/api/{*rest}")).unwrap();
         router.add(route(Method::Get, "/api/v1/users")).unwrap();
-        router.add(route(Method::Get, "/api/v1/{resource}")).unwrap();
+        router
+            .add(route(Method::Get, "/api/v1/{resource}"))
+            .unwrap();
 
         // Most specific static path wins
         let m = router.match_path("/api/v1/users", Method::Get).unwrap();
@@ -2651,7 +2653,9 @@ mod tests {
         assert_eq!(m.route.path, "/api/v1/{resource}");
 
         // Wildcard catches the rest
-        let m = router.match_path("/api/v2/anything/deep", Method::Get).unwrap();
+        let m = router
+            .match_path("/api/v2/anything/deep", Method::Get)
+            .unwrap();
         assert_eq!(m.route.path, "/api/{*rest}");
     }
 
@@ -2662,7 +2666,9 @@ mod tests {
 
         // In order of generality (most specific first)
         router.add(route(Method::Get, "/users/me")).unwrap();
-        router.add(route(Method::Get, "/users/{user_id}/profile")).unwrap();
+        router
+            .add(route(Method::Get, "/users/{user_id}/profile"))
+            .unwrap();
         router.add(route(Method::Get, "/users/{user_id}")).unwrap();
         router.add(route(Method::Get, "/{*path}")).unwrap();
 
@@ -2676,7 +2682,9 @@ mod tests {
         assert_eq!(m.params[0], ("user_id", "123"));
 
         // /users/123/profile -> deeper param match
-        let m = router.match_path("/users/123/profile", Method::Get).unwrap();
+        let m = router
+            .match_path("/users/123/profile", Method::Get)
+            .unwrap();
         assert_eq!(m.route.path, "/users/{user_id}/profile");
         assert_eq!(m.params[0], ("user_id", "123"));
 

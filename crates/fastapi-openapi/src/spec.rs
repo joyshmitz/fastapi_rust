@@ -1141,11 +1141,7 @@ impl OpenApiBuilder {
     ///     .build();
     /// ```
     #[must_use]
-    pub fn security_requirement(
-        mut self,
-        scheme: impl Into<String>,
-        scopes: Vec<String>,
-    ) -> Self {
+    pub fn security_requirement(mut self, scheme: impl Into<String>, scopes: Vec<String>) -> Self {
         let mut req = SecurityRequirement::new();
         req.insert(scheme.into(), scopes);
         self.security.push(req);
@@ -2146,7 +2142,10 @@ mod security_tests {
     #[test]
     fn builder_adds_security_with_scopes() {
         let doc = OpenApiBuilder::new("Test API", "1.0.0")
-            .security_requirement("oauth2", vec!["read:users".to_string(), "write:users".to_string()])
+            .security_requirement(
+                "oauth2",
+                vec!["read:users".to_string(), "write:users".to_string()],
+            )
             .build();
 
         assert_eq!(doc.security.len(), 1);
@@ -2257,8 +2256,7 @@ mod security_tests {
 
     #[test]
     fn route_without_security_has_empty_security() {
-        let route = Route::with_placeholder_handler(Method::Get, "/public")
-            .operation_id("public");
+        let route = Route::with_placeholder_handler(Method::Get, "/public").operation_id("public");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);

@@ -51,10 +51,7 @@ mod path_generation {
 
         assert_eq!(op.parameters.len(), 1);
         assert_eq!(op.parameters[0].name, "username");
-        assert!(matches!(
-            op.parameters[0].location,
-            ParameterLocation::Path
-        ));
+        assert!(matches!(op.parameters[0].location, ParameterLocation::Path));
         assert!(op.parameters[0].required);
     }
 
@@ -94,8 +91,11 @@ mod path_generation {
 
     #[test]
     fn path_with_multiple_parameters() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users/{user_id:int}/posts/{post_id:int}")
-            .operation_id("get_user_post");
+        let route = Route::with_placeholder_handler(
+            Method::Get,
+            "/users/{user_id:int}/posts/{post_id:int}",
+        )
+        .operation_id("get_user_post");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -131,10 +131,10 @@ mod path_generation {
 
     #[test]
     fn multiple_methods_on_same_path() {
-        let get_route = Route::with_placeholder_handler(Method::Get, "/items")
-            .operation_id("list_items");
-        let post_route = Route::with_placeholder_handler(Method::Post, "/items")
-            .operation_id("create_item");
+        let get_route =
+            Route::with_placeholder_handler(Method::Get, "/items").operation_id("list_items");
+        let post_route =
+            Route::with_placeholder_handler(Method::Post, "/items").operation_id("create_item");
         let put_route = Route::with_placeholder_handler(Method::Put, "/items/{id:int}")
             .operation_id("update_item");
         let delete_route = Route::with_placeholder_handler(Method::Delete, "/items/{id:int}")
@@ -301,8 +301,8 @@ mod request_body {
 
     #[test]
     fn route_without_request_body() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users")
-            .operation_id("list_users");
+        let route =
+            Route::with_placeholder_handler(Method::Get, "/users").operation_id("list_users");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -322,8 +322,8 @@ mod responses {
 
     #[test]
     fn default_200_response_is_added() {
-        let route = Route::with_placeholder_handler(Method::Get, "/health")
-            .operation_id("health_check");
+        let route =
+            Route::with_placeholder_handler(Method::Get, "/health").operation_id("health_check");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);

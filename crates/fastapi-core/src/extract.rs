@@ -6847,12 +6847,10 @@ impl FromRequest for ApiKeyHeader {
 
     async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
         // Get config from request extensions or use default
-        let header_name = req
-            .get_extension::<ApiKeyHeaderConfig>()
-            .map_or_else(
-                || DEFAULT_API_KEY_HEADER.to_string(),
-                |c| c.get_header_name().to_string(),
-            );
+        let header_name = req.get_extension::<ApiKeyHeaderConfig>().map_or_else(
+            || DEFAULT_API_KEY_HEADER.to_string(),
+            |c| c.get_header_name().to_string(),
+        );
 
         // Get the API key header (case-insensitive lookup)
         let key_header = req
@@ -6871,6 +6869,279 @@ impl FromRequest for ApiKeyHeader {
         }
 
         Ok(ApiKeyHeader::with_header_name(key, header_name))
+    }
+}
+
+// ============================================================================
+// API Key Query Parameter Extractor
+// ============================================================================
+
+/// Default query parameter name for API key extraction.
+pub const DEFAULT_API_KEY_QUERY_PARAM: &str = "api_key";
+
+/// Configuration for API key query parameter extraction.
+#[derive(Debug, Clone)]
+pub struct ApiKeyQueryConfig {
+    /// Query parameter name to extract API key from.
+    param_name: String,
+}
+
+impl Default for ApiKeyQueryConfig {
+    fn default() -> Self {
+        Self {
+            param_name: DEFAULT_API_KEY_QUERY_PARAM.to_string(),
+        }
+    }
+}
+
+impl ApiKeyQueryConfig {
+    /// Create a new configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the query parameter name to extract the API key from.
+    #[must_use]
+    pub fn param_name(mut self, name: impl Into<String>) -> Self {
+        self.param_name = name.into();
+        self
+    }
+
+    /// Get the configured parameter name.
+    #[must_use]
+    pub fn get_param_name(&self) -> &str {
+        &self.param_name
+    }
+}
+
+/// Extracts an API key from a query parameter.
+///
+/// This extractor pulls the API key from a configurable query parameter
+/// (default: `api_key`). Returns 401 Unauthorized if missing or empty.
+///
+/// # Security Warning
+///
+/// Query parameter API keys are **less secure** than header-based keys:
+/// - They appear in URL logs (browser history, server logs, proxies)
+/// - They can leak via the Referer header
+/// - They may be cached by browsers and intermediate caches
+///
+/// Use [`ApiKeyHeader`] for production-grade API key authentication.
+/// Query parameter keys are primarily useful for:
+/// - Quick testing/debugging
+/// - Webhook callbacks where headers aren't controllable
+/// - Legacy API compatibility
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::ApiKeyQuery;
+///
+/// async fn webhook_handler(api_key: ApiKeyQuery) -> impl IntoResponse {
+///     // Validate the API key
+///     if api_key.key() == expected_key {
+///         "Webhook received"
+///     } else {
+///         "Invalid API key"
+///     }
+/// }
+/// ```
+///
+/// # Custom Parameter Name
+///
+/// Configure a custom parameter name by adding `ApiKeyQueryConfig` to request extensions:
+///
+/// ```ignore
+/// // In middleware or app setup:
+/// req.insert_extension(ApiKeyQueryConfig::new().param_name("token"));
+/// // Then ?token=xxx will be used instead of ?api_key=xxx
+/// ```
+///
+/// # OpenAPI Security Scheme
+///
+/// This generates the following OpenAPI security scheme:
+/// ```yaml
+/// securitySchemes:
+///   ApiKeyQuery:
+///     type: apiKey
+///     in: query
+///     name: api_key
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyQuery {
+    /// The extracted API key value.
+    key: String,
+    /// The parameter name it was extracted from.
+    param_name: String,
+}
+
+impl ApiKeyQuery {
+    /// Create a new ApiKeyQuery with the given key.
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            param_name: DEFAULT_API_KEY_QUERY_PARAM.to_string(),
+        }
+    }
+
+    /// Create a new ApiKeyQuery with a custom parameter name.
+    #[must_use]
+    pub fn with_param_name(key: impl Into<String>, param_name: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            param_name: param_name.into(),
+        }
+    }
+
+    /// Get the API key value.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Get the parameter name it was extracted from.
+    #[must_use]
+    pub fn param_name(&self) -> &str {
+        &self.param_name
+    }
+
+    /// Consume and return the key value.
+    #[must_use]
+    pub fn into_key(self) -> String {
+        self.key
+    }
+}
+
+impl Deref for ApiKeyQuery {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+impl AsRef<str> for ApiKeyQuery {
+    fn as_ref(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Implement SecureCompare for timing-safe API key validation.
+impl SecureCompare for ApiKeyQuery {
+    fn secure_eq(&self, other: &str) -> bool {
+        constant_time_str_eq(&self.key, other)
+    }
+
+    fn secure_eq_bytes(&self, other: &[u8]) -> bool {
+        constant_time_eq(self.key.as_bytes(), other)
+    }
+}
+
+/// Error returned when API key query parameter extraction fails.
+#[derive(Debug, Clone)]
+pub enum ApiKeyQueryError {
+    /// The API key query parameter is missing.
+    MissingParam {
+        /// Name of the expected parameter.
+        param_name: String,
+    },
+    /// The API key parameter is present but empty.
+    EmptyKey {
+        /// Name of the parameter.
+        param_name: String,
+    },
+}
+
+impl ApiKeyQueryError {
+    /// Create a missing parameter error.
+    #[must_use]
+    pub fn missing_param(param_name: impl Into<String>) -> Self {
+        Self::MissingParam {
+            param_name: param_name.into(),
+        }
+    }
+
+    /// Create an empty key error.
+    #[must_use]
+    pub fn empty_key(param_name: impl Into<String>) -> Self {
+        Self::EmptyKey {
+            param_name: param_name.into(),
+        }
+    }
+
+    /// Get the detail message for error responses.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::MissingParam { param_name } => {
+                format!("API key required. Include '{param_name}' query parameter.")
+            }
+            Self::EmptyKey { param_name } => {
+                format!("API key cannot be empty. Provide a value for '{param_name}'.")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ApiKeyQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingParam { param_name } => {
+                write!(f, "Missing API key query parameter: {param_name}")
+            }
+            Self::EmptyKey { param_name } => {
+                write!(f, "Empty API key in query parameter: {param_name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyQueryError {}
+
+impl IntoResponse for ApiKeyQueryError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        let body = serde_json::json!({
+            "detail": self.detail()
+        });
+
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+impl FromRequest for ApiKeyQuery {
+    type Error = ApiKeyQueryError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get config from request extensions or use default
+        let param_name = req.get_extension::<ApiKeyQueryConfig>().map_or_else(
+            || DEFAULT_API_KEY_QUERY_PARAM.to_string(),
+            |c| c.get_param_name().to_string(),
+        );
+
+        // Parse the query string if present
+        let query_params = req
+            .query()
+            .map(QueryParams::parse)
+            .unwrap_or_default();
+
+        // Get the API key parameter
+        let key_value = query_params
+            .get(&param_name)
+            .ok_or_else(|| ApiKeyQueryError::missing_param(&param_name))?;
+
+        // Trim whitespace and check for empty key
+        let key = key_value.trim();
+        if key.is_empty() {
+            return Err(ApiKeyQueryError::empty_key(&param_name));
+        }
+
+        Ok(ApiKeyQuery::with_param_name(key, param_name))
     }
 }
 
@@ -9003,6 +9274,210 @@ mod api_key_header_tests {
         let key1 = ApiKeyHeader::new("same_key");
         let key2 = ApiKeyHeader::new("same_key");
         let key3 = ApiKeyHeader::new("different_key");
+
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+    }
+}
+
+#[cfg(test)]
+mod api_key_query_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::IntoResponse;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 99999)
+    }
+
+    #[test]
+    fn api_key_query_basic_extraction() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("api_key=test_key_123".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "test_key_123");
+        assert_eq!(api_key.param_name(), "api_key");
+    }
+
+    #[test]
+    fn api_key_query_missing() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        // No query string
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyQueryError::MissingParam { .. }));
+    }
+
+    #[test]
+    fn api_key_query_empty_query_string() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyQueryError::MissingParam { .. }));
+    }
+
+    #[test]
+    fn api_key_query_param_missing_but_others_present() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("other_param=value".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyQueryError::MissingParam { .. }));
+    }
+
+    #[test]
+    fn api_key_query_empty_value() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("api_key=".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyQueryError::EmptyKey { .. }));
+    }
+
+    #[test]
+    fn api_key_query_whitespace_only() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("api_key=   ".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyQueryError::EmptyKey { .. }));
+    }
+
+    #[test]
+    fn api_key_query_trims_whitespace() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("api_key=  my_key_123  ".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "my_key_123");
+    }
+
+    #[test]
+    fn api_key_query_custom_param_name() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some("token=custom_key".to_string()));
+        req.insert_extension(ApiKeyQueryConfig::new().param_name("token"));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "custom_key");
+        assert_eq!(api_key.param_name(), "token");
+    }
+
+    #[test]
+    fn api_key_query_with_other_params() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        req.set_query(Some(
+            "callback=https://example.com&api_key=webhook_key&format=json".to_string(),
+        ));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "webhook_key");
+    }
+
+    #[test]
+    fn api_key_query_url_encoded_value() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/webhook");
+        // URL encoded key with special chars: "key+with spaces" -> "key%2Bwith%20spaces"
+        req.set_query(Some("api_key=key%2Bwith%20spaces".to_string()));
+
+        let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "key+with spaces");
+    }
+
+    #[test]
+    fn api_key_query_error_response_401() {
+        let err = ApiKeyQueryError::missing_param("api_key");
+        let response = err.into_response();
+        assert_eq!(response.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn api_key_query_error_response_json() {
+        let err = ApiKeyQueryError::missing_param("api_key");
+        let response = err.into_response();
+
+        let has_json_content_type = response
+            .headers()
+            .iter()
+            .any(|(n, v)| n == "content-type" && v.starts_with(b"application/json"));
+        assert!(has_json_content_type);
+    }
+
+    #[test]
+    fn api_key_query_secure_compare() {
+        let api_key = ApiKeyQuery::new("secret_key_123");
+
+        // Timing-safe comparison
+        assert!(api_key.secure_eq("secret_key_123"));
+        assert!(!api_key.secure_eq("secret_key_124"));
+        assert!(!api_key.secure_eq("wrong"));
+
+        // Byte comparison
+        assert!(api_key.secure_eq_bytes(b"secret_key_123"));
+        assert!(!api_key.secure_eq_bytes(b"secret_key_124"));
+    }
+
+    #[test]
+    fn api_key_query_deref_and_as_ref() {
+        let api_key = ApiKeyQuery::new("deref_test");
+
+        // Deref to &str
+        let s: &str = &api_key;
+        assert_eq!(s, "deref_test");
+
+        // AsRef<str>
+        let s: &str = api_key.as_ref();
+        assert_eq!(s, "deref_test");
+    }
+
+    #[test]
+    fn api_key_query_config_defaults() {
+        let config = ApiKeyQueryConfig::default();
+        assert_eq!(config.get_param_name(), DEFAULT_API_KEY_QUERY_PARAM);
+    }
+
+    #[test]
+    fn api_key_query_error_display() {
+        let err = ApiKeyQueryError::missing_param("api_key");
+        assert!(err.to_string().contains("api_key"));
+
+        let err = ApiKeyQueryError::empty_key("api_key");
+        assert!(err.to_string().contains("Empty"));
+    }
+
+    #[test]
+    fn api_key_query_equality() {
+        let key1 = ApiKeyQuery::new("same_key");
+        let key2 = ApiKeyQuery::new("same_key");
+        let key3 = ApiKeyQuery::new("different_key");
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);

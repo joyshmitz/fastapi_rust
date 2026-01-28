@@ -4400,10 +4400,7 @@ mod tests {
 
         // Prefix match with remaining path
         assert_eq!(mounted.match_prefix("/admin/users"), Some("/users"));
-        assert_eq!(
-            mounted.match_prefix("/admin/users/123"),
-            Some("/users/123")
-        );
+        assert_eq!(mounted.match_prefix("/admin/users/123"), Some("/users/123"));
 
         // No match - different prefix
         assert_eq!(mounted.match_prefix("/api"), None);
@@ -4460,10 +4457,7 @@ mod tests {
         assert_eq!(app.mounted_apps()[2].prefix(), "/docs");
     }
 
-    fn admin_handler(
-        _ctx: &RequestContext,
-        _req: &mut Request,
-    ) -> std::future::Ready<Response> {
+    fn admin_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Ready<Response> {
         std::future::ready(Response::ok().body(ResponseBody::Bytes(b"Admin Panel".to_vec())))
     }
 
