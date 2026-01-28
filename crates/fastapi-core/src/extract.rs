@@ -6582,18 +6582,19 @@ impl BackgroundTasks {
         self.inner.len()
     }
 
-    /// Execute all tasks with error isolation.
+    /// Execute all tasks sequentially.
     ///
     /// This is called by the framework after the response is sent.
-    /// Each task's errors are logged but do not affect other tasks
-    /// or the response that was already sent.
+    /// Tasks run in the order they were added (FIFO).
     ///
     /// # Error Handling
     ///
-    /// - Tasks run independently - one failure doesn't stop others
-    /// - All errors are logged to stderr
-    /// - Panics in task closures are caught; panics during await propagate
-    ///   (this is a Rust limitation without additional crate dependencies)
+    /// This method does NOT provide error isolation. If a task panics,
+    /// subsequent tasks will not run. For panic isolation, use
+    /// [`execute_with_panic_isolation()`] instead.
+    ///
+    /// Since tasks run after the response is sent, panics do not affect
+    /// the HTTP response that was already delivered to the client.
     ///
     /// # Example
     ///
@@ -6606,8 +6607,6 @@ impl BackgroundTasks {
     /// ```
     pub async fn execute_all(mut self) {
         for task in self.take_tasks() {
-            // Execute the task - panics during await propagate
-            // (catching async panics requires additional crate dependencies)
             let future = task();
             future.await;
         }
