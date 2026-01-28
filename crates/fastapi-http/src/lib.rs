@@ -59,6 +59,7 @@
 
 pub mod body;
 pub mod connection;
+pub mod multipart;
 mod parser;
 mod query;
 pub mod range;
@@ -98,4 +99,8 @@ pub use asupersync::signal::{GracefulOutcome, ShutdownController, ShutdownReceiv
 pub use streaming::{
     CancelAwareStream, ChunkedBytes, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_BUFFER_SIZE, FileStream,
     StreamConfig, StreamError, StreamingResponseExt,
+};
+pub use multipart::{
+    MultipartConfig, MultipartError, MultipartForm, MultipartParser, Part, UploadFile,
+    parse_boundary, DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_FIELDS, DEFAULT_MAX_TOTAL_SIZE,
 };

@@ -792,6 +792,999 @@ mod form_tests {
 }
 
 // ============================================================================
+// Multipart Form Extractor
+// ============================================================================
+
+/// Default maximum file size for multipart uploads (10MB).
+pub const DEFAULT_MULTIPART_FILE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Default maximum total size for multipart uploads (50MB).
+pub const DEFAULT_MULTIPART_TOTAL_SIZE: usize = 50 * 1024 * 1024;
+
+/// Default maximum number of fields in multipart form.
+pub const DEFAULT_MULTIPART_MAX_FIELDS: usize = 100;
+
+/// Configuration for multipart form extraction.
+#[derive(Debug, Clone)]
+pub struct MultipartConfig {
+    max_file_size: usize,
+    max_total_size: usize,
+    max_fields: usize,
+}
+
+impl Default for MultipartConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: DEFAULT_MULTIPART_FILE_SIZE,
+            max_total_size: DEFAULT_MULTIPART_TOTAL_SIZE,
+            max_fields: DEFAULT_MULTIPART_MAX_FIELDS,
+        }
+    }
+}
+
+impl MultipartConfig {
+    /// Create a new configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum file size.
+    #[must_use]
+    pub fn max_file_size(mut self, size: usize) -> Self {
+        self.max_file_size = size;
+        self
+    }
+
+    /// Set the maximum total upload size.
+    #[must_use]
+    pub fn max_total_size(mut self, size: usize) -> Self {
+        self.max_total_size = size;
+        self
+    }
+
+    /// Set the maximum number of fields.
+    #[must_use]
+    pub fn max_fields(mut self, count: usize) -> Self {
+        self.max_fields = count;
+        self
+    }
+
+    /// Get the maximum file size.
+    #[must_use]
+    pub fn get_max_file_size(&self) -> usize {
+        self.max_file_size
+    }
+
+    /// Get the maximum total upload size.
+    #[must_use]
+    pub fn get_max_total_size(&self) -> usize {
+        self.max_total_size
+    }
+
+    /// Get the maximum number of fields.
+    #[must_use]
+    pub fn get_max_fields(&self) -> usize {
+        self.max_fields
+    }
+}
+
+/// An uploaded file extracted from a multipart form.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{UploadedFile, FromRequest};
+///
+/// async fn upload(file: UploadedFile) -> String {
+///     format!("Received file '{}' ({} bytes)", file.filename(), file.size())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct UploadedFile {
+    /// The form field name.
+    field_name: String,
+    /// The original filename.
+    filename: String,
+    /// The Content-Type of the file.
+    content_type: String,
+    /// The file contents.
+    data: Vec<u8>,
+}
+
+impl UploadedFile {
+    /// Create a new uploaded file.
+    #[must_use]
+    pub fn new(field_name: String, filename: String, content_type: String, data: Vec<u8>) -> Self {
+        Self {
+            field_name,
+            filename,
+            content_type,
+            data,
+        }
+    }
+
+    /// Get the form field name.
+    #[must_use]
+    pub fn field_name(&self) -> &str {
+        &self.field_name
+    }
+
+    /// Get the original filename.
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    /// Get the Content-Type.
+    #[must_use]
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    /// Get the file data.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Take ownership of the file data.
+    #[must_use]
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// Get the file size in bytes.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Get the file extension from the filename.
+    #[must_use]
+    pub fn extension(&self) -> Option<&str> {
+        self.filename
+            .rsplit('.')
+            .next()
+            .filter(|ext| !ext.is_empty() && *ext != self.filename)
+    }
+
+    /// Read the file data as UTF-8 text.
+    ///
+    /// Returns `None` if the data is not valid UTF-8.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.data).ok()
+    }
+}
+
+/// Error for multipart form extraction failures.
+#[derive(Debug)]
+pub enum MultipartExtractError {
+    /// Content-Type is not multipart/form-data.
+    UnsupportedMediaType { actual: Option<String> },
+    /// Missing boundary in Content-Type.
+    MissingBoundary,
+    /// File size exceeds limit.
+    FileTooLarge { size: usize, limit: usize },
+    /// Total upload size exceeds limit.
+    TotalTooLarge { size: usize, limit: usize },
+    /// Too many fields.
+    TooManyFields { count: usize, limit: usize },
+    /// Invalid multipart format.
+    InvalidFormat { detail: String },
+    /// Streaming body not supported.
+    StreamingNotSupported,
+    /// No file found with the given field name.
+    FileNotFound { field_name: String },
+}
+
+impl std::fmt::Display for MultipartExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedMediaType { actual } => {
+                if let Some(ct) = actual {
+                    write!(f, "Expected multipart/form-data, got: {ct}")
+                } else {
+                    write!(f, "Expected multipart/form-data, got empty Content-Type")
+                }
+            }
+            Self::MissingBoundary => write!(f, "Missing boundary in multipart Content-Type"),
+            Self::FileTooLarge { size, limit } => {
+                write!(f, "File too large: {size} bytes exceeds limit of {limit}")
+            }
+            Self::TotalTooLarge { size, limit } => {
+                write!(f, "Total upload too large: {size} bytes exceeds limit of {limit}")
+            }
+            Self::TooManyFields { count, limit } => {
+                write!(f, "Too many fields: {count} exceeds limit of {limit}")
+            }
+            Self::InvalidFormat { detail } => {
+                write!(f, "Invalid multipart format: {detail}")
+            }
+            Self::StreamingNotSupported => {
+                write!(f, "Streaming body not supported for multipart extraction")
+            }
+            Self::FileNotFound { field_name } => {
+                write!(f, "No file found with field name '{field_name}'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultipartExtractError {}
+
+impl IntoResponse for MultipartExtractError {
+    fn into_response(self) -> Response {
+        match &self {
+            MultipartExtractError::UnsupportedMediaType { .. } => {
+                HttpError::unsupported_media_type().into_response()
+            }
+            MultipartExtractError::MissingBoundary => {
+                HttpError::bad_request()
+                    .with_detail("Missing boundary in multipart Content-Type")
+                    .into_response()
+            }
+            MultipartExtractError::FileTooLarge { size, limit } => {
+                HttpError::payload_too_large()
+                    .with_detail(format!("File {size} bytes > {limit} limit"))
+                    .into_response()
+            }
+            MultipartExtractError::TotalTooLarge { size, limit } => {
+                HttpError::payload_too_large()
+                    .with_detail(format!("Total {size} bytes > {limit} limit"))
+                    .into_response()
+            }
+            MultipartExtractError::TooManyFields { count, limit } => {
+                HttpError::bad_request()
+                    .with_detail(format!("Too many fields: {count} > {limit}"))
+                    .into_response()
+            }
+            MultipartExtractError::InvalidFormat { detail } => {
+                HttpError::bad_request()
+                    .with_detail(format!("Invalid multipart: {detail}"))
+                    .into_response()
+            }
+            MultipartExtractError::StreamingNotSupported => {
+                HttpError::bad_request()
+                    .with_detail("Streaming body not supported")
+                    .into_response()
+            }
+            MultipartExtractError::FileNotFound { field_name } => {
+                use crate::error::error_types;
+                ValidationErrors::single(
+                    ValidationError::new(
+                        error_types::VALUE_ERROR,
+                        vec![crate::error::LocItem::field(field_name)],
+                    )
+                    .with_msg(format!("Required file '{field_name}' not found")),
+                )
+                .into_response()
+            }
+        }
+    }
+}
+
+/// Multipart form data extractor.
+///
+/// Extracts a complete multipart form including all fields and files.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{Multipart, FromRequest};
+///
+/// async fn upload(form: Multipart) -> String {
+///     let description = form.get_field("description").unwrap_or("No description");
+///     let file = form.get_file("document");
+///     format!("Description: {}, File: {:?}", description, file.map(|f| f.filename()))
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Multipart {
+    parts: Vec<MultipartPart>,
+}
+
+/// A part of a multipart form (either a field or a file).
+#[derive(Debug, Clone)]
+pub struct MultipartPart {
+    /// Field name.
+    pub name: String,
+    /// Filename if this is a file upload.
+    pub filename: Option<String>,
+    /// Content-Type if specified.
+    pub content_type: Option<String>,
+    /// The part data.
+    pub data: Vec<u8>,
+}
+
+impl Multipart {
+    /// Create from parsed parts.
+    #[must_use]
+    pub fn from_parts(parts: Vec<MultipartPart>) -> Self {
+        Self { parts }
+    }
+
+    /// Get all parts.
+    #[must_use]
+    pub fn parts(&self) -> &[MultipartPart] {
+        &self.parts
+    }
+
+    /// Get a form field value by name.
+    #[must_use]
+    pub fn get_field(&self, name: &str) -> Option<&str> {
+        self.parts
+            .iter()
+            .find(|p| p.name == name && p.filename.is_none())
+            .and_then(|p| std::str::from_utf8(&p.data).ok())
+    }
+
+    /// Get an uploaded file by field name.
+    #[must_use]
+    pub fn get_file(&self, name: &str) -> Option<UploadedFile> {
+        self.parts
+            .iter()
+            .find(|p| p.name == name && p.filename.is_some())
+            .map(|p| {
+                UploadedFile::new(
+                    p.name.clone(),
+                    p.filename.clone().unwrap_or_default(),
+                    p.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                    p.data.clone(),
+                )
+            })
+    }
+
+    /// Get all files.
+    #[must_use]
+    pub fn files(&self) -> Vec<UploadedFile> {
+        self.parts
+            .iter()
+            .filter(|p| p.filename.is_some())
+            .map(|p| {
+                UploadedFile::new(
+                    p.name.clone(),
+                    p.filename.clone().unwrap_or_default(),
+                    p.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                    p.data.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Get all files with a specific field name.
+    #[must_use]
+    pub fn get_files(&self, name: &str) -> Vec<UploadedFile> {
+        self.parts
+            .iter()
+            .filter(|p| p.name == name && p.filename.is_some())
+            .map(|p| {
+                UploadedFile::new(
+                    p.name.clone(),
+                    p.filename.clone().unwrap_or_default(),
+                    p.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                    p.data.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Get all field names and values.
+    #[must_use]
+    pub fn fields(&self) -> Vec<(&str, &str)> {
+        self.parts
+            .iter()
+            .filter(|p| p.filename.is_none())
+            .filter_map(|p| Some((p.name.as_str(), std::str::from_utf8(&p.data).ok()?)))
+            .collect()
+    }
+
+    /// Check if a field exists.
+    #[must_use]
+    pub fn has_field(&self, name: &str) -> bool {
+        self.parts.iter().any(|p| p.name == name)
+    }
+
+    /// Get the number of parts.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Check if the form is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
+impl FromRequest for Multipart {
+    type Error = MultipartExtractError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Check Content-Type
+        let content_type = req
+            .headers()
+            .get("content-type")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(String::from);
+
+        let ct = content_type.as_deref().ok_or_else(|| MultipartExtractError::UnsupportedMediaType {
+            actual: None,
+        })?;
+
+        if !ct.to_ascii_lowercase().starts_with("multipart/form-data") {
+            return Err(MultipartExtractError::UnsupportedMediaType {
+                actual: Some(ct.to_string()),
+            });
+        }
+
+        // Parse boundary
+        let boundary = parse_multipart_boundary(ct)?;
+
+        let _ = ctx.checkpoint();
+
+        // Get body
+        let body = req.take_body();
+        let bytes = match body {
+            Body::Empty => Vec::new(),
+            Body::Bytes(b) => b,
+            Body::Stream(_) => return Err(MultipartExtractError::StreamingNotSupported),
+        };
+
+        // Get config from request extensions or use default
+        let config = req
+            .get_extension::<MultipartConfig>()
+            .cloned()
+            .unwrap_or_default();
+
+        let _ = ctx.checkpoint();
+
+        // Parse multipart
+        let parts = parse_multipart_body(&bytes, &boundary, &config)?;
+
+        let _ = ctx.checkpoint();
+
+        Ok(Multipart::from_parts(parts))
+    }
+}
+
+/// File extractor for a single file upload.
+///
+/// This extractor gets a single file from a multipart form by field name.
+/// The field name is specified via `FileConfig` extension on the request,
+/// or defaults to "file".
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{File, FromRequest};
+///
+/// async fn upload(file: File) -> String {
+///     format!("Received: {} ({} bytes)", file.filename(), file.size())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct File(pub UploadedFile);
+
+impl File {
+    /// Get the underlying uploaded file.
+    #[must_use]
+    pub fn into_inner(self) -> UploadedFile {
+        self.0
+    }
+
+    /// Get a reference to the uploaded file.
+    #[must_use]
+    pub fn inner(&self) -> &UploadedFile {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for File {
+    type Target = UploadedFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Configuration for the File extractor.
+#[derive(Debug, Clone)]
+pub struct FileConfig {
+    field_name: String,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            field_name: "file".to_string(),
+        }
+    }
+}
+
+impl FileConfig {
+    /// Create a new file config with the given field name.
+    #[must_use]
+    pub fn new(field_name: impl Into<String>) -> Self {
+        Self {
+            field_name: field_name.into(),
+        }
+    }
+
+    /// Get the field name.
+    #[must_use]
+    pub fn field_name(&self) -> &str {
+        &self.field_name
+    }
+}
+
+impl FromRequest for File {
+    type Error = MultipartExtractError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let field_name = req
+            .get_extension::<FileConfig>()
+            .map(|c| c.field_name.clone())
+            .unwrap_or_else(|| "file".to_string());
+
+        let multipart = Multipart::from_request(ctx, req).await?;
+
+        let file = multipart.get_file(&field_name).ok_or_else(|| {
+            MultipartExtractError::FileNotFound { field_name }
+        })?;
+
+        Ok(File(file))
+    }
+}
+
+/// Parse boundary from Content-Type header.
+fn parse_multipart_boundary(content_type: &str) -> Result<String, MultipartExtractError> {
+    for part in content_type.split(';') {
+        let part = part.trim();
+        if let Some(boundary) = part.strip_prefix("boundary=").or_else(|| part.strip_prefix("BOUNDARY=")) {
+            let boundary = boundary.trim_matches('"').trim_matches('\'');
+            if boundary.is_empty() {
+                return Err(MultipartExtractError::MissingBoundary);
+            }
+            return Ok(boundary.to_string());
+        }
+    }
+    Err(MultipartExtractError::MissingBoundary)
+}
+
+/// Parse multipart body into parts.
+fn parse_multipart_body(
+    body: &[u8],
+    boundary: &str,
+    config: &MultipartConfig,
+) -> Result<Vec<MultipartPart>, MultipartExtractError> {
+    let boundary_bytes = format!("--{boundary}").into_bytes();
+    let mut parts = Vec::new();
+    let mut total_size = 0usize;
+    let mut pos = 0;
+
+    // Find first boundary
+    pos = find_bytes(body, &boundary_bytes, pos).ok_or_else(|| {
+        MultipartExtractError::InvalidFormat {
+            detail: "no boundary found".to_string(),
+        }
+    })?;
+
+    loop {
+        // Check field limit
+        if parts.len() >= config.max_fields {
+            return Err(MultipartExtractError::TooManyFields {
+                count: parts.len() + 1,
+                limit: config.max_fields,
+            });
+        }
+
+        // Check if this is the final boundary (--boundary--)
+        let boundary_end = pos + boundary_bytes.len();
+        if boundary_end + 2 <= body.len() && body[boundary_end..boundary_end + 2] == *b"--" {
+            break;
+        }
+
+        // Skip boundary and CRLF
+        pos = boundary_end;
+        if pos + 2 > body.len() {
+            return Err(MultipartExtractError::InvalidFormat {
+                detail: "unexpected end after boundary".to_string(),
+            });
+        }
+        if body[pos..pos + 2] != *b"\r\n" {
+            return Err(MultipartExtractError::InvalidFormat {
+                detail: "expected CRLF after boundary".to_string(),
+            });
+        }
+        pos += 2;
+
+        // Parse headers
+        let mut name = None;
+        let mut filename = None;
+        let mut content_type = None;
+
+        loop {
+            let line_end = find_crlf(body, pos).ok_or_else(|| {
+                MultipartExtractError::InvalidFormat {
+                    detail: "unterminated headers".to_string(),
+                }
+            })?;
+
+            let line = &body[pos..line_end];
+            if line.is_empty() {
+                pos = line_end + 2;
+                break;
+            }
+
+            if let Ok(line_str) = std::str::from_utf8(line) {
+                if let Some((header_name, header_value)) = line_str.split_once(':') {
+                    let header_name = header_name.trim().to_ascii_lowercase();
+                    let header_value = header_value.trim();
+
+                    if header_name == "content-disposition" {
+                        (name, filename) = parse_content_disposition_header(header_value);
+                    } else if header_name == "content-type" {
+                        content_type = Some(header_value.to_string());
+                    }
+                }
+            }
+
+            pos = line_end + 2;
+        }
+
+        let name = name.ok_or_else(|| MultipartExtractError::InvalidFormat {
+            detail: "missing Content-Disposition name".to_string(),
+        })?;
+
+        // Find next boundary
+        let data_end = find_bytes(body, &boundary_bytes, pos).ok_or_else(|| {
+            MultipartExtractError::InvalidFormat {
+                detail: "missing closing boundary".to_string(),
+            }
+        })?;
+
+        // Data ends before \r\n--boundary
+        let data = if data_end >= 2 && body[data_end - 2..data_end] == *b"\r\n" {
+            &body[pos..data_end - 2]
+        } else {
+            &body[pos..data_end]
+        };
+
+        // Check size limits for files
+        if filename.is_some() && data.len() > config.max_file_size {
+            return Err(MultipartExtractError::FileTooLarge {
+                size: data.len(),
+                limit: config.max_file_size,
+            });
+        }
+
+        total_size += data.len();
+        if total_size > config.max_total_size {
+            return Err(MultipartExtractError::TotalTooLarge {
+                size: total_size,
+                limit: config.max_total_size,
+            });
+        }
+
+        parts.push(MultipartPart {
+            name,
+            filename,
+            content_type,
+            data: data.to_vec(),
+        });
+
+        pos = data_end;
+    }
+
+    Ok(parts)
+}
+
+/// Find a byte sequence in data starting from position.
+fn find_bytes(data: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start);
+    }
+    for i in start..data.len().saturating_sub(needle.len() - 1) {
+        if data[i..].starts_with(needle) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find CRLF in data starting from position.
+fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
+    for i in start..data.len().saturating_sub(1) {
+        if data[i..i + 2] == *b"\r\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Parse Content-Disposition header value.
+fn parse_content_disposition_header(value: &str) -> (Option<String>, Option<String>) {
+    let mut name = None;
+    let mut filename = None;
+
+    for part in value.split(';') {
+        let part = part.trim();
+        if let Some(n) = part.strip_prefix("name=").or_else(|| part.strip_prefix("NAME=")) {
+            name = Some(unquote_param(n));
+        } else if let Some(f) = part.strip_prefix("filename=").or_else(|| part.strip_prefix("FILENAME=")) {
+            filename = Some(unquote_param(f));
+        }
+    }
+
+    (name, filename)
+}
+
+/// Remove quotes from a parameter value.
+fn unquote_param(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::RequestContext;
+    use asupersync::Cx;
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(Cx::for_testing(), 1)
+    }
+
+    #[test]
+    fn test_parse_boundary() {
+        let ct = "multipart/form-data; boundary=----WebKit";
+        let boundary = parse_multipart_boundary(ct).unwrap();
+        assert_eq!(boundary, "----WebKit");
+    }
+
+    #[test]
+    fn test_parse_boundary_quoted() {
+        let ct = r#"multipart/form-data; boundary="simple""#;
+        let boundary = parse_multipart_boundary(ct).unwrap();
+        assert_eq!(boundary, "simple");
+    }
+
+    #[test]
+    fn test_parse_boundary_missing() {
+        let ct = "multipart/form-data";
+        let result = parse_multipart_boundary(ct);
+        assert!(matches!(result, Err(MultipartExtractError::MissingBoundary)));
+    }
+
+    #[test]
+    fn test_parse_simple_form() {
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"field1\"\r\n",
+            "\r\n",
+            "value1\r\n",
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"field2\"\r\n",
+            "\r\n",
+            "value2\r\n",
+            "------boundary--\r\n"
+        );
+
+        let config = MultipartConfig::default();
+        let parts = parse_multipart_body(body.as_bytes(), boundary, &config).unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].name, "field1");
+        assert_eq!(std::str::from_utf8(&parts[0].data).unwrap(), "value1");
+        assert_eq!(parts[1].name, "field2");
+        assert_eq!(std::str::from_utf8(&parts[1].data).unwrap(), "value2");
+    }
+
+    #[test]
+    fn test_parse_file_upload() {
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "Hello!\r\n",
+            "------boundary--\r\n"
+        );
+
+        let config = MultipartConfig::default();
+        let parts = parse_multipart_body(body.as_bytes(), boundary, &config).unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].name, "file");
+        assert_eq!(parts[0].filename, Some("test.txt".to_string()));
+        assert_eq!(parts[0].content_type, Some("text/plain".to_string()));
+        assert_eq!(std::str::from_utf8(&parts[0].data).unwrap(), "Hello!");
+    }
+
+    #[test]
+    fn test_multipart_extractor() {
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"name\"\r\n",
+            "\r\n",
+            "John\r\n",
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"avatar\"; filename=\"pic.jpg\"\r\n",
+            "Content-Type: image/jpeg\r\n",
+            "\r\n",
+            "JPEG\r\n",
+            "------boundary--\r\n"
+        );
+
+        let config = MultipartConfig::default();
+        let parts = parse_multipart_body(body.as_bytes(), boundary, &config).unwrap();
+        let form = Multipart::from_parts(parts);
+
+        assert_eq!(form.get_field("name"), Some("John"));
+        let file = form.get_file("avatar").unwrap();
+        assert_eq!(file.filename(), "pic.jpg");
+        assert_eq!(file.content_type(), "image/jpeg");
+    }
+
+    #[test]
+    fn test_file_size_limit() {
+        let boundary = "----boundary";
+        let large = "x".repeat(1000);
+        let body = format!(
+            "------boundary\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\n\
+             \r\n\
+             {}\r\n\
+             ------boundary--\r\n",
+            large
+        );
+
+        let config = MultipartConfig::default().max_file_size(100);
+        let result = parse_multipart_body(body.as_bytes(), boundary, &config);
+
+        assert!(matches!(result, Err(MultipartExtractError::FileTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_total_size_limit() {
+        let boundary = "----boundary";
+        let data = "x".repeat(500);
+        let body = format!(
+            "------boundary\r\n\
+             Content-Disposition: form-data; name=\"f1\"; filename=\"a.txt\"\r\n\
+             \r\n\
+             {}\r\n\
+             ------boundary\r\n\
+             Content-Disposition: form-data; name=\"f2\"; filename=\"b.txt\"\r\n\
+             \r\n\
+             {}\r\n\
+             ------boundary--\r\n",
+            data, data
+        );
+
+        let config = MultipartConfig::default()
+            .max_file_size(1000)
+            .max_total_size(800);
+        let result = parse_multipart_body(body.as_bytes(), boundary, &config);
+
+        assert!(matches!(result, Err(MultipartExtractError::TotalTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_field_count_limit() {
+        let boundary = "----boundary";
+        let mut body = String::new();
+        for i in 0..5 {
+            body.push_str(&format!(
+                "------boundary\r\n\
+                 Content-Disposition: form-data; name=\"f{}\"\r\n\
+                 \r\n\
+                 v{}\r\n",
+                i, i
+            ));
+        }
+        body.push_str("------boundary--\r\n");
+
+        let config = MultipartConfig::default().max_fields(3);
+        let result = parse_multipart_body(body.as_bytes(), boundary, &config);
+
+        assert!(matches!(result, Err(MultipartExtractError::TooManyFields { .. })));
+    }
+
+    #[test]
+    fn test_uploaded_file_extension() {
+        let file = UploadedFile::new(
+            "doc".to_string(),
+            "report.pdf".to_string(),
+            "application/pdf".to_string(),
+            vec![],
+        );
+        assert_eq!(file.extension(), Some("pdf"));
+
+        let no_ext = UploadedFile::new(
+            "doc".to_string(),
+            "README".to_string(),
+            "text/plain".to_string(),
+            vec![],
+        );
+        assert_eq!(no_ext.extension(), None);
+    }
+
+    #[test]
+    fn test_multipart_from_request_wrong_content_type() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Bytes(b"{}".to_vec()));
+
+        let result = futures_executor::block_on(Multipart::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(MultipartExtractError::UnsupportedMediaType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_file_extractor() {
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"doc.pdf\"\r\n",
+            "Content-Type: application/pdf\r\n",
+            "\r\n",
+            "PDF content\r\n",
+            "------boundary--\r\n"
+        );
+
+        let config = MultipartConfig::default();
+        let parts = parse_multipart_body(body.as_bytes(), boundary, &config).unwrap();
+        let form = Multipart::from_parts(parts);
+
+        let file = form.get_file("file").unwrap();
+        assert_eq!(file.filename(), "doc.pdf");
+        assert_eq!(file.content_type(), "application/pdf");
+        assert_eq!(file.text(), Some("PDF content"));
+    }
+
+    #[test]
+    fn test_multiple_files() {
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"a.txt\"\r\n",
+            "\r\n",
+            "file a\r\n",
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"b.txt\"\r\n",
+            "\r\n",
+            "file b\r\n",
+            "------boundary--\r\n"
+        );
+
+        let config = MultipartConfig::default();
+        let parts = parse_multipart_body(body.as_bytes(), boundary, &config).unwrap();
+        let form = Multipart::from_parts(parts);
+
+        let files = form.get_files("files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].filename(), "a.txt");
+        assert_eq!(files[1].filename(), "b.txt");
+    }
+}
+
+// ============================================================================
 // Path Parameter Extractor
 // ============================================================================
 

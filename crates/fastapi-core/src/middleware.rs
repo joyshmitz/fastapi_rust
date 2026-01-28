@@ -2630,6 +2630,105 @@ mod tests {
         assert_eq!(response.status().as_u16(), 403);
     }
 
+    #[test]
+    fn cors_simple_request_disallowed_origin_no_headers() {
+        // Non-preflight request from disallowed origin should proceed but not get CORS headers
+        let cors = Cors::new().allow_origin("https://good.example");
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("origin", b"https://evil.example".to_vec());
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        // Simple requests proceed (browser will block based on missing headers)
+        assert!(matches!(result, ControlFlow::Continue));
+
+        let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+        // No CORS headers should be added for disallowed origin
+        assert!(header_value(&response, "access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn cors_expose_headers_configuration() {
+        let cors = Cors::new()
+            .allow_any_origin()
+            .expose_headers(["x-custom-header", "x-another-header"]);
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("origin", b"https://example.com".to_vec());
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+
+        let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+        assert_eq!(
+            header_value(&response, "access-control-expose-headers"),
+            Some("x-custom-header, x-another-header".to_string())
+        );
+    }
+
+    #[test]
+    fn cors_any_origin_sets_wildcard() {
+        let cors = Cors::new().allow_any_origin();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("origin", b"https://any-site.com".to_vec());
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+
+        let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+        assert_eq!(
+            header_value(&response, "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+    }
+
+    #[test]
+    fn cors_config_allows_method_override() {
+        // Test that allow_methods overrides defaults
+        let cors = Cors::new()
+            .allow_any_origin()
+            .allow_methods([crate::request::Method::Get, crate::request::Method::Post]);
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Options, "/");
+        req.headers_mut()
+            .insert("origin", b"https://example.com".to_vec());
+        req.headers_mut()
+            .insert("access-control-request-method", b"POST".to_vec());
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        let ControlFlow::Break(response) = result else {
+            panic!("expected preflight break");
+        };
+        assert_eq!(
+            header_value(&response, "access-control-allow-methods"),
+            Some("GET, POST".to_string())
+        );
+    }
+
+    #[test]
+    fn cors_no_origin_header_skips_cors() {
+        // Request without Origin header should not get CORS headers
+        let cors = Cors::new().allow_any_origin();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        assert!(matches!(result, ControlFlow::Continue));
+
+        let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+        assert!(header_value(&response, "access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn cors_middleware_name() {
+        let cors = Cors::new();
+        assert_eq!(cors.name(), "Cors");
+    }
+
     // =========================================================================
     // Request ID Middleware tests
     // =========================================================================
@@ -4217,5 +4316,429 @@ mod tests {
 
         let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
         assert!(result.is_break()); // Should reject empty tokens
+    }
+
+    // =========================================================================
+    // Middleware Stack Ordering Tests (Onion Model)
+    // =========================================================================
+
+    /// Middleware that records execution order to a shared Vec.
+    /// Used to verify the onion model (before in order, after in reverse).
+    #[derive(Clone)]
+    struct OrderRecordingMiddleware {
+        id: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl OrderRecordingMiddleware {
+        fn new(id: &'static str, log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { id, log }
+        }
+    }
+
+    impl Middleware for OrderRecordingMiddleware {
+        fn before<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, ControlFlow> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("{id}:before"));
+                ControlFlow::Continue
+            })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("{id}:after"));
+                response
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "OrderRecording"
+        }
+    }
+
+    /// Middleware that short-circuits in its before hook.
+    struct ShortCircuitMiddleware {
+        id: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ShortCircuitMiddleware {
+        fn new(id: &'static str, log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { id, log }
+        }
+    }
+
+    impl Middleware for ShortCircuitMiddleware {
+        fn before<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, ControlFlow> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("{id}:before:break"));
+                ControlFlow::Break(
+                    Response::with_status(StatusCode::FORBIDDEN)
+                        .body(ResponseBody::Bytes(b"short-circuited".to_vec())),
+                )
+            })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("{id}:after"));
+                response
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "ShortCircuit"
+        }
+    }
+
+    /// Simple handler that records when it runs.
+    struct RecordingHandler {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingHandler {
+        fn new(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { log }
+        }
+    }
+
+    impl Handler for RecordingHandler {
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push("handler".to_string());
+                Response::ok().body(ResponseBody::Bytes(b"ok".to_vec()))
+            })
+        }
+    }
+
+    #[test]
+    fn middleware_stack_three_middleware_onion_order() {
+        // Test that three middleware follow the onion model:
+        // Before hooks run in order: 1 -> 2 -> 3
+        // After hooks run in reverse: 3 -> 2 -> 1
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderRecordingMiddleware::new("mw1", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("mw2", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("mw3", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+
+        let execution_log = log.lock().unwrap().clone();
+        assert_eq!(
+            execution_log,
+            vec![
+                "mw1:before",
+                "mw2:before",
+                "mw3:before",
+                "handler",
+                "mw3:after",
+                "mw2:after",
+                "mw1:after",
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_short_circuit_runs_prior_after_hooks() {
+        // When middleware 2 short-circuits:
+        // - mw1:before runs (returns Continue, count=1)
+        // - mw2:before short-circuits (returns Break, count stays at 1)
+        // - mw3:before does NOT run
+        // - handler does NOT run
+        // - Only middleware that successfully completed before (mw1) have after run
+        // - mw1:after runs
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderRecordingMiddleware::new("mw1", log.clone()));
+        stack.push(ShortCircuitMiddleware::new("mw2", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("mw3", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+
+        // Should return the short-circuit response
+        assert_eq!(response.status().as_u16(), 403);
+
+        let execution_log = log.lock().unwrap().clone();
+        // Note: mw2's after hook does NOT run because it didn't return Continue
+        // Only middleware that successfully completed before (returned Continue) have after run
+        assert_eq!(
+            execution_log,
+            vec!["mw1:before", "mw2:before:break", "mw1:after",]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_first_middleware_short_circuits() {
+        // When the first middleware short-circuits:
+        // - mw1:before short-circuits (returns Break, count=0)
+        // - No after hooks run (count=0)
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(ShortCircuitMiddleware::new("mw1", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("mw2", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 403);
+
+        let execution_log = log.lock().unwrap().clone();
+        // No after hooks run because no middleware returned Continue
+        assert_eq!(execution_log, vec!["mw1:before:break",]);
+    }
+
+    #[test]
+    fn middleware_stack_empty_runs_handler_only() {
+        // Empty stack should just run the handler (onion ordering variant)
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let stack = MiddlewareStack::new();
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 200);
+
+        let execution_log = log.lock().unwrap().clone();
+        assert_eq!(execution_log, vec!["handler"]);
+    }
+
+    #[test]
+    fn middleware_stack_single_middleware_ordering() {
+        // Single middleware should have before -> handler -> after
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderRecordingMiddleware::new("mw1", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+
+        let execution_log = log.lock().unwrap().clone();
+        assert_eq!(execution_log, vec!["mw1:before", "handler", "mw1:after",]);
+    }
+
+    #[test]
+    fn middleware_stack_five_middleware_onion_order() {
+        // Test with five middleware for a longer chain
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderRecordingMiddleware::new("a", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("b", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("c", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("d", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("e", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+
+        let execution_log = log.lock().unwrap().clone();
+        assert_eq!(
+            execution_log,
+            vec![
+                "a:before",
+                "b:before",
+                "c:before",
+                "d:before",
+                "e:before",
+                "handler",
+                "e:after",
+                "d:after",
+                "c:after",
+                "b:after",
+                "a:after",
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_stack_short_circuit_at_end_runs_prior_afters() {
+        // When the last middleware short-circuits:
+        // - mw1:before runs (Continue, count=1)
+        // - mw2:before runs (Continue, count=2)
+        // - mw3:before short-circuits (Break, count stays at 2)
+        // - handler does NOT run
+        // - After hooks run for mw1 and mw2 only (they returned Continue)
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(OrderRecordingMiddleware::new("mw1", log.clone()));
+        stack.push(OrderRecordingMiddleware::new("mw2", log.clone()));
+        stack.push(ShortCircuitMiddleware::new("mw3", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 403);
+
+        let execution_log = log.lock().unwrap().clone();
+        // mw3's after hook does NOT run because it didn't return Continue
+        assert_eq!(
+            execution_log,
+            vec![
+                "mw1:before",
+                "mw2:before",
+                "mw3:before:break",
+                "mw2:after",
+                "mw1:after",
+            ]
+        );
+    }
+
+    /// Middleware that modifies the request in before and response in after.
+    struct ModifyingMiddleware {
+        id: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ModifyingMiddleware {
+        fn new(id: &'static str, log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { id, log }
+        }
+    }
+
+    impl Middleware for ModifyingMiddleware {
+        fn before<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            req: &'a mut Request,
+        ) -> BoxFuture<'a, ControlFlow> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                // Add a header to track middleware order
+                req.headers_mut()
+                    .insert(format!("x-{id}-before"), b"true".to_vec());
+                log.lock().unwrap().push(format!("{id}:before"));
+                ControlFlow::Continue
+            })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a Request,
+            response: Response,
+        ) -> BoxFuture<'a, Response> {
+            let id = self.id;
+            let log = self.log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("{id}:after"));
+                // Add a header to the response
+                response.header(format!("x-{id}-after"), b"true".to_vec())
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "Modifying"
+        }
+    }
+
+    #[test]
+    fn middleware_stack_modifications_accumulate_correctly() {
+        // Test that request modifications in before hooks accumulate,
+        // and response modifications in after hooks accumulate
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut stack = MiddlewareStack::new();
+        stack.push(ModifyingMiddleware::new("mw1", log.clone()));
+        stack.push(ModifyingMiddleware::new("mw2", log.clone()));
+        stack.push(ModifyingMiddleware::new("mw3", log.clone()));
+
+        let handler = RecordingHandler::new(log.clone());
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let response = futures_executor::block_on(stack.execute(&handler, &ctx, &mut req));
+
+        // Check that all after hooks added their headers
+        assert!(header_value(&response, "x-mw1-after").is_some());
+        assert!(header_value(&response, "x-mw2-after").is_some());
+        assert!(header_value(&response, "x-mw3-after").is_some());
+
+        // Check that the request was modified by all before hooks
+        assert!(req.headers().contains("x-mw1-before"));
+        assert!(req.headers().contains("x-mw2-before"));
+        assert!(req.headers().contains("x-mw3-before"));
+    }
+
+    #[test]
+    fn layer_wrap_maintains_middleware_order() {
+        // Test that Layer::wrap creates a Layered handler that maintains before->after ordering
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Create a layer with our recording middleware
+        let layer = Layer::new(OrderRecordingMiddleware::new("layer", log.clone()));
+
+        // Wrap the recording handler
+        let handler = RecordingHandler::new(log.clone());
+        let layered_handler = layer.wrap(handler);
+
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        // Execute the layered handler directly (not via middleware stack)
+        let _response = futures_executor::block_on(layered_handler.call(&ctx, &mut req));
+
+        let execution_log = log.lock().unwrap().clone();
+        assert_eq!(
+            execution_log,
+            vec!["layer:before", "handler", "layer:after",]
+        );
     }
 }
