@@ -56,6 +56,7 @@ pub mod app;
 pub mod bench;
 mod context;
 mod dependency;
+pub mod docs;
 pub mod error;
 mod extract;
 pub mod health;
@@ -145,6 +146,12 @@ pub use logging::{AutoSpan, LogConfig, LogEntry, LogLevel, Span};
 pub use health::{
     HealthCheckRegistry, HealthCheckResult, HealthReport, HealthStatus, basic_health_handler,
     detailed_health_handler, liveness_handler, readiness_handler,
+};
+
+// Re-export documentation utilities
+pub use docs::{
+    DocsConfig, oauth2_redirect_html, oauth2_redirect_response, redoc_html, redoc_response,
+    swagger_ui_html, swagger_ui_response,
 };
 
 // Re-export api_router utilities
