@@ -792,6 +792,412 @@ mod form_tests {
 }
 
 // ============================================================================
+// Raw Body Extractors (Bytes/String)
+// ============================================================================
+
+/// Default maximum raw body size (2MB).
+pub const DEFAULT_RAW_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Configuration for raw body extraction.
+#[derive(Debug, Clone)]
+pub struct RawBodyConfig {
+    /// Maximum body size in bytes.
+    limit: usize,
+}
+
+impl Default for RawBodyConfig {
+    fn default() -> Self {
+        Self {
+            limit: DEFAULT_RAW_BODY_LIMIT,
+        }
+    }
+}
+
+impl RawBodyConfig {
+    /// Create a new configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum body size.
+    #[must_use]
+    pub fn limit(mut self, size: usize) -> Self {
+        self.limit = size;
+        self
+    }
+
+    /// Get the maximum body size.
+    #[must_use]
+    pub fn get_limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Error for raw body extraction failures.
+#[derive(Debug)]
+pub enum RawBodyError {
+    /// Body exceeds maximum allowed size.
+    PayloadTooLarge { size: usize, limit: usize },
+    /// Streaming body not supported.
+    StreamingNotSupported,
+    /// Body is not valid UTF-8 (for String extractor).
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for RawBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PayloadTooLarge { size, limit } => {
+                write!(f, "Payload too large: {size} bytes exceeds limit of {limit}")
+            }
+            Self::StreamingNotSupported => {
+                write!(f, "Streaming body not supported for raw extraction")
+            }
+            Self::InvalidUtf8 => write!(f, "Body is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for RawBodyError {}
+
+impl IntoResponse for RawBodyError {
+    fn into_response(self) -> Response {
+        match &self {
+            RawBodyError::PayloadTooLarge { size, limit } => HttpError::payload_too_large()
+                .with_detail(format!("Body {size} bytes > {limit} limit"))
+                .into_response(),
+            RawBodyError::StreamingNotSupported => HttpError::bad_request()
+                .with_detail("Streaming body not supported")
+                .into_response(),
+            RawBodyError::InvalidUtf8 => HttpError::bad_request()
+                .with_detail("Body is not valid UTF-8")
+                .into_response(),
+        }
+    }
+}
+
+/// Raw bytes body extractor.
+///
+/// Extracts the request body as raw bytes without any content-type validation.
+/// This is useful when you need the raw payload regardless of format.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{Bytes, FromRequest};
+///
+/// async fn upload(body: Bytes) -> String {
+///     format!("Received {} bytes", body.len())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Bytes(pub Vec<u8>);
+
+impl Bytes {
+    /// Create a new Bytes from a vector.
+    #[must_use]
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    /// Get the length of the body.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if the body is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Get the bytes as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Take ownership of the inner Vec.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+}
+
+impl From<Bytes> for Vec<u8> {
+    fn from(bytes: Bytes) -> Self {
+        bytes.0
+    }
+}
+
+impl FromRequest for Bytes {
+    type Error = RawBodyError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let _ = ctx.checkpoint();
+
+        let body = req.take_body();
+        let bytes = match body {
+            Body::Empty => Vec::new(),
+            Body::Bytes(b) => b,
+            Body::Stream(_) => return Err(RawBodyError::StreamingNotSupported),
+        };
+
+        // Get limit from config or use default
+        let limit = req
+            .get_extension::<RawBodyConfig>()
+            .map(|c| c.limit)
+            .unwrap_or(DEFAULT_RAW_BODY_LIMIT);
+
+        if bytes.len() > limit {
+            return Err(RawBodyError::PayloadTooLarge {
+                size: bytes.len(),
+                limit,
+            });
+        }
+
+        let _ = ctx.checkpoint();
+        Ok(Bytes(bytes))
+    }
+}
+
+/// String body extractor.
+///
+/// Extracts the request body as a UTF-8 string. Returns an error if the
+/// body is not valid UTF-8.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::{StringBody, FromRequest};
+///
+/// async fn process(body: StringBody) -> String {
+///     format!("Received: {}", body.as_str())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct StringBody(pub String);
+
+impl StringBody {
+    /// Create a new Text from a string.
+    #[must_use]
+    pub fn new(data: String) -> Self {
+        Self(data)
+    }
+
+    /// Get the length of the string.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if the string is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Get the string as a str slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Take ownership of the inner String.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for Text {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Text {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<String> for StringBody {
+    fn from(data: String) -> Self {
+        Self(data)
+    }
+}
+
+impl From<StringBody> for String {
+    fn from(text: StringBody) -> Self {
+        text.0
+    }
+}
+
+impl FromRequest for Text {
+    type Error = RawBodyError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let bytes = Bytes::from_request(ctx, req).await?;
+
+        let text = String::from_utf8(bytes.into_inner()).map_err(|_| RawBodyError::InvalidUtf8)?;
+
+        Ok(StringBody(text))
+    }
+}
+
+#[cfg(test)]
+mod raw_body_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(asupersync::Cx::for_testing(), 1)
+    }
+
+    #[test]
+    fn test_bytes_extract_success() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.set_body(Body::Bytes(b"hello world".to_vec()));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        let bytes = result.unwrap();
+        assert_eq!(bytes.as_slice(), b"hello world");
+        assert_eq!(bytes.len(), 11);
+    }
+
+    #[test]
+    fn test_bytes_extract_empty() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.set_body(Body::Empty);
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        let bytes = result.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_bytes_size_limit() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        let large_body = vec![0u8; DEFAULT_RAW_BODY_LIMIT + 1];
+        req.set_body(Body::Bytes(large_body));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(RawBodyError::PayloadTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_bytes_custom_limit() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.insert_extension(RawBodyConfig::new().limit(100));
+        req.set_body(Body::Bytes(vec![0u8; 150]));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(RawBodyError::PayloadTooLarge { size: 150, limit: 100 })
+        ));
+    }
+
+    #[test]
+    fn test_bytes_deref() {
+        let bytes = Bytes::new(b"test".to_vec());
+        assert_eq!(&*bytes, b"test");
+    }
+
+    #[test]
+    fn test_bytes_from_vec() {
+        let bytes: Bytes = vec![1, 2, 3].into();
+        assert_eq!(bytes.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_string_body_extract_success() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        req.set_body(Body::Bytes(b"hello world".to_vec()));
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        let text = result.unwrap();
+        assert_eq!(text.as_str(), "hello world");
+        assert_eq!(text.len(), 11);
+    }
+
+    #[test]
+    fn test_string_body_extract_empty() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        req.set_body(Body::Empty);
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        let text = result.unwrap();
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_string_body_invalid_utf8() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        // Invalid UTF-8 sequence
+        req.set_body(Body::Bytes(vec![0xff, 0xfe, 0x00, 0x01]));
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(RawBodyError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn test_string_body_deref() {
+        let text = StringBody::new("hello".to_string());
+        assert_eq!(&*text, "hello");
+    }
+
+    #[test]
+    fn test_string_body_from_string() {
+        let text: StringBody = "test".to_string().into();
+        assert_eq!(text.as_str(), "test");
+    }
+
+    #[test]
+    fn test_string_body_unicode() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        req.set_body(Body::Bytes("こんにちは世界 🌍".as_bytes().to_vec()));
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        let text = result.unwrap();
+        assert_eq!(text.as_str(), "こんにちは世界 🌍");
+    }
+}
+
+// ============================================================================
 // Multipart Form Extractor
 // ============================================================================
 

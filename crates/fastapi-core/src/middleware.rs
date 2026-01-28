@@ -2345,6 +2345,344 @@ impl Middleware for CsrfMiddleware {
     }
 }
 
+// ============================================================================
+// Compression Middleware (requires "compression" feature)
+// ============================================================================
+
+/// Configuration for response compression.
+///
+/// Controls when and how responses are compressed using gzip.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::{CompressionMiddleware, CompressionConfig};
+///
+/// // Use defaults (min size 1024, level 6)
+/// let mw = CompressionMiddleware::new();
+///
+/// // Custom configuration
+/// let config = CompressionConfig::new()
+///     .min_size(512)
+///     .level(9);  // Maximum compression
+/// let mw = CompressionMiddleware::with_config(config);
+/// ```
+#[cfg(feature = "compression")]
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    /// Minimum response size in bytes to compress.
+    /// Responses smaller than this are not compressed.
+    /// Default: 1024 bytes (1 KB)
+    pub min_size: usize,
+    /// Compression level (1-9).
+    /// 1 = fastest, 9 = best compression, 6 = balanced (default)
+    pub level: u32,
+    /// Content types that are already compressed and should be skipped.
+    /// Default includes common compressed formats.
+    pub skip_content_types: Vec<&'static str>,
+}
+
+#[cfg(feature = "compression")]
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            min_size: 1024,
+            level: 6,
+            skip_content_types: vec![
+                // Images (already compressed)
+                "image/jpeg",
+                "image/png",
+                "image/gif",
+                "image/webp",
+                "image/avif",
+                // Video/Audio (already compressed)
+                "video/",
+                "audio/",
+                // Archives (already compressed)
+                "application/zip",
+                "application/gzip",
+                "application/x-gzip",
+                "application/x-bzip2",
+                "application/x-xz",
+                "application/x-7z-compressed",
+                "application/x-rar-compressed",
+                // Other compressed formats
+                "application/pdf",
+                "application/woff",
+                "application/woff2",
+                "font/woff",
+                "font/woff2",
+            ],
+        }
+    }
+}
+
+#[cfg(feature = "compression")]
+impl CompressionConfig {
+    /// Creates a new configuration with default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the minimum response size to compress.
+    ///
+    /// Responses smaller than this threshold will not be compressed,
+    /// as compression overhead may exceed the savings.
+    #[must_use]
+    pub fn min_size(mut self, size: usize) -> Self {
+        self.min_size = size;
+        self
+    }
+
+    /// Sets the compression level (1-9).
+    ///
+    /// - 1: Fastest compression, lowest ratio
+    /// - 6: Balanced (default)
+    /// - 9: Best compression ratio, slowest
+    ///
+    /// Values outside 1-9 are clamped.
+    #[must_use]
+    pub fn level(mut self, level: u32) -> Self {
+        self.level = level.clamp(1, 9);
+        self
+    }
+
+    /// Adds a content type to skip during compression.
+    ///
+    /// Content types can be exact matches or prefixes (e.g., "video/" matches all video types).
+    #[must_use]
+    pub fn skip_content_type(mut self, content_type: &'static str) -> Self {
+        self.skip_content_types.push(content_type);
+        self
+    }
+
+    /// Checks if the given content type should be skipped.
+    fn should_skip_content_type(&self, content_type: &str) -> bool {
+        let ct_lower = content_type.to_ascii_lowercase();
+        for skip in &self.skip_content_types {
+            if skip.ends_with('/') {
+                // Prefix match (e.g., "video/" matches "video/mp4")
+                if ct_lower.starts_with(*skip) {
+                    return true;
+                }
+            } else {
+                // Exact match (with optional charset)
+                if ct_lower == *skip || ct_lower.starts_with(&format!("{skip};")) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Middleware that compresses responses using gzip.
+///
+/// This middleware inspects the `Accept-Encoding` header and compresses
+/// eligible responses with gzip. Compression is skipped for:
+/// - Responses smaller than `min_size`
+/// - Responses with already-compressed content types
+/// - Responses that already have a `Content-Encoding` header
+/// - Clients that don't accept gzip
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::{CompressionMiddleware, CompressionConfig, MiddlewareStack};
+///
+/// let mut stack = MiddlewareStack::new();
+///
+/// // Default configuration
+/// stack.push(CompressionMiddleware::new());
+///
+/// // Or with custom settings
+/// let config = CompressionConfig::new()
+///     .min_size(256)   // Compress smaller responses
+///     .level(9);       // Maximum compression
+/// stack.push(CompressionMiddleware::with_config(config));
+/// ```
+///
+/// # Headers
+///
+/// When compression is applied:
+/// - `Content-Encoding: gzip` is added
+/// - `Vary: Accept-Encoding` is added (for caching)
+/// - `Content-Length` is updated to reflect compressed size
+#[cfg(feature = "compression")]
+#[derive(Debug, Clone)]
+pub struct CompressionMiddleware {
+    config: CompressionConfig,
+}
+
+#[cfg(feature = "compression")]
+impl Default for CompressionMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "compression")]
+impl CompressionMiddleware {
+    /// Creates compression middleware with default configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            config: CompressionConfig::default(),
+        }
+    }
+
+    /// Creates compression middleware with custom configuration.
+    #[must_use]
+    pub fn with_config(config: CompressionConfig) -> Self {
+        Self { config }
+    }
+
+    /// Checks if the client accepts gzip encoding.
+    fn accepts_gzip(req: &Request) -> bool {
+        if let Some(accept_encoding) = req.headers().get("accept-encoding") {
+            if let Ok(value) = std::str::from_utf8(accept_encoding) {
+                // Parse Accept-Encoding header
+                // Examples: "gzip", "gzip, deflate", "gzip;q=1.0, identity;q=0.5"
+                for part in value.split(',') {
+                    let encoding = part.trim().split(';').next().unwrap_or("").trim();
+                    if encoding.eq_ignore_ascii_case("gzip") {
+                        return true;
+                    }
+                    // Also accept "*" which means any encoding
+                    if encoding == "*" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Gets the Content-Type from response headers.
+    fn get_content_type(headers: &[(String, Vec<u8>)]) -> Option<String> {
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("content-type") {
+                return std::str::from_utf8(value).ok().map(String::from);
+            }
+        }
+        None
+    }
+
+    /// Checks if response already has Content-Encoding header.
+    fn has_content_encoding(headers: &[(String, Vec<u8>)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+    }
+
+    /// Compresses data using gzip.
+    fn compress_gzip(data: &[u8], level: u32) -> Result<Vec<u8>, std::io::Error> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
+        encoder.write_all(data)?;
+        encoder.finish()
+    }
+}
+
+#[cfg(feature = "compression")]
+impl Middleware for CompressionMiddleware {
+    fn after<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        req: &'a Request,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        let config = self.config.clone();
+
+        Box::pin(async move {
+            // Check if client accepts gzip
+            if !Self::accepts_gzip(req) {
+                return response;
+            }
+
+            // Decompose response to inspect body
+            let (status, headers, body) = response.into_parts();
+
+            // Check if already compressed
+            if Self::has_content_encoding(&headers) {
+                return Response::with_status(status)
+                    .body(body)
+                    .rebuild_with_headers(headers);
+            }
+
+            // Get body bytes (only compress Bytes variant, not streaming)
+            let body_bytes = match body {
+                crate::response::ResponseBody::Bytes(bytes) => bytes,
+                other => {
+                    // Can't compress Empty or Stream bodies
+                    return Response::with_status(status)
+                        .body(other)
+                        .rebuild_with_headers(headers);
+                }
+            };
+
+            // Check minimum size
+            if body_bytes.len() < config.min_size {
+                return Response::with_status(status)
+                    .body(crate::response::ResponseBody::Bytes(body_bytes))
+                    .rebuild_with_headers(headers);
+            }
+
+            // Check content type
+            if let Some(content_type) = Self::get_content_type(&headers) {
+                if config.should_skip_content_type(&content_type) {
+                    return Response::with_status(status)
+                        .body(crate::response::ResponseBody::Bytes(body_bytes))
+                        .rebuild_with_headers(headers);
+                }
+            }
+
+            // Compress the body
+            match Self::compress_gzip(&body_bytes, config.level) {
+                Ok(compressed) => {
+                    // Only use compressed if it's actually smaller
+                    if compressed.len() >= body_bytes.len() {
+                        return Response::with_status(status)
+                            .body(crate::response::ResponseBody::Bytes(body_bytes))
+                            .rebuild_with_headers(headers);
+                    }
+
+                    // Build response with compression headers
+                    let mut resp = Response::with_status(status)
+                        .body(crate::response::ResponseBody::Bytes(compressed));
+
+                    // Copy original headers (except content-length)
+                    for (name, value) in headers {
+                        if !name.eq_ignore_ascii_case("content-length") {
+                            resp = resp.header(name, value);
+                        }
+                    }
+
+                    // Add compression headers
+                    resp = resp.header("Content-Encoding", b"gzip".to_vec());
+                    resp = resp.header("Vary", b"Accept-Encoding".to_vec());
+
+                    resp
+                }
+                Err(_) => {
+                    // Compression failed, return original
+                    Response::with_status(status)
+                        .body(crate::response::ResponseBody::Bytes(body_bytes))
+                        .rebuild_with_headers(headers)
+                }
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "Compression"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

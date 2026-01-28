@@ -399,6 +399,28 @@ impl Response {
     pub fn into_parts(self) -> (StatusCode, Vec<(String, Vec<u8>)>, ResponseBody) {
         (self.status, self.headers, self.body)
     }
+
+    /// Rebuilds this response with the given headers, preserving status and body.
+    ///
+    /// This is useful for middleware that needs to modify the response
+    /// but preserve original headers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (status, headers, body) = response.into_parts();
+    /// // ... modify headers ...
+    /// let new_response = Response::with_status(status)
+    ///     .body(body)
+    ///     .rebuild_with_headers(headers);
+    /// ```
+    #[must_use]
+    pub fn rebuild_with_headers(mut self, headers: Vec<(String, Vec<u8>)>) -> Self {
+        for (name, value) in headers {
+            self = self.header(name, value);
+        }
+        self
+    }
 }
 
 /// Trait for types that can be converted into a response.
