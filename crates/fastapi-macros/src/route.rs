@@ -501,6 +501,14 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
         None
     };
 
+    // Generate request body builder call if a body extractor is present
+    let request_body_call = find_body_extractor(fn_inputs).map(|info| {
+        let schema = &info.type_name;
+        let content_type = info.content_type;
+        let required = info.required;
+        quote! { .request_body(#schema, #content_type, #required) }
+    });
+
     // Generate the expanded code
     let expanded = quote! {
         #fn_vis #fn_asyncness fn #fn_name(#fn_inputs) #fn_output #fn_block
@@ -523,6 +531,7 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
             #operation_id_call
             #tags_call
             #deprecated_call
+            #request_body_call
         }
 
         #[doc(hidden)]
@@ -727,5 +736,58 @@ mod tests {
         let attrs: RouteAttrs = syn::parse_quote! { "/users", summary = "Test", };
         assert_eq!(attrs.path.value(), "/users");
         assert_eq!(attrs.summary.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn test_extract_body_info_json() {
+        let ty: Type = syn::parse_quote! { Json<CreateUser> };
+        let info = extract_body_info(&ty);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.type_name, "CreateUser");
+        assert_eq!(info.content_type, "application/json");
+        assert!(info.required);
+    }
+
+    #[test]
+    fn test_extract_body_info_optional_json() {
+        let ty: Type = syn::parse_quote! { Option<Json<UpdateUser>> };
+        let info = extract_body_info(&ty);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.type_name, "UpdateUser");
+        assert_eq!(info.content_type, "application/json");
+        assert!(!info.required); // Optional body is not required
+    }
+
+    #[test]
+    fn test_extract_body_info_non_body() {
+        // Path extractor is not a body extractor
+        let ty: Type = syn::parse_quote! { Path<i64> };
+        assert!(extract_body_info(&ty).is_none());
+
+        // Query extractor is not a body extractor
+        let ty: Type = syn::parse_quote! { Query<Params> };
+        assert!(extract_body_info(&ty).is_none());
+
+        // Header extractor is not a body extractor
+        let ty: Type = syn::parse_quote! { Header<ContentType> };
+        assert!(extract_body_info(&ty).is_none());
+    }
+
+    #[test]
+    fn test_extract_type_name_simple() {
+        let ty: Type = syn::parse_quote! { User };
+        assert_eq!(extract_type_name(&ty), "User");
+
+        let ty: Type = syn::parse_quote! { CreateUserRequest };
+        assert_eq!(extract_type_name(&ty), "CreateUserRequest");
+    }
+
+    #[test]
+    fn test_extract_type_name_vec() {
+        let ty: Type = syn::parse_quote! { Vec<Item> };
+        // For generic types, we just get the outer type name
+        assert_eq!(extract_type_name(&ty), "Vec");
     }
 }

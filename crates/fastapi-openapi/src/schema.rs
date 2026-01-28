@@ -1,6 +1,7 @@
 //! JSON Schema types for OpenAPI 3.1.
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// JSON Schema representation.
@@ -466,7 +467,152 @@ pub trait JsonSchema {
     fn schema_name() -> Option<&'static str> {
         None
     }
+
+    /// Get the schema for this type, registering it with the given registry.
+    ///
+    /// If the type has a schema name, this registers the full schema definition
+    /// and returns a `$ref` reference. Otherwise, returns the inline schema.
+    fn schema_with_registry(registry: &SchemaRegistry) -> Schema
+    where
+        Self: Sized,
+    {
+        if let Some(name) = Self::schema_name() {
+            registry.get_or_register::<Self>(name)
+        } else {
+            Self::schema()
+        }
+    }
 }
+
+// ============================================================================
+// Schema Registry for $ref support
+// ============================================================================
+
+/// Registry for collecting and deduplicating JSON schemas.
+///
+/// The `SchemaRegistry` tracks schemas by name and returns `$ref` references
+/// when a schema is already registered. This prevents schema duplication
+/// in OpenAPI documents.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_openapi::{SchemaRegistry, JsonSchema, Schema};
+///
+/// #[derive(JsonSchema)]
+/// struct User {
+///     id: i64,
+///     name: String,
+/// }
+///
+/// let registry = SchemaRegistry::new();
+///
+/// // First access registers the schema and returns a $ref
+/// let schema1 = User::schema_with_registry(&registry);
+/// assert!(matches!(schema1, Schema::Ref(_)));
+///
+/// // Second access returns the same $ref without re-registering
+/// let schema2 = User::schema_with_registry(&registry);
+/// assert!(matches!(schema2, Schema::Ref(_)));
+///
+/// // Export all collected schemas for components/schemas
+/// let schemas = registry.into_schemas();
+/// assert!(schemas.contains_key("User"));
+/// ```
+#[derive(Debug, Default)]
+pub struct SchemaRegistry {
+    /// Registered schemas by name.
+    schemas: RefCell<HashMap<String, Schema>>,
+}
+
+impl SchemaRegistry {
+    /// Create a new empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schemas: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Get or register a schema by name.
+    ///
+    /// If the schema is already registered, returns a `$ref` reference.
+    /// Otherwise, generates the schema, registers it, and returns a `$ref`.
+    pub fn get_or_register<T: JsonSchema>(&self, name: &str) -> Schema {
+        let mut schemas = self.schemas.borrow_mut();
+
+        if !schemas.contains_key(name) {
+            // Register the full schema definition
+            schemas.insert(name.to_string(), T::schema());
+        }
+
+        // Return a $ref
+        Schema::reference(name)
+    }
+
+    /// Register a schema directly by name.
+    ///
+    /// Returns a `$ref` to the registered schema.
+    pub fn register(&self, name: impl Into<String>, schema: Schema) -> Schema {
+        let name = name.into();
+        self.schemas.borrow_mut().insert(name.clone(), schema);
+        Schema::reference(&name)
+    }
+
+    /// Check if a schema with the given name is already registered.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.schemas.borrow().contains_key(name)
+    }
+
+    /// Get the number of registered schemas.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.schemas.borrow().len()
+    }
+
+    /// Check if the registry is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.schemas.borrow().is_empty()
+    }
+
+    /// Consume the registry and return all collected schemas.
+    ///
+    /// The returned map is suitable for use in `components.schemas`.
+    #[must_use]
+    pub fn into_schemas(self) -> HashMap<String, Schema> {
+        self.schemas.into_inner()
+    }
+
+    /// Get a clone of all registered schemas without consuming the registry.
+    #[must_use]
+    pub fn schemas(&self) -> HashMap<String, Schema> {
+        self.schemas.borrow().clone()
+    }
+
+    /// Merge another registry's schemas into this one.
+    ///
+    /// If a schema with the same name exists in both, the existing one is kept.
+    pub fn merge(&self, other: &SchemaRegistry) {
+        let mut schemas = self.schemas.borrow_mut();
+        for (name, schema) in other.schemas.borrow().iter() {
+            schemas.entry(name.clone()).or_insert_with(|| schema.clone());
+        }
+    }
+}
+
+impl Clone for SchemaRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            schemas: RefCell::new(self.schemas.borrow().clone()),
+        }
+    }
+}
+
+// ============================================================================
+// Primitive type implementations
+// ============================================================================
 
 // Implement for primitive types
 impl JsonSchema for String {
@@ -965,5 +1111,224 @@ mod tests {
         assert!(!json.contains("minLength"));
         assert!(!json.contains("maxLength"));
         assert!(!json.contains("pattern"));
+    }
+
+    // =========================================================================
+    // SchemaRegistry Tests
+    // =========================================================================
+
+    #[test]
+    fn test_registry_new_is_empty() {
+        let registry = SchemaRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_register_direct() {
+        let registry = SchemaRegistry::new();
+        let schema = Schema::string();
+
+        let result = registry.register("Username", schema);
+
+        assert!(registry.contains("Username"));
+        assert_eq!(registry.len(), 1);
+
+        // Result should be a $ref
+        if let Schema::Ref(ref_schema) = result {
+            assert_eq!(ref_schema.reference, "#/components/schemas/Username");
+        } else {
+            panic!("Expected Schema::Ref");
+        }
+    }
+
+    #[test]
+    fn test_registry_get_or_register_new() {
+        let registry = SchemaRegistry::new();
+
+        // First call registers and returns $ref
+        let result = registry.get_or_register::<String>("StringType");
+
+        assert!(registry.contains("StringType"));
+        if let Schema::Ref(ref_schema) = result {
+            assert_eq!(ref_schema.reference, "#/components/schemas/StringType");
+        } else {
+            panic!("Expected Schema::Ref");
+        }
+    }
+
+    #[test]
+    fn test_registry_get_or_register_existing() {
+        let registry = SchemaRegistry::new();
+
+        // First call
+        let _result1 = registry.get_or_register::<String>("StringType");
+        let initial_len = registry.len();
+
+        // Second call should not add a new entry
+        let result2 = registry.get_or_register::<String>("StringType");
+
+        assert_eq!(registry.len(), initial_len);
+        if let Schema::Ref(ref_schema) = result2 {
+            assert_eq!(ref_schema.reference, "#/components/schemas/StringType");
+        } else {
+            panic!("Expected Schema::Ref");
+        }
+    }
+
+    #[test]
+    fn test_registry_into_schemas() {
+        let registry = SchemaRegistry::new();
+        registry.register("Type1", Schema::string());
+        registry.register("Type2", Schema::boolean());
+
+        let schemas = registry.into_schemas();
+
+        assert_eq!(schemas.len(), 2);
+        assert!(schemas.contains_key("Type1"));
+        assert!(schemas.contains_key("Type2"));
+    }
+
+    #[test]
+    fn test_registry_schemas_clone() {
+        let registry = SchemaRegistry::new();
+        registry.register("Type1", Schema::string());
+
+        let schemas = registry.schemas();
+
+        // Registry should still have the schema
+        assert!(registry.contains("Type1"));
+        assert_eq!(schemas.len(), 1);
+    }
+
+    #[test]
+    fn test_registry_merge() {
+        let registry1 = SchemaRegistry::new();
+        registry1.register("Type1", Schema::string());
+
+        let registry2 = SchemaRegistry::new();
+        registry2.register("Type2", Schema::boolean());
+        registry2.register("Type1", Schema::integer(Some("int32"))); // Duplicate name
+
+        registry1.merge(&registry2);
+
+        // Should have both types
+        assert_eq!(registry1.len(), 2);
+        assert!(registry1.contains("Type1"));
+        assert!(registry1.contains("Type2"));
+
+        // Original Type1 should be preserved (string, not integer)
+        let schemas = registry1.into_schemas();
+        if let Schema::Primitive(p) = &schemas["Type1"] {
+            assert!(matches!(p.schema_type, SchemaType::String));
+        } else {
+            panic!("Expected primitive string schema");
+        }
+    }
+
+    #[test]
+    fn test_registry_clone() {
+        let registry1 = SchemaRegistry::new();
+        registry1.register("Type1", Schema::string());
+
+        let registry2 = registry1.clone();
+
+        assert!(registry2.contains("Type1"));
+        assert_eq!(registry2.len(), 1);
+
+        // Modifications to clone don't affect original
+        registry2.register("Type2", Schema::boolean());
+        assert!(!registry1.contains("Type2"));
+        assert!(registry2.contains("Type2"));
+    }
+
+    #[test]
+    fn test_ref_schema_serialization() {
+        let ref_schema = Schema::reference("User");
+        let json = serde_json::to_string(&ref_schema).unwrap();
+        assert!(json.contains(r##""$ref":"#/components/schemas/User""##));
+    }
+
+    #[test]
+    fn test_registry_with_object_schema() {
+        let registry = SchemaRegistry::new();
+
+        let user_schema = Schema::object(
+            [
+                ("id".to_string(), Schema::integer(Some("int64"))),
+                ("name".to_string(), Schema::string()),
+            ]
+            .into_iter()
+            .collect(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let result = registry.register("User", user_schema);
+
+        // Should return a $ref
+        if let Schema::Ref(ref_schema) = result {
+            assert_eq!(ref_schema.reference, "#/components/schemas/User");
+        } else {
+            panic!("Expected Schema::Ref");
+        }
+
+        // The stored schema should be the object
+        let schemas = registry.into_schemas();
+        if let Schema::Object(obj) = &schemas["User"] {
+            assert!(obj.properties.contains_key("id"));
+            assert!(obj.properties.contains_key("name"));
+            assert!(obj.required.contains(&"id".to_string()));
+        } else {
+            panic!("Expected object schema");
+        }
+    }
+
+    #[test]
+    fn test_registry_nested_refs() {
+        let registry = SchemaRegistry::new();
+
+        // Register Address schema
+        let address_schema = Schema::object(
+            [
+                ("street".to_string(), Schema::string()),
+                ("city".to_string(), Schema::string()),
+            ]
+            .into_iter()
+            .collect(),
+            vec!["street".to_string(), "city".to_string()],
+        );
+        let _address_ref = registry.register("Address", address_schema);
+
+        // Register User schema with $ref to Address
+        let user_schema = Schema::object(
+            [
+                ("name".to_string(), Schema::string()),
+                ("address".to_string(), Schema::reference("Address")),
+            ]
+            .into_iter()
+            .collect(),
+            vec!["name".to_string()],
+        );
+        let _user_ref = registry.register("User", user_schema);
+
+        let schemas = registry.into_schemas();
+        assert_eq!(schemas.len(), 2);
+
+        // User's address field should be a $ref
+        if let Schema::Object(obj) = &schemas["User"] {
+            if let Schema::Ref(ref_schema) = &obj.properties["address"] {
+                assert_eq!(ref_schema.reference, "#/components/schemas/Address");
+            } else {
+                panic!("Expected address to be a $ref");
+            }
+        } else {
+            panic!("Expected User to be an object");
+        }
+    }
+
+    #[test]
+    fn test_registry_default() {
+        let registry = SchemaRegistry::default();
+        assert!(registry.is_empty());
     }
 }

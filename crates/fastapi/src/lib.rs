@@ -102,7 +102,7 @@ pub use fastapi_core::{
 // Re-export testing utilities
 pub use fastapi_core::{CookieJar, RequestBuilder, TestClient, TestResponse};
 pub use fastapi_macros::{JsonSchema, Validate, delete, get, head, options, patch, post, put};
-pub use fastapi_openapi::{OpenApi, OpenApiBuilder};
+pub use fastapi_openapi::{OpenApi, OpenApiBuilder, SchemaRegistry};
 pub use fastapi_router::{
     // Core router types
     Route, Router,

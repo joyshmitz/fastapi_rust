@@ -766,6 +766,9 @@ impl Router {
                 description: route.description,
                 tags: route.tags,
                 deprecated: route.deprecated,
+                request_body_schema: route.request_body_schema,
+                request_body_content_type: route.request_body_content_type,
+                request_body_required: route.request_body_required,
                 handler: route.handler,
             };
 

@@ -1,6 +1,6 @@
 //! OpenAPI 3.1 specification types.
 
-use crate::schema::Schema;
+use crate::schema::{Schema, SchemaRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -737,6 +737,134 @@ mod serialization_tests {
         assert!(json.contains(r#""description":"Example description""#));
         assert!(json.contains(r#""value""#));
     }
+
+    #[test]
+    fn openapi_builder_with_registry_includes_schemas() {
+        use crate::schema::Schema;
+
+        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+
+        // Register schemas via the registry
+        builder
+            .registry()
+            .register("User", Schema::object(
+                [
+                    ("id".to_string(), Schema::integer(Some("int64"))),
+                    ("name".to_string(), Schema::string()),
+                ]
+                .into_iter()
+                .collect(),
+                vec!["id".to_string(), "name".to_string()],
+            ));
+
+        let doc = builder.build();
+
+        // Components should include the registered schema
+        assert!(doc.components.is_some());
+        let components = doc.components.unwrap();
+        assert!(components.schemas.contains_key("User"));
+    }
+
+    #[test]
+    fn openapi_builder_registry_returns_refs() {
+        use crate::schema::Schema;
+
+        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+
+        // Register and get $ref back
+        let user_ref = builder.registry().register("User", Schema::string());
+
+        if let Schema::Ref(ref_schema) = user_ref {
+            assert_eq!(ref_schema.reference, "#/components/schemas/User");
+        } else {
+            panic!("Expected Schema::Ref");
+        }
+    }
+
+    #[test]
+    fn openapi_builder_merges_registry_and_explicit_schemas() {
+        use crate::schema::Schema;
+
+        let builder = OpenApiBuilder::new("Test API", "1.0.0")
+            .schema("ExplicitSchema", Schema::boolean());
+
+        // Also register via registry
+        builder.registry().register("RegistrySchema", Schema::string());
+
+        let doc = builder.build();
+
+        let components = doc.components.unwrap();
+        assert!(components.schemas.contains_key("ExplicitSchema"));
+        assert!(components.schemas.contains_key("RegistrySchema"));
+    }
+
+    #[test]
+    fn openapi_builder_explicit_schemas_override_registry() {
+        use crate::schema::Schema;
+
+        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+
+        // Register via registry first
+        builder.registry().register("MyType", Schema::string());
+
+        // Then add explicitly (should override)
+        let builder = builder.schema("MyType", Schema::boolean());
+
+        let doc = builder.build();
+        let components = doc.components.unwrap();
+
+        // Should be boolean (explicit), not string (registry)
+        if let Schema::Primitive(p) = &components.schemas["MyType"] {
+            assert!(matches!(p.schema_type, crate::schema::SchemaType::Boolean));
+        } else {
+            panic!("Expected primitive boolean schema");
+        }
+    }
+
+    #[test]
+    fn openapi_builder_with_existing_registry() {
+        use crate::schema::Schema;
+
+        // Pre-populate a registry
+        let registry = SchemaRegistry::new();
+        registry.register("PreRegistered", Schema::string());
+
+        // Use the pre-populated registry
+        let builder = OpenApiBuilder::with_registry("Test API", "1.0.0", registry);
+
+        let doc = builder.build();
+        let components = doc.components.unwrap();
+        assert!(components.schemas.contains_key("PreRegistered"));
+    }
+
+    #[test]
+    fn openapi_builder_registry_serializes_refs_correctly() {
+        use crate::schema::Schema;
+
+        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+
+        // Register User schema
+        let user_ref = builder.registry().register(
+            "User",
+            Schema::object(
+                [("name".to_string(), Schema::string())]
+                    .into_iter()
+                    .collect(),
+                vec!["name".to_string()],
+            ),
+        );
+
+        // Create a response that uses the $ref
+        let doc = builder.build();
+        let json = serde_json::to_string_pretty(&doc).unwrap();
+
+        // Should have components/schemas/User
+        assert!(json.contains(r#""User""#));
+
+        // The user_ref should serialize as a $ref
+        let ref_json = serde_json::to_string(&user_ref).unwrap();
+        assert!(ref_json.contains(r##""$ref":"#/components/schemas/User""##));
+    }
 }
 
 /// OpenAPI document builder.
@@ -746,6 +874,8 @@ pub struct OpenApiBuilder {
     paths: HashMap<String, PathItem>,
     components: Components,
     tags: Vec<Tag>,
+    /// Schema registry for collecting and deduplicating schemas.
+    registry: SchemaRegistry,
 }
 
 impl OpenApiBuilder {
@@ -765,7 +895,44 @@ impl OpenApiBuilder {
             paths: HashMap::new(),
             components: Components::default(),
             tags: Vec::new(),
+            registry: SchemaRegistry::new(),
         }
+    }
+
+    /// Create a new builder with an existing schema registry.
+    ///
+    /// Use this when you want to share schemas across multiple OpenAPI documents
+    /// or when you've pre-registered schemas.
+    #[must_use]
+    pub fn with_registry(
+        title: impl Into<String>,
+        version: impl Into<String>,
+        registry: SchemaRegistry,
+    ) -> Self {
+        Self {
+            info: Info {
+                title: title.into(),
+                version: version.into(),
+                description: None,
+                terms_of_service: None,
+                contact: None,
+                license: None,
+            },
+            servers: Vec::new(),
+            paths: HashMap::new(),
+            components: Components::default(),
+            tags: Vec::new(),
+            registry,
+        }
+    }
+
+    /// Get a reference to the schema registry.
+    ///
+    /// Use this to register schemas that should be in `#/components/schemas/`
+    /// and get `$ref` references to them.
+    #[must_use]
+    pub fn registry(&self) -> &SchemaRegistry {
+        &self.registry
     }
 
     /// Add a description.
@@ -803,17 +970,26 @@ impl OpenApiBuilder {
     }
 
     /// Build the OpenAPI document.
+    ///
+    /// This merges all schemas from the registry into `components.schemas`.
     #[must_use]
     pub fn build(self) -> OpenApi {
+        // Merge registry schemas with explicitly added schemas
+        let mut all_schemas = self.registry.into_schemas();
+        for (name, schema) in self.components.schemas {
+            // Explicitly added schemas take precedence
+            all_schemas.insert(name, schema);
+        }
+
         OpenApi {
             openapi: "3.1.0".to_string(),
             info: self.info,
             servers: self.servers,
             paths: self.paths,
-            components: if self.components.schemas.is_empty() {
+            components: if all_schemas.is_empty() {
                 None
             } else {
-                Some(self.components)
+                Some(Components { schemas: all_schemas })
             },
             tags: self.tags,
         }
