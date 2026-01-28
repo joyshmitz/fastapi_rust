@@ -2006,6 +2006,11 @@ impl App {
                     .header("Allow", format_allow_header(&allowed).into_bytes())
             }
             RouteLookup::NotFound => Response::with_status(StatusCode::NOT_FOUND),
+            RouteLookup::Redirect { target } => {
+                // 308 Permanent Redirect preserves the request method
+                Response::with_status(StatusCode::PERMANENT_REDIRECT)
+                    .header("Location", target.into_bytes())
+            }
         }
     }
 
