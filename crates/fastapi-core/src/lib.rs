@@ -80,14 +80,15 @@ pub use error::{
 pub use extract::{
     Accept, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BasicAuth,
     BasicAuthError, BearerToken, BearerTokenError, ContentType, Cookie, CookieExtractError,
-    CookieName, CookiePrefix, CookiePrefixError, CsrfTokenCookie, DEFAULT_JSON_LIMIT, DEFAULT_PAGE,
-    DEFAULT_PER_PAGE, FromHeaderValue, FromRequest, Header, HeaderExtractError, HeaderName,
-    HeaderValues, Host, Json, JsonConfig, JsonExtractError, MAX_PER_PAGE, NamedHeader,
-    OAuth2BearerError, OAuth2BearerErrorKind, OAuth2PasswordBearer, OAuth2PasswordBearerConfig,
-    Page, Pagination, PaginationConfig, Path, PathExtractError, PathParams, Query,
-    QueryExtractError, QueryParams, RequestCookie, RequestCookies, RequestRef, ResponseMut,
-    ResponseMutations, SameSite, SecureCompare, SessionIdCookie, State, StateExtractError,
-    UserAgent, XRequestId, constant_time_eq, constant_time_str_eq, snake_to_header_case,
+    CookieName, CookiePrefix, CookiePrefixError, CsrfTokenCookie, DEFAULT_FORM_LIMIT,
+    DEFAULT_JSON_LIMIT, DEFAULT_PAGE, DEFAULT_PER_PAGE, Form, FormConfig, FormExtractError,
+    FromHeaderValue, FromRequest, Header, HeaderExtractError, HeaderName, HeaderValues, Host, Json,
+    JsonConfig, JsonExtractError, MAX_PER_PAGE, NamedHeader, OAuth2BearerError,
+    OAuth2BearerErrorKind, OAuth2PasswordBearer, OAuth2PasswordBearerConfig, Page, Pagination,
+    PaginationConfig, Path, PathExtractError, PathParams, Query, QueryExtractError, QueryParams,
+    RequestCookie, RequestCookies, RequestRef, ResponseMut, ResponseMutations, SameSite,
+    SecureCompare, SessionIdCookie, State, StateExtractError, UserAgent, XRequestId,
+    constant_time_eq, constant_time_str_eq, snake_to_header_case,
 };
 pub use middleware::{
     AddResponseHeader, BoxFuture, ControlFlow, Cors, CorsConfig, CsrfConfig, CsrfMiddleware,
@@ -131,8 +132,8 @@ pub use api_router::{APIRouter, IncludeConfig, ResponseDef, RouterDependency, Ro
 // Re-export app utilities
 pub use app::{
     App, AppBuilder, AppConfig, BoxLifespanFn, ConfigError, ExceptionHandlers, HasState,
-    LifespanError, LifespanScope, RequiresState, RouteEntry, StartupHook, StartupHookError,
-    StartupOutcome, StateContainer, StateRegistry,
+    LifespanError, LifespanScope, MountedApp, RequiresState, RouteEntry, StartupHook,
+    StartupHookError, StartupOutcome, StateContainer, StateRegistry,
 };
 
 // Re-export shutdown utilities

@@ -1225,6 +1225,8 @@ pub struct AppBuilder<S: StateRegistry = ()> {
     async_shutdown_hooks: Vec<Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
     /// Optional lifespan function for async startup/shutdown context management.
     lifespan: Option<BoxLifespanFn>,
+    /// Mounted sub-applications at specific path prefixes.
+    mounted_apps: Vec<MountedApp>,
     _state_marker: PhantomData<S>,
 }
 
@@ -1241,6 +1243,7 @@ impl Default for AppBuilder<()> {
             shutdown_hooks: Vec::new(),
             async_shutdown_hooks: Vec::new(),
             lifespan: None,
+            mounted_apps: Vec::new(),
             _state_marker: PhantomData,
         }
     }
@@ -1403,6 +1406,64 @@ impl<S: StateRegistry> AppBuilder<S> {
         self
     }
 
+    /// Mounts a sub-application at a path prefix.
+    ///
+    /// Mounted applications are completely independent from the parent:
+    /// - They have their own middleware stack (parent middleware does NOT apply)
+    /// - They have their own state and configuration
+    /// - Their OpenAPI schemas are NOT merged with the parent
+    /// - Request paths have the prefix stripped before being passed to the sub-app
+    ///
+    /// This differs from [`include_router`](Self::include_router), which merges
+    /// routes into the parent app and applies parent middleware.
+    ///
+    /// # Use Cases
+    ///
+    /// - Mount admin panels at `/admin`
+    /// - Mount Swagger UI at `/docs`
+    /// - Mount static file servers
+    /// - Integrate legacy or third-party apps
+    ///
+    /// # Path Stripping Behavior
+    ///
+    /// When a request arrives at `/admin/users`, and an app is mounted at `/admin`,
+    /// the sub-app receives the request with path `/users`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_core::app::App;
+    ///
+    /// // Create an admin sub-application
+    /// let admin_app = App::builder()
+    ///     .get("/users", admin_list_users)
+    ///     .get("/settings", admin_settings)
+    ///     .middleware(AdminAuthMiddleware::new())
+    ///     .build();
+    ///
+    /// // Mount it at /admin
+    /// let main_app = App::builder()
+    ///     .get("/", home_page)
+    ///     .mount("/admin", admin_app)
+    ///     .build();
+    ///
+    /// // Now:
+    /// // - GET /           -> home_page
+    /// // - GET /admin/users -> admin_list_users (with AdminAuthMiddleware)
+    /// // - GET /admin/settings -> admin_settings (with AdminAuthMiddleware)
+    /// ```
+    #[must_use]
+    pub fn mount(mut self, prefix: impl Into<String>, app: App) -> Self {
+        self.mounted_apps.push(MountedApp::new(prefix, app));
+        self
+    }
+
+    /// Returns the number of mounted sub-applications.
+    #[must_use]
+    pub fn mounted_app_count(&self) -> usize {
+        self.mounted_apps.len()
+    }
+
     /// Adds shared state to the application (legacy method).
     ///
     /// State can be accessed by handlers through the `State<T>` extractor.
@@ -1466,6 +1527,7 @@ impl<S: StateRegistry> AppBuilder<S> {
             shutdown_hooks: self.shutdown_hooks,
             async_shutdown_hooks: self.async_shutdown_hooks,
             lifespan: self.lifespan,
+            mounted_apps: self.mounted_apps,
             _state_marker: PhantomData,
         }
     }
@@ -1820,6 +1882,7 @@ impl<S: StateRegistry> AppBuilder<S> {
             async_shutdown_hooks: parking_lot::Mutex::new(self.async_shutdown_hooks),
             lifespan: parking_lot::Mutex::new(self.lifespan),
             lifespan_cleanup: parking_lot::Mutex::new(None),
+            mounted_apps: self.mounted_apps,
         }
     }
 }
@@ -1835,7 +1898,79 @@ impl<S: StateRegistry> std::fmt::Debug for AppBuilder<S> {
             .field("exception_handlers", &self.exception_handlers)
             .field("startup_hooks", &self.startup_hooks.len())
             .field("shutdown_hooks", &self.shutdown_hook_count())
+            .field("mounted_apps", &self.mounted_apps.len())
             .finish()
+    }
+}
+
+/// A mounted sub-application with its path prefix.
+///
+/// Mounted applications are completely independent from the parent app:
+/// - They have their own middleware stack
+/// - They have their own state and configuration
+/// - Their OpenAPI schemas are NOT merged with the parent
+/// - Request paths have the prefix stripped before being passed to the sub-app
+///
+/// This differs from `include_router`, which merges routes into the parent app.
+#[derive(Debug)]
+pub struct MountedApp {
+    /// Path prefix at which this app is mounted (e.g., "/admin", "/docs").
+    prefix: String,
+    /// The mounted sub-application.
+    app: Arc<App>,
+}
+
+impl MountedApp {
+    /// Create a new mounted app at the given prefix.
+    ///
+    /// The prefix should start with '/' and not end with '/'.
+    #[must_use]
+    pub fn new(prefix: impl Into<String>, app: App) -> Self {
+        let mut prefix = prefix.into();
+        // Normalize prefix: ensure starts with '/', doesn't end with '/'
+        if !prefix.starts_with('/') {
+            prefix = format!("/{}", prefix);
+        }
+        while prefix.ends_with('/') && prefix.len() > 1 {
+            prefix.pop();
+        }
+        Self {
+            prefix,
+            app: Arc::new(app),
+        }
+    }
+
+    /// Returns the mount prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Returns a reference to the mounted app.
+    #[must_use]
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    /// Check if a request path matches this mount prefix.
+    ///
+    /// Returns the remaining path after the prefix is stripped, or None if no match.
+    #[must_use]
+    pub fn match_prefix<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if path == self.prefix {
+            // Exact match - sub-app should receive "/"
+            Some("/")
+        } else if path.starts_with(&self.prefix) {
+            let remaining = &path[self.prefix.len()..];
+            // Must be followed by '/' or end of string
+            if remaining.starts_with('/') {
+                Some(remaining)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -1862,6 +1997,8 @@ pub struct App {
     lifespan: parking_lot::Mutex<Option<BoxLifespanFn>>,
     /// Cleanup future from lifespan function (runs during shutdown).
     lifespan_cleanup: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    /// Mounted sub-applications.
+    mounted_apps: Vec<MountedApp>,
 }
 
 impl App {
@@ -1948,11 +2085,24 @@ impl App {
         self.exception_handlers.handle_or_default(ctx, err)
     }
 
+    /// Returns the mounted sub-applications.
+    #[must_use]
+    pub fn mounted_apps(&self) -> &[MountedApp] {
+        &self.mounted_apps
+    }
+
     /// Handles an incoming request.
     ///
-    /// This matches the request against registered routes, runs middleware,
-    /// and returns the response. Path parameters are extracted and stored
-    /// in request extensions for use by the `Path` extractor.
+    /// This first checks mounted sub-applications (in registration order),
+    /// then matches against registered routes, runs middleware, and returns
+    /// the response. Path parameters are extracted and stored in request
+    /// extensions for use by the `Path` extractor.
+    ///
+    /// # Mounted App Handling
+    ///
+    /// When a request path matches a mounted app's prefix, the request is
+    /// forwarded to that app with the prefix stripped from the path. The
+    /// mounted app's middleware runs instead of the parent's middleware.
     ///
     /// # Special Parameter Injection
     ///
@@ -1962,6 +2112,24 @@ impl App {
     ///   `BackgroundTasksInner`. The HTTP server should retrieve and execute these
     ///   after sending the response using `take_background_tasks()`.
     pub async fn handle(&self, ctx: &RequestContext, req: &mut Request) -> Response {
+        // First, check mounted sub-applications
+        for mounted in &self.mounted_apps {
+            if let Some(stripped_path) = mounted.match_prefix(req.path()) {
+                // Clone the request with the stripped path for the sub-app
+                let original_path = req.path().to_string();
+                req.set_path(stripped_path.to_string());
+
+                // Forward to the mounted app (uses its own middleware stack)
+                // Use Box::pin for the recursive call to avoid infinite future size
+                let response = Box::pin(mounted.app.handle(ctx, req)).await;
+
+                // Restore original path (in case of error handling or logging)
+                req.set_path(original_path);
+
+                return response;
+            }
+        }
+
         // Use the route table for path matching with converter validation
         match self.route_table.lookup(req.path(), req.method()) {
             RouteLookup::Match { route: idx, params } => {
@@ -2218,7 +2386,10 @@ impl App {
     /// // Tests will be deterministic with this seed
     /// ```
     #[must_use]
-    pub fn test_client_with_seed(self: Arc<Self>, seed: u64) -> crate::testing::TestClient<Arc<App>> {
+    pub fn test_client_with_seed(
+        self: Arc<Self>,
+        seed: u64,
+    ) -> crate::testing::TestClient<Arc<App>> {
         crate::testing::TestClient::with_seed(self, seed)
     }
 }
@@ -4214,5 +4385,141 @@ mod tests {
         // Lifespan cleanup should run after regular hooks
         let events = log.lock().unwrap();
         assert_eq!(*events, vec!["regular_hook", "lifespan_cleanup"]);
+    }
+
+    // =========================================================================
+    // Sub-Application Mounting Tests
+    // =========================================================================
+
+    #[test]
+    fn mounted_app_prefix_matching() {
+        let mounted = MountedApp::new("/admin", App::builder().build());
+
+        // Exact match returns "/"
+        assert_eq!(mounted.match_prefix("/admin"), Some("/"));
+
+        // Prefix match with remaining path
+        assert_eq!(mounted.match_prefix("/admin/users"), Some("/users"));
+        assert_eq!(
+            mounted.match_prefix("/admin/users/123"),
+            Some("/users/123")
+        );
+
+        // No match - different prefix
+        assert_eq!(mounted.match_prefix("/api"), None);
+        assert_eq!(mounted.match_prefix("/"), None);
+
+        // No match - partial prefix without slash boundary
+        assert_eq!(mounted.match_prefix("/administrator"), None);
+    }
+
+    #[test]
+    fn mounted_app_prefix_normalization() {
+        // Prefix without leading slash gets normalized
+        let mounted = MountedApp::new("admin", App::builder().build());
+        assert_eq!(mounted.prefix(), "/admin");
+
+        // Trailing slash gets removed
+        let mounted = MountedApp::new("/admin/", App::builder().build());
+        assert_eq!(mounted.prefix(), "/admin");
+
+        // Multiple trailing slashes get removed
+        let mounted = MountedApp::new("/admin///", App::builder().build());
+        assert_eq!(mounted.prefix(), "/admin");
+    }
+
+    #[test]
+    fn app_builder_mount_adds_mounted_app() {
+        let sub_app = App::builder().get("/", test_handler).build();
+
+        let app = App::builder()
+            .get("/", test_handler)
+            .mount("/admin", sub_app)
+            .build();
+
+        assert_eq!(app.mounted_apps().len(), 1);
+        assert_eq!(app.mounted_apps()[0].prefix(), "/admin");
+    }
+
+    #[test]
+    fn app_builder_multiple_mounts() {
+        let admin_app = App::builder().get("/", test_handler).build();
+        let api_app = App::builder().get("/", test_handler).build();
+        let docs_app = App::builder().get("/", test_handler).build();
+
+        let app = App::builder()
+            .get("/", test_handler)
+            .mount("/admin", admin_app)
+            .mount("/api", api_app)
+            .mount("/docs", docs_app)
+            .build();
+
+        assert_eq!(app.mounted_apps().len(), 3);
+        assert_eq!(app.mounted_apps()[0].prefix(), "/admin");
+        assert_eq!(app.mounted_apps()[1].prefix(), "/api");
+        assert_eq!(app.mounted_apps()[2].prefix(), "/docs");
+    }
+
+    fn admin_handler(
+        _ctx: &RequestContext,
+        _req: &mut Request,
+    ) -> std::future::Ready<Response> {
+        std::future::ready(Response::ok().body(ResponseBody::Bytes(b"Admin Panel".to_vec())))
+    }
+
+    #[test]
+    fn app_routes_to_mounted_app() {
+        let admin_app = App::builder()
+            .get("/", admin_handler)
+            .get("/users", admin_handler)
+            .build();
+
+        let app = App::builder()
+            .get("/", test_handler)
+            .mount("/admin", admin_app)
+            .build();
+
+        let ctx = test_context();
+
+        // Request to parent app
+        let mut req = Request::new(Method::Get, "/");
+        let response = futures_executor::block_on(app.handle(&ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 200);
+        if let ResponseBody::Bytes(body) = response.body() {
+            assert_eq!(body.as_slice(), b"Hello, World!");
+        }
+
+        // Request to mounted app (exact prefix)
+        let mut req = Request::new(Method::Get, "/admin");
+        let response = futures_executor::block_on(app.handle(&ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 200);
+        if let ResponseBody::Bytes(body) = response.body() {
+            assert_eq!(body.as_slice(), b"Admin Panel");
+        }
+
+        // Request to mounted app (with path)
+        let mut req = Request::new(Method::Get, "/admin/users");
+        let response = futures_executor::block_on(app.handle(&ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 200);
+        if let ResponseBody::Bytes(body) = response.body() {
+            assert_eq!(body.as_slice(), b"Admin Panel");
+        }
+    }
+
+    #[test]
+    fn mounted_app_404_for_unknown_routes() {
+        let admin_app = App::builder().get("/users", admin_handler).build();
+
+        let app = App::builder()
+            .get("/", test_handler)
+            .mount("/admin", admin_app)
+            .build();
+
+        let ctx = test_context();
+
+        // Request to mounted app for unknown route
+        let mut req = Request::new(Method::Get, "/admin/unknown");
+        let response = futures_executor::block_on(app.handle(&ctx, &mut req));
+        assert_eq!(response.status().as_u16(), 404);
     }
 }
