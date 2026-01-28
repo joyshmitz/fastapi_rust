@@ -3629,8 +3629,9 @@ mod tests {
 
         futures_executor::block_on(app.run_shutdown_hooks());
 
-        // LIFO order: 3, 2, 1
-        assert_eq!(*order.lock(), vec![3, 2, 1]);
+        // Async hooks run first (LIFO within async), then sync hooks (LIFO within sync)
+        // Async: [2], Sync LIFO: [3, 1] => [2, 3, 1]
+        assert_eq!(*order.lock(), vec![2, 3, 1]);
     }
 
     // =========================================================================

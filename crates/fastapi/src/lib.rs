@@ -70,6 +70,35 @@ pub use fastapi_core::{
     ValidationError, ValidationErrors,
 };
 
+// Re-export extractors
+pub use fastapi_core::{
+    // Body extractors
+    Json, JsonConfig, JsonExtractError,
+    // Path parameters
+    Path, PathExtractError, PathParams, PathParamsDeserializer,
+    // Query string
+    Query, QueryExtractError, QueryParams,
+    // Headers
+    Header, HeaderExtractError, HeaderValues, NamedHeader,
+    // Common header types
+    Accept, Authorization, ContentType, Host, UserAgent, XRequestId,
+    // Cookies
+    Cookie, CookiePrefix, CookiePrefixError, ResponseCookies, SameSite,
+    // State
+    State, AppState,
+    // Auth extractors
+    BasicAuth, BasicAuthError, BearerToken, BearerTokenError,
+    OAuth2PasswordBearer, OAuth2PasswordBearerConfig, OAuth2BearerError,
+    // Pagination
+    Pagination, PaginationConfig, Page, DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE,
+    // Background tasks
+    BackgroundTasks, BackgroundTasksInner,
+    // Response mutations
+    ResponseMut, ResponseMutations, SetResponseHeader,
+    // Request utilities
+    RequestRef, RequestContext,
+};
+
 // Re-export testing utilities
 pub use fastapi_core::{CookieJar, RequestBuilder, TestClient, TestResponse};
 pub use fastapi_macros::{JsonSchema, Validate, delete, get, patch, post, put};
@@ -79,11 +108,22 @@ pub use fastapi_router::{Route, Router};
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::{
+        // Core types
         App, AppBuilder, AppConfig, ConfigError, Cors, CorsConfig, DefaultConfig,
         DefaultDependencyConfig, DependencyOverrides, DependencyScope, Depends, DependsConfig,
-        FromDependency, FromRequest, HttpError, IntoResponse, JsonSchema, Method, NoCache, OpenApi,
-        OpenApiBuilder, Request, RequestId, RequestIdMiddleware, Response, Route, Router,
-        StatusCode, Validate, ValidationError, ValidationErrors, delete, get, patch, post, put,
+        FromDependency, FromRequest, HttpError, IntoResponse, Method, NoCache,
+        Request, RequestContext, RequestId, RequestIdMiddleware, Response, Route, Router,
+        StatusCode, ValidationError, ValidationErrors,
+        // Extractors
+        Json, Path, Query, Header, Cookie, State,
+        // Auth
+        BasicAuth, BearerToken, OAuth2PasswordBearer,
+        // Pagination
+        Pagination, Page,
+        // Macros
+        JsonSchema, Validate, delete, get, patch, post, put,
+        // OpenAPI
+        OpenApi, OpenApiBuilder,
     };
     pub use serde::{Deserialize, Serialize};
 }
@@ -93,6 +133,12 @@ pub mod testing {
     pub use fastapi_core::testing::{CookieJar, RequestBuilder, TestClient, TestResponse};
 }
 
-// TODO: Extractors module (Path, Query, Json, Header, Cookie)
-// TODO: App builder
-// TODO: Integration with asupersync Cx
+/// Extractors module for type-safe request data extraction.
+pub mod extractors {
+    pub use fastapi_core::{
+        Accept, AppState, Authorization, BackgroundTasks, BasicAuth, BearerToken,
+        ContentType, Cookie, Header, HeaderValues, Host, Json, JsonConfig, NamedHeader,
+        OAuth2PasswordBearer, Page, Pagination, PaginationConfig, Path, PathParams, Query,
+        QueryParams, RequestRef, ResponseMut, ResponseMutations, State, UserAgent, XRequestId,
+    };
+}

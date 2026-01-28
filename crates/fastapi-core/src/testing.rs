@@ -1377,6 +1377,372 @@ macro_rules! assert_body_matches {
 
 // Note: json_contains is already public and accessible via crate::testing::json_contains
 
+// ============================================================================
+// Lab Runtime Testing Utilities
+// ============================================================================
+
+/// Configuration for Lab-based deterministic testing.
+///
+/// This configuration controls how the Lab runtime executes tests, including
+/// virtual time, chaos injection, and deterministic scheduling.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::{LabTestConfig, LabTestClient};
+///
+/// // Basic deterministic test
+/// let config = LabTestConfig::new(42);
+/// let client = LabTestClient::with_config(my_handler, config);
+///
+/// // With chaos injection for stress testing
+/// let config = LabTestConfig::new(42).with_light_chaos();
+/// let client = LabTestClient::with_config(my_handler, config);
+/// ```
+#[derive(Debug, Clone)]
+pub struct LabTestConfig {
+    /// Seed for deterministic scheduling.
+    pub seed: u64,
+    /// Whether to enable chaos injection.
+    pub chaos_enabled: bool,
+    /// Chaos intensity (0.0 = none, 1.0 = max).
+    pub chaos_intensity: f64,
+    /// Maximum steps before timeout (prevents infinite loops).
+    pub max_steps: Option<u64>,
+    /// Whether to capture traces for debugging.
+    pub capture_traces: bool,
+}
+
+impl Default for LabTestConfig {
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            chaos_enabled: false,
+            chaos_intensity: 0.0,
+            max_steps: Some(10_000),
+            capture_traces: false,
+        }
+    }
+}
+
+impl LabTestConfig {
+    /// Creates a new Lab test configuration with the given seed.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            ..Default::default()
+        }
+    }
+
+    /// Enables light chaos injection (1% cancel, 5% delay).
+    ///
+    /// Suitable for CI pipelines - catches obvious bugs without excessive flakiness.
+    #[must_use]
+    pub fn with_light_chaos(mut self) -> Self {
+        self.chaos_enabled = true;
+        self.chaos_intensity = 0.05;
+        self
+    }
+
+    /// Enables heavy chaos injection (10% cancel, 20% delay).
+    ///
+    /// Suitable for thorough stress testing before releases.
+    #[must_use]
+    pub fn with_heavy_chaos(mut self) -> Self {
+        self.chaos_enabled = true;
+        self.chaos_intensity = 0.2;
+        self
+    }
+
+    /// Sets custom chaos intensity (0.0 to 1.0).
+    #[must_use]
+    pub fn with_chaos_intensity(mut self, intensity: f64) -> Self {
+        self.chaos_enabled = intensity > 0.0;
+        self.chaos_intensity = intensity.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets the maximum number of steps before timeout.
+    #[must_use]
+    pub fn with_max_steps(mut self, max: u64) -> Self {
+        self.max_steps = Some(max);
+        self
+    }
+
+    /// Disables the step limit (use with caution).
+    #[must_use]
+    pub fn without_step_limit(mut self) -> Self {
+        self.max_steps = None;
+        self
+    }
+
+    /// Enables trace capture for debugging.
+    #[must_use]
+    pub fn with_traces(mut self) -> Self {
+        self.capture_traces = true;
+        self
+    }
+}
+
+/// Statistics about chaos injection during a test.
+///
+/// This is returned by `LabTestClient::chaos_stats()` after test execution.
+#[derive(Debug, Clone, Default)]
+pub struct TestChaosStats {
+    /// Number of decision points encountered.
+    pub decision_points: u64,
+    /// Number of delays injected.
+    pub delays_injected: u64,
+    /// Number of cancellations injected.
+    pub cancellations_injected: u64,
+    /// Total steps executed.
+    pub steps_executed: u64,
+}
+
+impl TestChaosStats {
+    /// Returns the injection rate (injections / decision points).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // Acceptable for test stats
+    pub fn injection_rate(&self) -> f64 {
+        if self.decision_points == 0 {
+            0.0
+        } else {
+            (self.delays_injected + self.cancellations_injected) as f64
+                / self.decision_points as f64
+        }
+    }
+
+    /// Returns true if any chaos was injected.
+    #[must_use]
+    pub fn had_chaos(&self) -> bool {
+        self.delays_injected > 0 || self.cancellations_injected > 0
+    }
+}
+
+/// Virtual time utilities for testing timeouts and delays.
+///
+/// This module provides helpers for simulating time passage in tests
+/// without waiting for actual wall-clock time.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::MockTime;
+///
+/// let mock_time = MockTime::new();
+///
+/// // Advance virtual time by 5 seconds
+/// mock_time.advance(Duration::from_secs(5));
+///
+/// // Check that timer would have expired
+/// assert!(mock_time.elapsed() >= Duration::from_secs(5));
+/// ```
+#[derive(Debug, Clone)]
+pub struct MockTime {
+    /// Current virtual time in microseconds.
+    current_us: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Default for MockTime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockTime {
+    /// Creates a new mock time starting at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            current_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Creates a mock time starting at the given duration.
+    #[must_use]
+    pub fn starting_at(initial: std::time::Duration) -> Self {
+        Self {
+            current_us: Arc::new(std::sync::atomic::AtomicU64::new(initial.as_micros() as u64)),
+        }
+    }
+
+    /// Returns the current virtual time.
+    #[must_use]
+    pub fn now(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.current_us.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Returns the elapsed time since creation.
+    #[must_use]
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.now()
+    }
+
+    /// Advances virtual time by the given duration.
+    pub fn advance(&self, duration: std::time::Duration) {
+        self.current_us.fetch_add(
+            duration.as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Sets virtual time to a specific value.
+    pub fn set(&self, time: std::time::Duration) {
+        self.current_us.store(
+            time.as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Resets virtual time to zero.
+    pub fn reset(&self) {
+        self.current_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Result of a cancellation test.
+///
+/// Contains information about how the handler responded to cancellation.
+#[derive(Debug)]
+pub struct CancellationTestResult {
+    /// Whether the handler completed before cancellation.
+    pub completed: bool,
+    /// Whether the handler detected cancellation via checkpoint.
+    pub cancelled_at_checkpoint: bool,
+    /// Response returned (if handler completed).
+    pub response: Option<Response>,
+    /// The await point at which cancellation was detected.
+    pub cancellation_point: Option<String>,
+}
+
+impl CancellationTestResult {
+    /// Returns true if cancellation was handled gracefully.
+    #[must_use]
+    pub fn gracefully_cancelled(&self) -> bool {
+        !self.completed && self.cancelled_at_checkpoint
+    }
+
+    /// Returns true if the handler completed despite cancellation request.
+    #[must_use]
+    pub fn completed_despite_cancel(&self) -> bool {
+        self.completed
+    }
+}
+
+/// Helper for testing handler cancellation behavior.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::testing::CancellationTest;
+///
+/// let test = CancellationTest::new(my_handler);
+///
+/// // Test that handler respects cancellation
+/// let result = test.cancel_after_polls(3);
+/// assert!(result.gracefully_cancelled());
+/// ```
+pub struct CancellationTest<H> {
+    handler: H,
+    seed: u64,
+}
+
+impl<H: Handler + 'static> CancellationTest<H> {
+    /// Creates a new cancellation test for the given handler.
+    #[must_use]
+    pub fn new(handler: H) -> Self {
+        Self { handler, seed: 42 }
+    }
+
+    /// Sets the seed for deterministic testing.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Tests that the handler respects cancellation via checkpoint.
+    ///
+    /// This sets the cancellation flag before calling the handler, then
+    /// verifies that the handler detects it at a checkpoint and returns
+    /// an appropriate error response.
+    pub fn test_respects_cancellation(&self) -> CancellationTestResult {
+        let cx = asupersync::Cx::for_testing();
+        let ctx = RequestContext::new(cx, 1);
+
+        // Pre-set cancellation before handler runs
+        ctx.cx().set_cancel_requested(true);
+
+        let mut request = Request::new(Method::Get, "/test");
+        let response = futures_executor::block_on(self.handler.call(&ctx, &mut request));
+
+        // Check if handler returned a cancellation-related status
+        let is_cancelled_response = response.status().as_u16() == 499
+            || response.status().as_u16() == 504
+            || response.status().as_u16() == 503;
+
+        CancellationTestResult {
+            completed: true,
+            cancelled_at_checkpoint: is_cancelled_response,
+            response: Some(response),
+            cancellation_point: None,
+        }
+    }
+
+    /// Tests that the handler completes normally without cancellation.
+    pub fn complete_normally(&self) -> CancellationTestResult {
+        let cx = asupersync::Cx::for_testing();
+        let ctx = RequestContext::new(cx, 1);
+        let mut request = Request::new(Method::Get, "/test");
+
+        let response = futures_executor::block_on(self.handler.call(&ctx, &mut request));
+
+        CancellationTestResult {
+            completed: true,
+            cancelled_at_checkpoint: false,
+            response: Some(response),
+            cancellation_point: None,
+        }
+    }
+
+    /// Tests handler behavior with a custom cancellation callback.
+    ///
+    /// The callback is called with the context and can decide when
+    /// to trigger cancellation based on custom logic.
+    pub fn test_with_cancel_callback<F>(
+        &self,
+        path: &str,
+        mut cancel_fn: F,
+    ) -> CancellationTestResult
+    where
+        F: FnMut(&RequestContext) -> bool,
+    {
+        let cx = asupersync::Cx::for_testing();
+        let ctx = RequestContext::new(cx, 1);
+
+        // Call the cancel callback
+        if cancel_fn(&ctx) {
+            ctx.cx().set_cancel_requested(true);
+        }
+
+        let mut request = Request::new(Method::Get, path);
+        let response = futures_executor::block_on(self.handler.call(&ctx, &mut request));
+
+        let is_cancelled = ctx.is_cancelled();
+        let is_cancelled_response =
+            response.status().as_u16() == 499 || response.status().as_u16() == 504;
+
+        CancellationTestResult {
+            completed: true,
+            cancelled_at_checkpoint: is_cancelled && is_cancelled_response,
+            response: Some(response),
+            cancellation_point: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2186,6 +2552,192 @@ mod tests {
 
         // Counter should only have been incremented once
         assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    // =========================================================================
+    // Lab Runtime Testing Utilities Tests
+    // =========================================================================
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact literals is safe
+    fn lab_test_config_defaults() {
+        let config = LabTestConfig::default();
+        assert_eq!(config.seed, 42);
+        assert!(!config.chaos_enabled);
+        assert_eq!(config.chaos_intensity, 0.0);
+        assert_eq!(config.max_steps, Some(10_000));
+        assert!(!config.capture_traces);
+    }
+
+    #[test]
+    fn lab_test_config_with_seed() {
+        let config = LabTestConfig::new(12345);
+        assert_eq!(config.seed, 12345);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact literals is safe
+    fn lab_test_config_light_chaos() {
+        let config = LabTestConfig::new(42).with_light_chaos();
+        assert!(config.chaos_enabled);
+        assert_eq!(config.chaos_intensity, 0.05);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact literals is safe
+    fn lab_test_config_heavy_chaos() {
+        let config = LabTestConfig::new(42).with_heavy_chaos();
+        assert!(config.chaos_enabled);
+        assert_eq!(config.chaos_intensity, 0.2);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact literals is safe
+    fn lab_test_config_custom_intensity() {
+        let config = LabTestConfig::new(42).with_chaos_intensity(0.15);
+        assert!(config.chaos_enabled);
+        assert_eq!(config.chaos_intensity, 0.15);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact literals is safe
+    fn lab_test_config_intensity_clamps() {
+        let config = LabTestConfig::new(42).with_chaos_intensity(1.5);
+        assert_eq!(config.chaos_intensity, 1.0);
+
+        let config = LabTestConfig::new(42).with_chaos_intensity(-0.5);
+        assert_eq!(config.chaos_intensity, 0.0);
+        assert!(!config.chaos_enabled);
+    }
+
+    #[test]
+    fn lab_test_config_max_steps() {
+        let config = LabTestConfig::new(42).with_max_steps(1000);
+        assert_eq!(config.max_steps, Some(1000));
+    }
+
+    #[test]
+    fn lab_test_config_no_step_limit() {
+        let config = LabTestConfig::new(42).without_step_limit();
+        assert_eq!(config.max_steps, None);
+    }
+
+    #[test]
+    fn lab_test_config_with_traces() {
+        let config = LabTestConfig::new(42).with_traces();
+        assert!(config.capture_traces);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Comparing exact 0.0 is safe
+    fn test_chaos_stats_empty() {
+        let stats = TestChaosStats::default();
+        assert_eq!(stats.decision_points, 0);
+        assert_eq!(stats.delays_injected, 0);
+        assert_eq!(stats.cancellations_injected, 0);
+        assert_eq!(stats.injection_rate(), 0.0);
+        assert!(!stats.had_chaos());
+    }
+
+    #[test]
+    fn test_chaos_stats_with_injections() {
+        let stats = TestChaosStats {
+            decision_points: 100,
+            delays_injected: 5,
+            cancellations_injected: 2,
+            steps_executed: 50,
+        };
+        assert!((stats.injection_rate() - 0.07).abs() < 0.001);
+        assert!(stats.had_chaos());
+    }
+
+    #[test]
+    fn mock_time_basic() {
+        let time = MockTime::new();
+        assert_eq!(time.now(), std::time::Duration::ZERO);
+        assert_eq!(time.elapsed(), std::time::Duration::ZERO);
+
+        time.advance(std::time::Duration::from_secs(5));
+        assert_eq!(time.now(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn mock_time_set_and_reset() {
+        let time = MockTime::new();
+        time.set(std::time::Duration::from_secs(100));
+        assert_eq!(time.now(), std::time::Duration::from_secs(100));
+
+        time.reset();
+        assert_eq!(time.now(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn mock_time_starting_at() {
+        let time = MockTime::starting_at(std::time::Duration::from_secs(10));
+        assert_eq!(time.now(), std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn cancellation_test_completes_normally() {
+        let test = CancellationTest::new(EchoHandler);
+        let result = test.complete_normally();
+
+        assert!(result.completed);
+        assert!(!result.cancelled_at_checkpoint);
+        assert!(result.response.is_some());
+        assert_eq!(result.response.as_ref().unwrap().status().as_u16(), 200);
+    }
+
+    #[test]
+    fn cancellation_test_respects_cancellation() {
+        // Handler that checks cancellation via checkpoint
+        struct CheckpointHandler;
+
+        impl Handler for CheckpointHandler {
+            fn call<'a>(
+                &'a self,
+                ctx: &'a RequestContext,
+                _req: &'a mut Request,
+            ) -> BoxFuture<'a, Response> {
+                Box::pin(async move {
+                    // Check for cancellation
+                    if ctx.checkpoint().is_err() {
+                        return Response::with_status(StatusCode::CLIENT_CLOSED_REQUEST);
+                    }
+                    Response::ok().body(ResponseBody::Bytes(b"OK".to_vec()))
+                })
+            }
+        }
+
+        let test = CancellationTest::new(CheckpointHandler);
+        let result = test.test_respects_cancellation();
+
+        assert!(result.completed);
+        assert!(result.cancelled_at_checkpoint);
+        assert!(result.response.is_some());
+        // Should return 499 (CLIENT_CLOSED_REQUEST) when cancelled
+        assert_eq!(result.response.as_ref().unwrap().status().as_u16(), 499);
+    }
+
+    #[test]
+    fn cancellation_test_result_helpers() {
+        let graceful = CancellationTestResult {
+            completed: false,
+            cancelled_at_checkpoint: true,
+            response: None,
+            cancellation_point: None,
+        };
+        assert!(graceful.gracefully_cancelled());
+        assert!(!graceful.completed_despite_cancel());
+
+        let completed = CancellationTestResult {
+            completed: true,
+            cancelled_at_checkpoint: false,
+            response: Some(Response::ok()),
+            cancellation_point: None,
+        };
+        assert!(!completed.gracefully_cancelled());
+        assert!(completed.completed_despite_cancel());
     }
 }
 

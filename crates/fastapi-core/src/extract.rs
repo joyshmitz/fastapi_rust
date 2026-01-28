@@ -6,7 +6,7 @@
 use crate::context::RequestContext;
 use crate::error::{HttpError, ValidationError, ValidationErrors};
 use crate::request::{Body, Request};
-use crate::response::IntoResponse;
+use crate::response::{IntoResponse, Response, ResponseBody};
 use serde::de::{
     self, DeserializeOwned, Deserializer, IntoDeserializer, MapAccess, SeqAccess, Visitor,
 };
@@ -181,6 +181,22 @@ impl<T> DerefMut for Json<T> {
     }
 }
 
+impl<T: serde::Serialize> IntoResponse for Json<T> {
+    fn into_response(self) -> Response {
+        match serde_json::to_vec(&self.0) {
+            Ok(bytes) => Response::ok()
+                .header("content-type", b"application/json".to_vec())
+                .body(ResponseBody::Bytes(bytes)),
+            Err(e) => {
+                // Serialization error - use ResponseValidationError for proper handling
+                // This ensures error details are logged but not exposed to clients
+                crate::error::ResponseValidationError::serialization_failed(e.to_string())
+                    .into_response()
+            }
+        }
+    }
+}
+
 /// Error returned when JSON extraction fails.
 #[derive(Debug)]
 pub enum JsonExtractError {
@@ -311,8 +327,10 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
             Body::Bytes(b) => b,
         };
 
-        // Check size limit (using default for now - could be made configurable)
-        let limit = DEFAULT_JSON_LIMIT;
+        // Check size limit using the configured limit from RequestContext.
+        // This respects both app-level config (AppConfig.max_body_size) and
+        // per-route overrides when available.
+        let limit = ctx.max_body_size();
         if bytes.len() > limit {
             return Err(JsonExtractError::PayloadTooLarge {
                 size: bytes.len(),
@@ -3866,12 +3884,79 @@ impl ResponseMutations {
 
         // Add Set-Cookie headers to delete cookies
         for name in self.delete_cookies {
-            let delete_cookie = format!("{}=; Max-Age=0; Path=/", name);
+            // Sanitize the cookie name to prevent injection
+            let sanitized_name = sanitize_cookie_token(&name);
+            let delete_cookie = format!("{}=; Max-Age=0; Path=/", sanitized_name);
             response = response.header("Set-Cookie", delete_cookie.into_bytes());
         }
 
         response
     }
+}
+
+// ============================================================================
+// Cookie Sanitization Helpers
+// ============================================================================
+
+/// Sanitize a cookie name to prevent injection attacks.
+///
+/// RFC 6265 specifies that cookie-name must be a valid HTTP token.
+/// This removes control characters and separators that could be misinterpreted.
+fn sanitize_cookie_token(name: &str) -> String {
+    name.chars()
+        .filter(|&c| {
+            // Token characters per RFC 7230: any VCHAR except delimiters
+            // Delimiters: "(),/:;<=>?@[\]{} and control chars
+            c.is_ascii()
+                && !c.is_ascii_control()
+                && c != ' '
+                && c != '"'
+                && c != '('
+                && c != ')'
+                && c != ','
+                && c != '/'
+                && c != ':'
+                && c != ';'
+                && c != '<'
+                && c != '='
+                && c != '>'
+                && c != '?'
+                && c != '@'
+                && c != '['
+                && c != '\\'
+                && c != ']'
+                && c != '{'
+                && c != '}'
+        })
+        .collect()
+}
+
+/// Sanitize a cookie value to prevent injection attacks.
+///
+/// RFC 6265 specifies that cookie-value excludes CTLs, whitespace,
+/// DQUOTE, comma, semicolon, and backslash (unless using quoted form).
+fn sanitize_cookie_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&c| {
+            c.is_ascii()
+                && !c.is_ascii_control()
+                && c != ' '
+                && c != '"'
+                && c != ','
+                && c != ';'
+                && c != '\\'
+        })
+        .collect()
+}
+
+/// Sanitize a cookie attribute value (path, domain) to prevent injection.
+///
+/// Removes characters that could be interpreted as attribute delimiters.
+fn sanitize_cookie_attr(attr: &str) -> String {
+    attr.chars()
+        .filter(|&c| c != ';' && c != '\r' && c != '\n' && c != '\0')
+        .collect()
 }
 
 /// A cookie to set in the response.
@@ -3954,18 +4039,36 @@ impl Cookie {
     }
 
     /// Convert to Set-Cookie header value.
+    ///
+    /// # Security
+    ///
+    /// Cookie names, values, and attribute values are sanitized to prevent
+    /// attribute injection attacks. Characters that could be interpreted as
+    /// attribute delimiters (`;`, `\r`, `\n`, `\0`) are removed.
     #[must_use]
     pub fn to_header_value(&self) -> String {
-        let mut parts = vec![format!("{}={}", self.name, self.value)];
+        // Sanitize cookie name: remove any characters that aren't valid tokens
+        // RFC 6265: cookie-name = token (excludes CTLs, separators)
+        let sanitized_name = sanitize_cookie_token(&self.name);
+
+        // Sanitize cookie value: remove characters that could inject attributes
+        // RFC 6265: cookie-value excludes CTLs, whitespace, DQUOTE, comma, semicolon, backslash
+        let sanitized_value = sanitize_cookie_value(&self.value);
+
+        let mut parts = vec![format!("{}={}", sanitized_name, sanitized_value)];
 
         if let Some(max_age) = self.max_age {
             parts.push(format!("Max-Age={}", max_age));
         }
         if let Some(ref path) = self.path {
-            parts.push(format!("Path={}", path));
+            // Sanitize path to prevent attribute injection
+            let sanitized_path = sanitize_cookie_attr(path);
+            parts.push(format!("Path={}", sanitized_path));
         }
         if let Some(ref domain) = self.domain {
-            parts.push(format!("Domain={}", domain));
+            // Sanitize domain to prevent attribute injection
+            let sanitized_domain = sanitize_cookie_attr(domain);
+            parts.push(format!("Domain={}", sanitized_domain));
         }
         if self.secure {
             parts.push("Secure".to_string());
@@ -4285,6 +4388,297 @@ impl SameSite {
         }
     }
 }
+
+// ============================================================================
+// Cookie Request Extractors
+// ============================================================================
+
+/// Extract all cookies from the incoming request as a map.
+///
+/// Parses the `Cookie` header and provides access to all cookies by name.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::RequestCookies;
+///
+/// async fn handler(cookies: RequestCookies) -> impl IntoResponse {
+///     if let Some(session_id) = cookies.get("session_id") {
+///         format!("Session: {}", session_id)
+///     } else {
+///         "No session".to_string()
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RequestCookies {
+    cookies: std::collections::HashMap<String, String>,
+}
+
+impl RequestCookies {
+    /// Create an empty cookie collection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse cookies from a Cookie header value.
+    #[must_use]
+    pub fn from_header(header_value: &str) -> Self {
+        let mut cookies = std::collections::HashMap::new();
+
+        // Cookie header format: "name1=value1; name2=value2"
+        for pair in header_value.split(';') {
+            let pair = pair.trim();
+            if let Some((name, value)) = pair.split_once('=') {
+                let name = name.trim().to_string();
+                let value = value.trim().to_string();
+                if !name.is_empty() {
+                    cookies.insert(name, value);
+                }
+            }
+        }
+
+        Self { cookies }
+    }
+
+    /// Get a cookie value by name.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.cookies.get(name).map(String::as_str)
+    }
+
+    /// Check if a cookie exists.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.cookies.contains_key(name)
+    }
+
+    /// Get the number of cookies.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cookies.len()
+    }
+
+    /// Check if there are no cookies.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
+    }
+
+    /// Iterate over all cookie name-value pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.cookies.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Get all cookie names.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.cookies.keys().map(String::as_str)
+    }
+}
+
+impl FromRequest for RequestCookies {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let cookies = req
+            .headers()
+            .get("cookie")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(Self::from_header)
+            .unwrap_or_default();
+
+        Ok(cookies)
+    }
+}
+
+/// Extract a single cookie value by name from the incoming request.
+///
+/// The cookie name is specified via the `CookieName` trait, similar to how
+/// `Header<T>` works with `HeaderName`.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::{RequestCookie, CookieName};
+///
+/// // Define a cookie name
+/// struct SessionId;
+/// impl CookieName for SessionId {
+///     const NAME: &'static str = "session_id";
+/// }
+///
+/// async fn handler(session: RequestCookie<SessionId>) -> impl IntoResponse {
+///     format!("Session: {}", session.value())
+/// }
+///
+/// // For optional cookies:
+/// async fn optional_handler(session: Option<RequestCookie<SessionId>>) -> impl IntoResponse {
+///     match session {
+///         Some(s) => format!("Session: {}", s.value()),
+///         None => "No session".to_string(),
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct RequestCookie<T> {
+    value: String,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> RequestCookie<T> {
+    /// Create a new cookie extractor with the given value.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Get the cookie value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Consume and return the cookie value.
+    #[must_use]
+    pub fn into_value(self) -> String {
+        self.value
+    }
+}
+
+impl<T> Deref for RequestCookie<T> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> AsRef<str> for RequestCookie<T> {
+    fn as_ref(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Trait for defining cookie names used with `RequestCookie<T>`.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::CookieName;
+///
+/// struct SessionId;
+/// impl CookieName for SessionId {
+///     const NAME: &'static str = "session_id";
+/// }
+/// ```
+pub trait CookieName {
+    /// The cookie name to extract.
+    const NAME: &'static str;
+}
+
+/// Error type for cookie extraction failures.
+#[derive(Debug)]
+pub enum CookieExtractError {
+    /// The requested cookie was not found.
+    NotFound {
+        /// The name of the missing cookie.
+        name: &'static str,
+    },
+    /// The cookie value could not be parsed.
+    InvalidValue {
+        /// The cookie name.
+        name: &'static str,
+        /// The raw value that couldn't be parsed.
+        value: String,
+        /// Description of the expected format.
+        expected: &'static str,
+    },
+}
+
+impl fmt::Display for CookieExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound { name } => {
+                write!(f, "Cookie '{}' not found", name)
+            }
+            Self::InvalidValue {
+                name,
+                value,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "Invalid cookie '{}' value '{}': expected {}",
+                    name, value, expected
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CookieExtractError {}
+
+impl IntoResponse for CookieExtractError {
+    fn into_response(self) -> crate::response::Response {
+        match self {
+            Self::NotFound { name } => ValidationErrors::single(
+                ValidationError::missing(crate::error::loc::cookie(name))
+                    .with_msg("Cookie is required"),
+            )
+            .into_response(),
+            Self::InvalidValue {
+                name,
+                value,
+                expected,
+            } => ValidationErrors::single(
+                ValidationError::type_error(crate::error::loc::cookie(name), expected)
+                    .with_msg(format!("Expected {expected}"))
+                    .with_input(serde_json::Value::String(value)),
+            )
+            .into_response(),
+        }
+    }
+}
+
+impl<T: CookieName> FromRequest for RequestCookie<T> {
+    type Error = CookieExtractError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let cookies = req
+            .headers()
+            .get("cookie")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(RequestCookies::from_header)
+            .unwrap_or_default();
+
+        cookies
+            .get(T::NAME)
+            .map(|v| RequestCookie::new(v))
+            .ok_or(CookieExtractError::NotFound { name: T::NAME })
+    }
+}
+
+// Common cookie name types for convenience
+
+/// Session ID cookie name marker.
+pub struct SessionIdCookie;
+impl CookieName for SessionIdCookie {
+    const NAME: &'static str = "session_id";
+}
+
+/// CSRF token cookie name marker.
+pub struct CsrfTokenCookie;
+impl CookieName for CsrfTokenCookie {
+    const NAME: &'static str = "csrf_token";
+}
+
+// ============================================================================
+// Response Mutation Extractor
+// ============================================================================
 
 /// Mutable response wrapper for setting headers and cookies.
 ///
@@ -4686,6 +5080,87 @@ mod special_extractor_tests {
     }
 
     // =========================================================================
+    // Cookie Sanitization Security Tests
+    // =========================================================================
+
+    #[test]
+    fn cookie_sanitizes_semicolon_injection_in_value() {
+        // Attacker tries to inject Domain attribute via value
+        let cookie = Cookie::new("session", "abc; Domain=.evil.com");
+        let header = cookie.to_header_value();
+        // Semicolon should be removed, preventing attribute injection
+        assert_eq!(header, "session=abcDomain=.evil.com");
+        assert!(!header.contains("; Domain"));
+    }
+
+    #[test]
+    fn cookie_sanitizes_semicolon_injection_in_name() {
+        // Attacker tries to inject via cookie name
+        let cookie = Cookie::new("session; HttpOnly", "value");
+        let header = cookie.to_header_value();
+        // Semicolon should be removed from name
+        assert!(!header.starts_with("session; "));
+        assert!(header.starts_with("sessionHttpOnly="));
+    }
+
+    #[test]
+    fn cookie_sanitizes_path_injection() {
+        // Attacker tries to inject attributes via path
+        let cookie = Cookie::new("session", "abc").path("/; HttpOnly; Domain=.evil.com");
+        let header = cookie.to_header_value();
+        // Semicolons should be removed from path, preventing attribute injection
+        // The path becomes "/HttpOnlyDomain=.evil.com" (gibberish but safe)
+        assert!(!header.contains("; Domain"));
+        assert!(!header.contains("; HttpOnly"));
+        // Verify path is present but sanitized (no semicolons)
+        assert!(header.contains("Path=/"));
+    }
+
+    #[test]
+    fn cookie_sanitizes_domain_injection() {
+        // Attacker tries to inject attributes via domain
+        let cookie = Cookie::new("session", "abc").domain(".example.com; HttpOnly=false");
+        let header = cookie.to_header_value();
+        // Semicolons should be removed from domain, preventing attribute injection
+        assert!(!header.contains("; HttpOnly=false"));
+        // Domain is sanitized (semicolon removed), but space is preserved in attr values
+        assert!(header.contains("Domain=.example.com HttpOnly=false"));
+    }
+
+    #[test]
+    fn cookie_sanitizes_control_characters() {
+        // Attacker tries CRLF injection
+        let cookie = Cookie::new("session", "abc\r\nSet-Cookie: evil=value");
+        let header = cookie.to_header_value();
+        // Control characters and spaces should be removed
+        assert!(!header.contains("\r"));
+        assert!(!header.contains("\n"));
+        assert!(!header.contains(" ")); // Space is also removed from cookie values
+        // The sanitized value is "abcSet-Cookie:evil=value" (no CRLF injection possible)
+        assert!(header.contains("session=abcSet-Cookie:evil=value"));
+    }
+
+    #[test]
+    fn delete_cookie_sanitizes_name() {
+        // Attacker tries to inject via delete cookie name
+        let mut mutations = ResponseMutations::new();
+        mutations.remove_cookie("session; Domain=.evil.com");
+
+        let response = crate::response::Response::ok();
+        let response = mutations.apply(response);
+
+        let headers = response.headers();
+        let set_cookie = headers
+            .iter()
+            .find(|(n, _)| n == "Set-Cookie")
+            .map(|(_, v)| String::from_utf8_lossy(v).to_string());
+        assert!(set_cookie.is_some());
+        let cookie_header = set_cookie.unwrap();
+        // Semicolon should be removed, no Domain attribute injected
+        assert!(!cookie_header.contains("; Domain"));
+    }
+
+    // =========================================================================
     // Secure Cookie Configuration Helper Tests
     // =========================================================================
 
@@ -4853,6 +5328,170 @@ mod special_extractor_tests {
         assert!(header.contains("Path=/"));
         assert!(header.contains("HttpOnly"));
         assert!(header.contains("SameSite=Strict"));
+    }
+
+    // =========================================================================
+    // Request Cookie Extractor Tests
+    // =========================================================================
+
+    #[test]
+    fn request_cookies_parses_single_cookie() {
+        let cookies = RequestCookies::from_header("session_id=abc123");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies.get("session_id"), Some("abc123"));
+    }
+
+    #[test]
+    fn request_cookies_parses_multiple_cookies() {
+        let cookies = RequestCookies::from_header("session_id=abc123; user=bob; theme=dark");
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies.get("session_id"), Some("abc123"));
+        assert_eq!(cookies.get("user"), Some("bob"));
+        assert_eq!(cookies.get("theme"), Some("dark"));
+    }
+
+    #[test]
+    fn request_cookies_handles_whitespace() {
+        let cookies = RequestCookies::from_header("  session_id = abc123 ;  user=bob  ");
+        assert_eq!(cookies.get("session_id"), Some("abc123"));
+        assert_eq!(cookies.get("user"), Some("bob"));
+    }
+
+    #[test]
+    fn request_cookies_handles_empty_header() {
+        let cookies = RequestCookies::from_header("");
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn request_cookies_handles_malformed_pairs() {
+        // Malformed pairs without = should be skipped
+        let cookies = RequestCookies::from_header("valid=value; malformed; another=good");
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies.get("valid"), Some("value"));
+        assert_eq!(cookies.get("another"), Some("good"));
+        assert!(!cookies.contains("malformed"));
+    }
+
+    #[test]
+    fn request_cookies_contains_check() {
+        let cookies = RequestCookies::from_header("session=abc");
+        assert!(cookies.contains("session"));
+        assert!(!cookies.contains("missing"));
+    }
+
+    #[test]
+    fn request_cookies_iter() {
+        let cookies = RequestCookies::from_header("a=1; b=2");
+        let pairs: Vec<_> = cookies.iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("a", "1")));
+        assert!(pairs.contains(&("b", "2")));
+    }
+
+    #[test]
+    fn request_cookies_from_request() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut()
+            .insert("cookie", b"session=xyz; user=alice".to_vec());
+
+        let result = futures_executor::block_on(RequestCookies::from_request(&ctx, &mut req));
+        let cookies = result.unwrap();
+        assert_eq!(cookies.get("session"), Some("xyz"));
+        assert_eq!(cookies.get("user"), Some("alice"));
+    }
+
+    #[test]
+    fn request_cookies_from_request_no_cookie_header() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+
+        let result = futures_executor::block_on(RequestCookies::from_request(&ctx, &mut req));
+        let cookies = result.unwrap();
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn request_cookie_extractor_found() {
+        struct TestCookie;
+        impl CookieName for TestCookie {
+            const NAME: &'static str = "test_cookie";
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut()
+            .insert("cookie", b"test_cookie=hello_world".to_vec());
+
+        let result =
+            futures_executor::block_on(RequestCookie::<TestCookie>::from_request(&ctx, &mut req));
+        let cookie = result.unwrap();
+        assert_eq!(cookie.value(), "hello_world");
+    }
+
+    #[test]
+    fn request_cookie_extractor_not_found() {
+        struct MissingCookie;
+        impl CookieName for MissingCookie {
+            const NAME: &'static str = "missing";
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut().insert("cookie", b"other=value".to_vec());
+
+        let result = futures_executor::block_on(RequestCookie::<MissingCookie>::from_request(
+            &ctx, &mut req,
+        ));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            CookieExtractError::NotFound { name: "missing" }
+        ));
+    }
+
+    #[test]
+    fn request_cookie_deref() {
+        struct TestCookie;
+        impl CookieName for TestCookie {
+            const NAME: &'static str = "test";
+        }
+
+        let cookie = RequestCookie::<TestCookie>::new("test_value");
+        // Test Deref to str
+        assert_eq!(&*cookie, "test_value");
+        // Test AsRef
+        assert_eq!(cookie.as_ref(), "test_value");
+    }
+
+    #[test]
+    fn session_id_cookie_marker() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut()
+            .insert("cookie", b"session_id=sess123".to_vec());
+
+        let result = futures_executor::block_on(RequestCookie::<SessionIdCookie>::from_request(
+            &ctx, &mut req,
+        ));
+        let cookie = result.unwrap();
+        assert_eq!(cookie.value(), "sess123");
+    }
+
+    #[test]
+    fn csrf_token_cookie_marker() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+        req.headers_mut()
+            .insert("cookie", b"csrf_token=csrf_abc".to_vec());
+
+        let result = futures_executor::block_on(RequestCookie::<CsrfTokenCookie>::from_request(
+            &ctx, &mut req,
+        ));
+        let cookie = result.unwrap();
+        assert_eq!(cookie.value(), "csrf_abc");
     }
 }
 
@@ -10330,5 +10969,113 @@ mod security_tests {
         let Json(data) = result.unwrap();
         assert_eq!(data.big_int, 9007199254740993_i64);
         assert!((data.float_val - std::f64::consts::PI).abs() < 0.0000001);
+    }
+
+    // =========================================================================
+    // Json<T> IntoResponse tests
+    // =========================================================================
+
+    #[test]
+    fn json_into_response_serializes_struct() {
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct User {
+            name: String,
+            age: u32,
+        }
+
+        let user = User {
+            name: "Alice".to_string(),
+            age: 30,
+        };
+        let json = Json(user);
+        let response = json.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        // Check content-type header
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string());
+        assert_eq!(content_type, Some("application/json".to_string()));
+
+        // Check body content
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed["name"], "Alice");
+            assert_eq!(parsed["age"], 30);
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn json_into_response_serializes_primitive() {
+        let json = Json(42i32);
+        let response = json.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: i32 = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed, 42);
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn json_into_response_serializes_array() {
+        let json = Json(vec!["a", "b", "c"]);
+        let response = json.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: Vec<String> = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed, vec!["a", "b", "c"]);
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn json_into_response_serializes_hashmap() {
+        use std::collections::HashMap;
+
+        let mut map = HashMap::new();
+        map.insert("key1", "value1");
+        map.insert("key2", "value2");
+
+        let json = Json(map);
+        let response = json.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: HashMap<String, String> = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed.get("key1"), Some(&"value1".to_string()));
+            assert_eq!(parsed.get("key2"), Some(&"value2".to_string()));
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn json_into_response_handles_null() {
+        let json = Json(Option::<String>::None);
+        let response = json.into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let content = String::from_utf8_lossy(bytes);
+            assert_eq!(content, "null");
+        } else {
+            panic!("Expected Bytes body");
+        }
     }
 }

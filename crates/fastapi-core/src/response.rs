@@ -178,6 +178,35 @@ impl fmt::Debug for ResponseBody {
     }
 }
 
+// ============================================================================
+// Header Validation (CRLF Injection Prevention)
+// ============================================================================
+
+/// Check if a header name contains only valid HTTP token characters.
+///
+/// Valid token characters per RFC 7230:
+/// `!#$%&'*+-.0-9A-Z^_`a-z|~`
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(b,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
+                b'0'..=b'9' | b'A'..=b'Z' | b'^' | b'_' | b'`' | b'a'..=b'z' | b'|' | b'~'
+            )
+        })
+}
+
+/// Sanitize a header value to prevent CRLF injection attacks.
+///
+/// Removes CR (\r) and LF (\n) characters which could be used to inject
+/// additional headers. Also removes null bytes.
+fn sanitize_header_value(value: Vec<u8>) -> Vec<u8> {
+    value
+        .into_iter()
+        .filter(|&b| b != b'\r' && b != b'\n' && b != 0)
+        .collect()
+}
+
 /// HTTP response.
 #[derive(Debug)]
 pub struct Response {
@@ -222,9 +251,27 @@ impl Response {
     }
 
     /// Add a header.
+    ///
+    /// # Security
+    ///
+    /// Header names are validated to contain only valid token characters.
+    /// Header values are sanitized to prevent CRLF injection attacks.
+    /// Invalid characters in names will cause the header to be silently dropped.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        let name = name.into();
+        let value = value.into();
+
+        // Validate header name (must be valid HTTP token)
+        if !is_valid_header_name(&name) {
+            // Silently drop invalid headers to prevent injection
+            return self;
+        }
+
+        // Sanitize header value (remove CRLF to prevent injection)
+        let sanitized_value = sanitize_header_value(value);
+
+        self.headers.push((name, sanitized_value));
         self
     }
 
@@ -570,6 +617,100 @@ impl IntoResponse for NoContent {
     }
 }
 
+/// Binary response with `application/octet-stream` content type.
+///
+/// Use this for raw binary data that doesn't have a specific MIME type.
+///
+/// # Examples
+///
+/// ```
+/// use fastapi_core::Binary;
+///
+/// let data = vec![0x00, 0x01, 0x02, 0x03];
+/// let response = Binary::new(data);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Binary(Vec<u8>);
+
+impl Binary {
+    /// Create a new binary response.
+    #[must_use]
+    pub fn new(data: impl Into<Vec<u8>>) -> Self {
+        Self(data.into())
+    }
+
+    /// Get the binary data.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Create with a specific content type override.
+    #[must_use]
+    pub fn with_content_type(self, content_type: &str) -> BinaryWithType {
+        BinaryWithType {
+            data: self.0,
+            content_type: content_type.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for Binary {
+    fn into_response(self) -> Response {
+        Response::ok()
+            .header("content-type", b"application/octet-stream".to_vec())
+            .body(ResponseBody::Bytes(self.0))
+    }
+}
+
+impl From<Vec<u8>> for Binary {
+    fn from(data: Vec<u8>) -> Self {
+        Self::new(data)
+    }
+}
+
+impl From<&[u8]> for Binary {
+    fn from(data: &[u8]) -> Self {
+        Self::new(data.to_vec())
+    }
+}
+
+/// Binary response with a custom content type.
+///
+/// # Examples
+///
+/// ```
+/// use fastapi_core::Binary;
+///
+/// let pdf_data = vec![0x25, 0x50, 0x44, 0x46]; // PDF magic bytes
+/// let response = Binary::new(pdf_data).with_content_type("application/pdf");
+/// ```
+#[derive(Debug, Clone)]
+pub struct BinaryWithType {
+    data: Vec<u8>,
+    content_type: String,
+}
+
+impl BinaryWithType {
+    /// Get a reference to the underlying data.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get the content type.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+}
+
+impl IntoResponse for BinaryWithType {
+    fn into_response(self) -> Response {
+        Response::ok()
+            .header("content-type", self.content_type.into_bytes())
+            .body(ResponseBody::Bytes(self.data))
+    }
+}
+
 /// File response for serving files.
 ///
 /// Supports:
@@ -805,6 +946,298 @@ fn cancelled_to_response(reason: &CancelReason) -> Response {
         _ => StatusCode::CLIENT_CLOSED_REQUEST,
     };
     Response::with_status(status)
+}
+
+// ============================================================================
+// Response Model Configuration
+// ============================================================================
+
+/// Configuration for response model serialization.
+///
+/// This provides FastAPI-compatible options for controlling how response
+/// data is serialized and validated before sending to clients.
+///
+/// # Examples
+///
+/// ```
+/// use fastapi_core::ResponseModelConfig;
+/// use std::collections::HashSet;
+///
+/// // Only include specific fields
+/// let config = ResponseModelConfig::new()
+///     .include(["id", "name", "email"].into_iter().map(String::from).collect());
+///
+/// // Exclude sensitive fields
+/// let config = ResponseModelConfig::new()
+///     .exclude(["password", "internal_notes"].into_iter().map(String::from).collect());
+///
+/// // Use field aliases in output
+/// let config = ResponseModelConfig::new()
+///     .by_alias(true);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // Mirrors FastAPI's response_model options
+pub struct ResponseModelConfig {
+    /// Only include these fields in the response.
+    /// If None, all fields are included (subject to exclude).
+    pub include: Option<std::collections::HashSet<String>>,
+
+    /// Exclude these fields from the response.
+    pub exclude: Option<std::collections::HashSet<String>>,
+
+    /// Use serde aliases in output field names.
+    pub by_alias: bool,
+
+    /// Exclude fields that were not explicitly set.
+    /// Requires the type to track which fields were set.
+    pub exclude_unset: bool,
+
+    /// Exclude fields that have their default values.
+    pub exclude_defaults: bool,
+
+    /// Exclude fields with None values.
+    pub exclude_none: bool,
+}
+
+impl ResponseModelConfig {
+    /// Create a new configuration with defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set fields to include (whitelist).
+    #[must_use]
+    pub fn include(mut self, fields: std::collections::HashSet<String>) -> Self {
+        self.include = Some(fields);
+        self
+    }
+
+    /// Set fields to exclude (blacklist).
+    #[must_use]
+    pub fn exclude(mut self, fields: std::collections::HashSet<String>) -> Self {
+        self.exclude = Some(fields);
+        self
+    }
+
+    /// Use serde aliases in output.
+    ///
+    /// **Note:** This option is stored but not yet implemented in `filter_json`.
+    /// Full implementation requires compile-time serde attribute introspection.
+    #[must_use]
+    pub fn by_alias(mut self, value: bool) -> Self {
+        self.by_alias = value;
+        self
+    }
+
+    /// Exclude unset fields.
+    ///
+    /// **Note:** This option is stored but not yet implemented in `filter_json`.
+    /// Full implementation requires the type to track which fields were explicitly set.
+    #[must_use]
+    pub fn exclude_unset(mut self, value: bool) -> Self {
+        self.exclude_unset = value;
+        self
+    }
+
+    /// Exclude fields with default values.
+    ///
+    /// **Note:** This option is stored but not yet implemented in `filter_json`.
+    /// Full implementation requires compile-time default value comparison.
+    #[must_use]
+    pub fn exclude_defaults(mut self, value: bool) -> Self {
+        self.exclude_defaults = value;
+        self
+    }
+
+    /// Exclude fields with None values.
+    #[must_use]
+    pub fn exclude_none(mut self, value: bool) -> Self {
+        self.exclude_none = value;
+        self
+    }
+
+    /// Check if any filtering is configured.
+    #[must_use]
+    pub fn has_filtering(&self) -> bool {
+        self.include.is_some()
+            || self.exclude.is_some()
+            || self.exclude_none
+            || self.exclude_unset
+            || self.exclude_defaults
+    }
+
+    /// Apply filtering to a JSON value.
+    ///
+    /// This filters the JSON according to the configuration:
+    /// - Applies include whitelist
+    /// - Applies exclude blacklist
+    /// - Removes None values if exclude_none is set
+    #[must_use]
+    pub fn filter_json(&self, mut value: serde_json::Value) -> serde_json::Value {
+        if let serde_json::Value::Object(ref mut map) = value {
+            // Apply include whitelist
+            if let Some(ref include_set) = self.include {
+                map.retain(|key, _| include_set.contains(key));
+            }
+
+            // Apply exclude blacklist
+            if let Some(ref exclude_set) = self.exclude {
+                map.retain(|key, _| !exclude_set.contains(key));
+            }
+
+            // Remove None values if configured
+            if self.exclude_none {
+                map.retain(|_, v| !v.is_null());
+            }
+        }
+
+        value
+    }
+}
+
+/// Trait for types that can be validated as response models.
+///
+/// This allows custom validation logic to be applied before serialization.
+/// Types implementing this trait can verify that the response data is valid
+/// according to the declared response model.
+pub trait ResponseModel: Serialize {
+    /// Validate the response model before serialization.
+    ///
+    /// Returns Ok(()) if valid, or a validation error if invalid.
+    #[allow(clippy::result_large_err)] // Error provides detailed validation context
+    fn validate(&self) -> Result<(), crate::error::ResponseValidationError> {
+        // Default implementation: no validation
+        Ok(())
+    }
+
+    /// Get the model name for error messages.
+    fn model_name() -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+// Blanket implementation for all Serialize types
+impl<T: Serialize> ResponseModel for T {}
+
+/// A validated response with its configuration.
+///
+/// This wraps a response value with its model configuration, ensuring
+/// the response is validated and filtered before sending.
+///
+/// # Examples
+///
+/// ```
+/// use fastapi_core::{ValidatedResponse, ResponseModelConfig};
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct User {
+///     id: i64,
+///     name: String,
+///     email: String,
+///     password_hash: String,
+/// }
+///
+/// let user = User {
+///     id: 1,
+///     name: "Alice".to_string(),
+///     email: "alice@example.com".to_string(),
+///     password_hash: "secret123".to_string(),
+/// };
+///
+/// // Create a validated response that excludes the password
+/// let response = ValidatedResponse::new(user)
+///     .with_config(ResponseModelConfig::new()
+///         .exclude(["password_hash"].into_iter().map(String::from).collect()));
+/// ```
+#[derive(Debug)]
+pub struct ValidatedResponse<T> {
+    /// The response value.
+    pub value: T,
+    /// The serialization configuration.
+    pub config: ResponseModelConfig,
+}
+
+impl<T> ValidatedResponse<T> {
+    /// Create a new validated response.
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            config: ResponseModelConfig::default(),
+        }
+    }
+
+    /// Set the serialization configuration.
+    #[must_use]
+    pub fn with_config(mut self, config: ResponseModelConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+impl<T: Serialize + ResponseModel> IntoResponse for ValidatedResponse<T> {
+    fn into_response(self) -> Response {
+        // First validate the response model
+        if let Err(error) = self.value.validate() {
+            return error.into_response();
+        }
+
+        // Serialize to JSON
+        let json_value = match serde_json::to_value(&self.value) {
+            Ok(v) => v,
+            Err(e) => {
+                // Serialization failed - return 500
+                let error =
+                    crate::error::ResponseValidationError::serialization_failed(e.to_string());
+                return error.into_response();
+            }
+        };
+
+        // Apply filtering
+        let filtered = self.config.filter_json(json_value);
+
+        // Serialize the filtered value
+        let bytes = match serde_json::to_vec(&filtered) {
+            Ok(b) => b,
+            Err(e) => {
+                let error =
+                    crate::error::ResponseValidationError::serialization_failed(e.to_string());
+                return error.into_response();
+            }
+        };
+
+        Response::ok()
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(bytes))
+    }
+}
+
+/// Macro helper for creating validated responses with field exclusion.
+///
+/// This is a convenience wrapper that excludes specified fields from the response.
+#[must_use]
+pub fn exclude_fields<T: Serialize + ResponseModel>(
+    value: T,
+    fields: &[&str],
+) -> ValidatedResponse<T> {
+    ValidatedResponse::new(value).with_config(
+        ResponseModelConfig::new().exclude(fields.iter().map(|s| (*s).to_string()).collect()),
+    )
+}
+
+/// Macro helper for creating validated responses with field inclusion.
+///
+/// This is a convenience wrapper that only includes specified fields in the response.
+#[must_use]
+pub fn include_fields<T: Serialize + ResponseModel>(
+    value: T,
+    fields: &[&str],
+) -> ValidatedResponse<T> {
+    ValidatedResponse::new(value).with_config(
+        ResponseModelConfig::new().include(fields.iter().map(|s| (*s).to_string()).collect()),
+    )
 }
 
 #[cfg(test)]
@@ -1209,5 +1642,480 @@ mod tests {
                 .iter()
                 .any(|h| h.contains("old_session=") && h.contains("Max-Age=0"))
         );
+    }
+
+    // =========================================================================
+    // Binary tests
+    // =========================================================================
+
+    #[test]
+    fn binary_new_creates_from_vec() {
+        let data = vec![0x01, 0x02, 0x03, 0x04];
+        let binary = Binary::new(data.clone());
+        assert_eq!(binary.data(), &data[..]);
+    }
+
+    #[test]
+    fn binary_new_creates_from_slice() {
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+        let binary = Binary::new(&data[..]);
+        assert_eq!(binary.data(), &data);
+    }
+
+    #[test]
+    fn binary_into_response_has_correct_content_type() {
+        let binary = Binary::new(vec![1, 2, 3]);
+        let response = binary.into_response();
+
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string());
+
+        assert_eq!(content_type, Some("application/octet-stream".to_string()));
+    }
+
+    #[test]
+    fn binary_into_response_has_status_200() {
+        let binary = Binary::new(vec![1, 2, 3]);
+        let response = binary.into_response();
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn binary_into_response_has_correct_body() {
+        let data = vec![0x48, 0x65, 0x6C, 0x6C, 0x6F]; // "Hello" in bytes
+        let binary = Binary::new(data.clone());
+        let response = binary.into_response();
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            assert_eq!(bytes, &data);
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn binary_with_content_type_returns_binary_with_type() {
+        let data = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic bytes
+        let binary = Binary::new(data);
+        let binary_typed = binary.with_content_type("image/png");
+
+        assert_eq!(binary_typed.content_type(), "image/png");
+    }
+
+    #[test]
+    fn binary_with_type_into_response_has_correct_content_type() {
+        let data = vec![0xFF, 0xD8, 0xFF]; // JPEG magic bytes
+        let binary = Binary::new(data).with_content_type("image/jpeg");
+        let response = binary.into_response();
+
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string());
+
+        assert_eq!(content_type, Some("image/jpeg".to_string()));
+    }
+
+    #[test]
+    fn binary_with_type_into_response_has_correct_body() {
+        let data = vec![0x25, 0x50, 0x44, 0x46]; // PDF magic bytes
+        let binary = Binary::new(data.clone()).with_content_type("application/pdf");
+        let response = binary.into_response();
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            assert_eq!(bytes, &data);
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn binary_with_type_data_accessor() {
+        let data = vec![1, 2, 3, 4, 5];
+        let binary = Binary::new(data.clone()).with_content_type("application/custom");
+        assert_eq!(binary.data(), &data[..]);
+    }
+
+    #[test]
+    fn binary_with_type_status_200() {
+        let binary = Binary::new(vec![0]).with_content_type("text/plain");
+        let response = binary.into_response();
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    // =========================================================================
+    // ResponseModelConfig tests
+    // =========================================================================
+
+    #[test]
+    fn response_model_config_default() {
+        let config = ResponseModelConfig::new();
+        assert!(config.include.is_none());
+        assert!(config.exclude.is_none());
+        assert!(!config.by_alias);
+        assert!(!config.exclude_unset);
+        assert!(!config.exclude_defaults);
+        assert!(!config.exclude_none);
+    }
+
+    #[test]
+    fn response_model_config_include() {
+        let fields: std::collections::HashSet<String> =
+            ["id", "name"].iter().map(|s| (*s).to_string()).collect();
+        let config = ResponseModelConfig::new().include(fields.clone());
+        assert_eq!(config.include, Some(fields));
+    }
+
+    #[test]
+    fn response_model_config_exclude() {
+        let fields: std::collections::HashSet<String> =
+            ["password"].iter().map(|s| (*s).to_string()).collect();
+        let config = ResponseModelConfig::new().exclude(fields.clone());
+        assert_eq!(config.exclude, Some(fields));
+    }
+
+    #[test]
+    fn response_model_config_by_alias() {
+        let config = ResponseModelConfig::new().by_alias(true);
+        assert!(config.by_alias);
+    }
+
+    #[test]
+    fn response_model_config_exclude_none() {
+        let config = ResponseModelConfig::new().exclude_none(true);
+        assert!(config.exclude_none);
+    }
+
+    #[test]
+    fn response_model_config_exclude_unset() {
+        let config = ResponseModelConfig::new().exclude_unset(true);
+        assert!(config.exclude_unset);
+    }
+
+    #[test]
+    fn response_model_config_exclude_defaults() {
+        let config = ResponseModelConfig::new().exclude_defaults(true);
+        assert!(config.exclude_defaults);
+    }
+
+    #[test]
+    fn response_model_config_has_filtering() {
+        let config = ResponseModelConfig::new();
+        assert!(!config.has_filtering());
+
+        let config =
+            ResponseModelConfig::new().include(["id"].iter().map(|s| (*s).to_string()).collect());
+        assert!(config.has_filtering());
+
+        let config = ResponseModelConfig::new()
+            .exclude(["password"].iter().map(|s| (*s).to_string()).collect());
+        assert!(config.has_filtering());
+
+        let config = ResponseModelConfig::new().exclude_none(true);
+        assert!(config.has_filtering());
+    }
+
+    #[test]
+    fn response_model_config_filter_json_include() {
+        let config = ResponseModelConfig::new()
+            .include(["id", "name"].iter().map(|s| (*s).to_string()).collect());
+
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "email": "alice@example.com",
+            "password": "secret"
+        });
+
+        let filtered = config.filter_json(value);
+        assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+        assert!(filtered.get("email").is_none());
+        assert!(filtered.get("password").is_none());
+    }
+
+    #[test]
+    fn response_model_config_filter_json_exclude() {
+        let config = ResponseModelConfig::new().exclude(
+            ["password", "secret"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        );
+
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "password": "secret123",
+            "secret": "hidden"
+        });
+
+        let filtered = config.filter_json(value);
+        assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+        assert!(filtered.get("password").is_none());
+        assert!(filtered.get("secret").is_none());
+    }
+
+    #[test]
+    fn response_model_config_filter_json_exclude_none() {
+        let config = ResponseModelConfig::new().exclude_none(true);
+
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "middle_name": null,
+            "nickname": null
+        });
+
+        let filtered = config.filter_json(value);
+        assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+        assert!(filtered.get("middle_name").is_none());
+        assert!(filtered.get("nickname").is_none());
+    }
+
+    #[test]
+    fn response_model_config_filter_json_combined() {
+        let config = ResponseModelConfig::new()
+            .include(
+                ["id", "name", "email", "middle_name"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            )
+            .exclude_none(true);
+
+        let value = serde_json::json!({
+            "id": 1,
+            "name": "Alice",
+            "email": "alice@example.com",
+            "middle_name": null,
+            "password": "secret"
+        });
+
+        let filtered = config.filter_json(value);
+        assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+        assert_eq!(
+            filtered.get("email"),
+            Some(&serde_json::json!("alice@example.com"))
+        );
+        assert!(filtered.get("middle_name").is_none()); // null, excluded
+        assert!(filtered.get("password").is_none()); // not in include
+    }
+
+    // =========================================================================
+    // ValidatedResponse tests
+    // =========================================================================
+
+    #[test]
+    fn validated_response_serializes_struct() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+        };
+
+        let response = ValidatedResponse::new(user).into_response();
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed["id"], 1);
+            assert_eq!(parsed["name"], "Alice");
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn validated_response_excludes_fields() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+            password: String,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+            password: "secret123".to_string(),
+        };
+
+        let response = ValidatedResponse::new(user)
+            .with_config(
+                ResponseModelConfig::new()
+                    .exclude(["password"].iter().map(|s| (*s).to_string()).collect()),
+            )
+            .into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed["id"], 1);
+            assert_eq!(parsed["name"], "Alice");
+            assert!(parsed.get("password").is_none());
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn validated_response_includes_fields() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+            email: String,
+            password: String,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            password: "secret123".to_string(),
+        };
+
+        let response = ValidatedResponse::new(user)
+            .with_config(
+                ResponseModelConfig::new()
+                    .include(["id", "name"].iter().map(|s| (*s).to_string()).collect()),
+            )
+            .into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed["id"], 1);
+            assert_eq!(parsed["name"], "Alice");
+            assert!(parsed.get("email").is_none());
+            assert!(parsed.get("password").is_none());
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn validated_response_exclude_none_values() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+            nickname: Option<String>,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+            nickname: None,
+        };
+
+        let response = ValidatedResponse::new(user)
+            .with_config(ResponseModelConfig::new().exclude_none(true))
+            .into_response();
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(parsed["id"], 1);
+            assert_eq!(parsed["name"], "Alice");
+            assert!(parsed.get("nickname").is_none());
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn validated_response_content_type_is_json() {
+        #[derive(Serialize)]
+        struct Data {
+            value: i32,
+        }
+
+        let response = ValidatedResponse::new(Data { value: 42 }).into_response();
+
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| String::from_utf8_lossy(value).to_string());
+
+        assert_eq!(content_type, Some("application/json".to_string()));
+    }
+
+    // =========================================================================
+    // Helper function tests
+    // =========================================================================
+
+    #[test]
+    fn exclude_fields_helper() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+            password: String,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let response = exclude_fields(user, &["password"]).into_response();
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert!(parsed.get("id").is_some());
+            assert!(parsed.get("name").is_some());
+            assert!(parsed.get("password").is_none());
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn include_fields_helper() {
+        #[derive(Serialize)]
+        struct User {
+            id: i64,
+            name: String,
+            email: String,
+            password: String,
+        }
+
+        let user = User {
+            id: 1,
+            name: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let response = include_fields(user, &["id", "name"]).into_response();
+
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert!(parsed.get("id").is_some());
+            assert!(parsed.get("name").is_some());
+            assert!(parsed.get("email").is_none());
+            assert!(parsed.get("password").is_none());
+        } else {
+            panic!("Expected Bytes body");
+        }
     }
 }
