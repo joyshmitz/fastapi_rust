@@ -14,6 +14,8 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::trivially_copy_pass_by_ref)]
 #![allow(clippy::ref_option_ref)]
+#![allow(clippy::ref_option)]
+#![allow(clippy::modulo_one)]
 
 use fastapi_macros::Validate;
 
@@ -583,7 +585,7 @@ struct NoValidation {
 fn test_no_validation_always_valid() {
     let valid = NoValidation {
         name: String::new(), // Even empty is valid - no constraints
-        age: -1,              // Even negative is valid - no constraints
+        age: -1,             // Even negative is valid - no constraints
     };
     assert!(valid.validate().is_ok());
 }
@@ -1041,12 +1043,7 @@ fn test_optional_field_some_invalid() {
 
 fn validate_username(value: &str) -> Result<(), String> {
     // Username must start with a letter
-    if value
-        .chars()
-        .next()
-        .map(char::is_alphabetic)
-        .unwrap_or(false)
-    {
+    if value.chars().next().is_some_and(char::is_alphabetic) {
         Ok(())
     } else {
         Err("Username must start with a letter".to_string())
@@ -1216,6 +1213,7 @@ fn test_emoji_exceeds_max_bytes() {
 // ============================================================================
 
 #[derive(Validate)]
+#[allow(clippy::modulo_one)]
 struct ZeroMultipleTest {
     #[validate(multiple_of = 1)]
     value: i32,

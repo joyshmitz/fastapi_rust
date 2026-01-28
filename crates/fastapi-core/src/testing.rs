@@ -3798,6 +3798,7 @@ pub struct TestServer {
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     log_entries: Arc<Mutex<Vec<TestServerLogEntry>>>,
+    shutdown_controller: crate::shutdown::ShutdownController,
 }
 
 impl TestServer {
@@ -3829,10 +3830,12 @@ impl TestServer {
         let app = Arc::new(app);
         let shutdown = Arc::new(AtomicBool::new(false));
         let log_entries = Arc::new(Mutex::new(Vec::new()));
+        let shutdown_controller = crate::shutdown::ShutdownController::new();
 
         let shutdown_clone = Arc::clone(&shutdown);
         let log_entries_clone = Arc::clone(&log_entries);
         let app_clone = Arc::clone(&app);
+        let controller_clone = shutdown_controller.clone();
 
         let handle = thread::spawn(move || {
             Self::server_loop(
@@ -3841,6 +3844,7 @@ impl TestServer {
                 shutdown_clone,
                 log_entries_clone,
                 config,
+                controller_clone,
             );
         });
 
@@ -3849,6 +3853,7 @@ impl TestServer {
             shutdown,
             handle: Some(handle),
             log_entries,
+            shutdown_controller,
         }
     }
 
@@ -3859,23 +3864,31 @@ impl TestServer {
         shutdown: Arc<AtomicBool>,
         log_entries: Arc<Mutex<Vec<TestServerLogEntry>>>,
         config: TestServerConfig,
+        controller: crate::shutdown::ShutdownController,
     ) {
         let request_counter = std::sync::atomic::AtomicU64::new(1);
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                // Run shutdown hooks before exiting
+                while let Some(hook) = controller.pop_hook() {
+                    hook.run();
+                }
                 break;
             }
 
             match listener.accept() {
                 Ok((stream, _peer)) => {
-                    Self::handle_connection(
-                        stream,
-                        &app,
-                        &log_entries,
-                        &config,
-                        &request_counter,
-                    );
+                    // Track in-flight requests
+                    let _guard = controller.track_request();
+
+                    // If shutting down, reject with 503
+                    if controller.is_shutting_down() {
+                        Self::send_503(stream);
+                        continue;
+                    }
+
+                    Self::handle_connection(stream, &app, &log_entries, &config, &request_counter);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -4159,11 +4172,38 @@ impl TestServer {
             .clear();
     }
 
+    /// Sends a 503 Service Unavailable response during shutdown.
+    fn send_503(mut stream: StdTcpStream) {
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 19\r\n\r\nService Unavailable";
+        let _ = stream.write_all(response);
+        let _ = stream.flush();
+    }
+
+    /// Returns a reference to the server's shutdown controller.
+    ///
+    /// Use this to coordinate graceful shutdown in tests, including:
+    /// - Tracking in-flight requests via [`ShutdownController::track_request`]
+    /// - Registering shutdown hooks via [`ShutdownController::register_hook`]
+    /// - Checking shutdown phase via [`ShutdownController::phase`]
+    #[must_use]
+    pub fn shutdown_controller(&self) -> &crate::shutdown::ShutdownController {
+        &self.shutdown_controller
+    }
+
+    /// Returns the number of currently in-flight requests.
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.shutdown_controller.in_flight_count()
+    }
+
     /// Signals the server to shut down gracefully.
     ///
-    /// The server will stop accepting new connections and the background
-    /// thread will exit. This is also called automatically on drop.
+    /// This triggers the shutdown controller (which will cause the server
+    /// to reject new requests with 503) and stops the accept loop.
+    /// This is also called automatically on drop.
     pub fn shutdown(&self) {
+        self.shutdown_controller.shutdown();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -4171,8 +4211,7 @@ impl TestServer {
     /// Returns true if the server has been signaled to shut down.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -6309,7 +6348,10 @@ mod test_server_tests {
             b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
 
-        assert!(response.contains("200 OK"), "Expected 200 OK, got: {response}");
+        assert!(
+            response.contains("200 OK"),
+            "Expected 200 OK, got: {response}"
+        );
         assert!(response.contains("OK"), "Expected body 'OK'");
     }
 
@@ -6333,7 +6375,8 @@ mod test_server_tests {
         let app = make_test_app();
         let server = TestServer::start(app);
 
-        let request = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nHello World";
+        let request =
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nHello World";
         let response = send_request(server.addr(), request);
 
         assert!(response.contains("200 OK"));
@@ -6410,10 +6453,7 @@ mod test_server_tests {
         let addr = server.addr();
 
         // Server should respond before shutdown
-        let response = send_request(
-            addr,
-            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
+        let response = send_request(addr, b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(response.contains("200 OK"));
 
         // Signal shutdown
@@ -6458,7 +6498,10 @@ mod test_server_tests {
         );
 
         // Response should include content-length
-        assert!(response.contains("content-length: 2"), "Expected content-length: 2, got: {response}");
+        assert!(
+            response.contains("content-length: 2"),
+            "Expected content-length: 2, got: {response}"
+        );
     }
 
     #[test]
@@ -6491,5 +6534,262 @@ mod test_server_tests {
         assert_eq!(logs.len(), 1);
         // Duration should be non-zero but reasonable (under 1 second)
         assert!(logs[0].duration < Duration::from_secs(1));
+    }
+
+    // =========================================================================
+    // Graceful Shutdown E2E Tests (bd-14if)
+    // =========================================================================
+
+    #[test]
+    fn test_server_shutdown_controller_available() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // ShutdownController should be accessible
+        let controller = server.shutdown_controller();
+        assert!(!controller.is_shutting_down());
+        assert_eq!(controller.phase(), crate::shutdown::ShutdownPhase::Running);
+    }
+
+    #[test]
+    fn test_server_shutdown_triggers_controller() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Server should be running normally
+        assert!(!server.shutdown_controller().is_shutting_down());
+
+        // Trigger graceful shutdown
+        server.shutdown();
+
+        // Both the server flag and controller should reflect shutdown
+        assert!(server.is_shutdown());
+        assert!(server.shutdown_controller().is_shutting_down());
+        assert_eq!(
+            server.shutdown_controller().phase(),
+            crate::shutdown::ShutdownPhase::StopAccepting
+        );
+    }
+
+    #[test]
+    fn test_server_requests_complete_before_shutdown() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Make a normal request before shutdown
+        let response = send_request(
+            server.addr(),
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.contains("200 OK"));
+        assert_eq!(server.request_count(), 1);
+
+        // Signal shutdown
+        server.shutdown();
+
+        // Verify the request completed and was logged
+        let logs = server.log_entries();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status, 200);
+        assert_eq!(logs[0].path, "/health");
+    }
+
+    #[test]
+    fn test_server_in_flight_tracking() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Initially no in-flight requests
+        assert_eq!(server.in_flight_count(), 0);
+
+        // The in-flight guard is managed internally by the server loop,
+        // so after request completion it should be 0
+        send_request(
+            server.addr(),
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        // After the request completes (synchronous), in-flight should be 0
+        // (guard dropped at end of handle_connection)
+        assert_eq!(server.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn test_server_in_flight_guard_tracks_correctly() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Manually track requests via the controller
+        let controller = server.shutdown_controller();
+        assert_eq!(controller.in_flight_count(), 0);
+
+        let guard1 = controller.track_request();
+        assert_eq!(controller.in_flight_count(), 1);
+
+        let guard2 = controller.track_request();
+        assert_eq!(controller.in_flight_count(), 2);
+
+        drop(guard1);
+        assert_eq!(controller.in_flight_count(), 1);
+
+        drop(guard2);
+        assert_eq!(controller.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn test_server_shutdown_hooks_executed() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Register shutdown hooks
+        let hook_executed = Arc::new(AtomicBool::new(false));
+        let hook_executed_clone = Arc::clone(&hook_executed);
+        server.shutdown_controller().register_hook(move || {
+            hook_executed_clone.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        assert!(!hook_executed.load(std::sync::atomic::Ordering::Acquire));
+
+        // Trigger shutdown — hooks run in the server loop when it exits
+        server.shutdown();
+
+        // Wait for background thread to finish
+        // Drop the server to join the thread
+        drop(server);
+
+        assert!(
+            hook_executed.load(std::sync::atomic::Ordering::Acquire),
+            "Shutdown hook should have been executed"
+        );
+    }
+
+    #[test]
+    fn test_server_multiple_shutdown_hooks_lifo() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        let execution_order = Arc::new(Mutex::new(Vec::new()));
+
+        let order1 = Arc::clone(&execution_order);
+        server.shutdown_controller().register_hook(move || {
+            order1.lock().expect("mutex").push(1);
+        });
+
+        let order2 = Arc::clone(&execution_order);
+        server.shutdown_controller().register_hook(move || {
+            order2.lock().expect("mutex").push(2);
+        });
+
+        let order3 = Arc::clone(&execution_order);
+        server.shutdown_controller().register_hook(move || {
+            order3.lock().expect("mutex").push(3);
+        });
+
+        // Trigger shutdown and wait for thread to finish
+        server.shutdown();
+        drop(server);
+
+        // Hooks should run in LIFO order (3, 2, 1)
+        let order = execution_order.lock().expect("mutex");
+        assert_eq!(*order, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_server_shutdown_controller_phase_progression() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        let controller = server.shutdown_controller();
+        assert_eq!(controller.phase(), crate::shutdown::ShutdownPhase::Running);
+
+        // Advance through phases manually
+        assert!(controller.advance_phase());
+        assert_eq!(
+            controller.phase(),
+            crate::shutdown::ShutdownPhase::StopAccepting
+        );
+
+        assert!(controller.advance_phase());
+        assert_eq!(
+            controller.phase(),
+            crate::shutdown::ShutdownPhase::ShutdownFlagged
+        );
+
+        assert!(controller.advance_phase());
+        assert_eq!(
+            controller.phase(),
+            crate::shutdown::ShutdownPhase::GracePeriod
+        );
+
+        assert!(controller.advance_phase());
+        assert_eq!(
+            controller.phase(),
+            crate::shutdown::ShutdownPhase::Cancelling
+        );
+
+        assert!(controller.advance_phase());
+        assert_eq!(
+            controller.phase(),
+            crate::shutdown::ShutdownPhase::RunningHooks
+        );
+
+        assert!(controller.advance_phase());
+        assert_eq!(controller.phase(), crate::shutdown::ShutdownPhase::Stopped);
+
+        // Can't go past Stopped
+        assert!(!controller.advance_phase());
+    }
+
+    #[test]
+    fn test_server_receiver_notified_on_shutdown() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        let receiver = server.shutdown_controller().subscribe();
+        assert!(!receiver.is_shutting_down());
+
+        server.shutdown();
+        assert!(receiver.is_shutting_down());
+        assert!(!receiver.is_forced());
+    }
+
+    #[test]
+    fn test_server_forced_shutdown() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        let receiver = server.shutdown_controller().subscribe();
+
+        // First shutdown -> graceful
+        server.shutdown_controller().shutdown();
+        assert!(receiver.is_shutting_down());
+        assert!(!receiver.is_forced());
+
+        // Second shutdown -> forced
+        server.shutdown_controller().shutdown();
+        assert!(receiver.is_forced());
+    }
+
+    #[test]
+    fn test_server_requests_work_before_shutdown_signal() {
+        let app = make_test_app();
+        let server = TestServer::start(app);
+
+        // Multiple requests work fine before any shutdown signal
+        for i in 0..3 {
+            let response = send_request(
+                server.addr(),
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(
+                response.contains("200 OK"),
+                "Request {i} should succeed before shutdown"
+            );
+        }
+
+        assert_eq!(server.request_count(), 3);
+
+        // Now shutdown
+        server.shutdown();
+        assert!(server.is_shutdown());
     }
 }

@@ -531,10 +531,8 @@ impl HelpDisplay {
         if let Some(version) = &help.version {
             let _ = write!(name_line, " {muted}v{version}{ANSI_RESET}");
         }
-        let name_pad = (title_width
-            - help.name.len()
-            - help.version.as_ref().map_or(0, |v| v.len() + 2))
-            / 2;
+        let name_pad =
+            (title_width - help.name.len() - help.version.as_ref().map_or(0, |v| v.len() + 2)) / 2;
         lines.push(format!(
             "{border}│{ANSI_RESET}{}{}{}",
             " ".repeat(name_pad),

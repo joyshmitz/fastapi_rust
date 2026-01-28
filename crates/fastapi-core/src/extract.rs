@@ -7166,8 +7166,8 @@ mod special_extractor_tests {
 mod background_tasks_tests {
     use super::*;
     use crate::request::Method;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     fn test_context() -> RequestContext {
         let cx = asupersync::Cx::for_testing();
@@ -8076,6 +8076,1019 @@ impl FromRequest for OAuth2PasswordBearer {
         }
 
         Ok(OAuth2PasswordBearer::new(token))
+    }
+}
+
+// ============================================================================
+// OAuth2 Password Request Form
+// ============================================================================
+
+/// Error when OAuth2 password request form extraction fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuth2PasswordFormError {
+    /// Content-Type is not `application/x-www-form-urlencoded`.
+    UnsupportedMediaType {
+        /// The actual Content-Type, if any.
+        actual: Option<String>,
+    },
+    /// Request body exceeds the configured limit.
+    PayloadTooLarge {
+        /// The actual body size.
+        size: usize,
+        /// The configured limit.
+        limit: usize,
+    },
+    /// The `username` field is missing.
+    MissingUsername,
+    /// The `password` field is missing.
+    MissingPassword,
+    /// The `grant_type` must be `"password"` (strict mode).
+    InvalidGrantType {
+        /// The actual grant_type value.
+        actual: String,
+    },
+    /// The `grant_type` field is missing (strict mode).
+    MissingGrantType,
+    /// Request body is not valid UTF-8.
+    InvalidUtf8,
+    /// Streaming bodies are not supported.
+    StreamingNotSupported,
+}
+
+impl std::fmt::Display for OAuth2PasswordFormError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedMediaType { actual } => {
+                if let Some(ct) = actual {
+                    write!(f, "Expected application/x-www-form-urlencoded, got: {ct}")
+                } else {
+                    write!(f, "Missing Content-Type header")
+                }
+            }
+            Self::PayloadTooLarge { size, limit } => {
+                write!(f, "Body too large: {size} > {limit}")
+            }
+            Self::MissingUsername => write!(f, "Missing required field: username"),
+            Self::MissingPassword => write!(f, "Missing required field: password"),
+            Self::InvalidGrantType { actual } => {
+                write!(f, "grant_type must be \"password\", got: \"{actual}\"")
+            }
+            Self::MissingGrantType => write!(f, "Missing required field: grant_type"),
+            Self::InvalidUtf8 => write!(f, "Invalid UTF-8 in form body"),
+            Self::StreamingNotSupported => write!(f, "Streaming bodies not supported"),
+        }
+    }
+}
+
+impl std::error::Error for OAuth2PasswordFormError {}
+
+impl IntoResponse for OAuth2PasswordFormError {
+    fn into_response(self) -> Response {
+        match &self {
+            OAuth2PasswordFormError::UnsupportedMediaType { .. } => {
+                HttpError::unsupported_media_type().into_response()
+            }
+            OAuth2PasswordFormError::PayloadTooLarge { size, limit } => {
+                HttpError::payload_too_large()
+                    .with_detail(format!("Body {size} > {limit}"))
+                    .into_response()
+            }
+            OAuth2PasswordFormError::MissingUsername => {
+                ValidationErrors::single(
+                    ValidationError::new(
+                        crate::error::error_types::MISSING,
+                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("username")],
+                    )
+                    .with_msg("Field required".to_string()),
+                )
+                .into_response()
+            }
+            OAuth2PasswordFormError::MissingPassword => {
+                ValidationErrors::single(
+                    ValidationError::new(
+                        crate::error::error_types::MISSING,
+                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("password")],
+                    )
+                    .with_msg("Field required".to_string()),
+                )
+                .into_response()
+            }
+            OAuth2PasswordFormError::InvalidGrantType { actual } => {
+                ValidationErrors::single(
+                    ValidationError::new(
+                        crate::error::error_types::VALUE_ERROR,
+                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("grant_type")],
+                    )
+                    .with_msg(format!("grant_type must be \"password\", got: \"{actual}\"")),
+                )
+                .into_response()
+            }
+            OAuth2PasswordFormError::MissingGrantType => {
+                ValidationErrors::single(
+                    ValidationError::new(
+                        crate::error::error_types::MISSING,
+                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("grant_type")],
+                    )
+                    .with_msg("Field required".to_string()),
+                )
+                .into_response()
+            }
+            OAuth2PasswordFormError::InvalidUtf8 => {
+                HttpError::bad_request()
+                    .with_detail("Invalid UTF-8")
+                    .into_response()
+            }
+            OAuth2PasswordFormError::StreamingNotSupported => {
+                HttpError::bad_request().into_response()
+            }
+        }
+    }
+}
+
+/// OAuth2 password request form data.
+///
+/// Extracts the standard OAuth2 password grant fields from a
+/// `application/x-www-form-urlencoded` request body, matching FastAPI's
+/// `OAuth2PasswordRequestForm`.
+///
+/// # Fields
+///
+/// - `grant_type`: Optional, should be `"password"` per spec (not enforced here; use
+///   [`OAuth2PasswordRequestFormStrict`] for strict validation).
+/// - `username`: Required.
+/// - `password`: Required.
+/// - `scope`: Space-separated scopes (empty string if not provided).
+/// - `client_id`: Optional.
+/// - `client_secret`: Optional.
+///
+/// # Computed
+///
+/// - [`scopes()`](OAuth2PasswordRequestForm::scopes): Returns the `scope` string split into a `Vec<String>`.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::OAuth2PasswordRequestForm;
+///
+/// async fn login(form: OAuth2PasswordRequestForm) -> Response {
+///     let username = &form.username;
+///     let password = &form.password;
+///     let scopes = form.scopes();
+///     // ... authenticate user ...
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OAuth2PasswordRequestForm {
+    /// The grant type. Should be `"password"` per the OAuth2 spec.
+    pub grant_type: Option<String>,
+    /// The username (required).
+    pub username: String,
+    /// The password (required).
+    pub password: String,
+    /// Space-separated scopes. Defaults to empty string.
+    pub scope: String,
+    /// Optional client ID.
+    pub client_id: Option<String>,
+    /// Optional client secret.
+    pub client_secret: Option<String>,
+}
+
+impl OAuth2PasswordRequestForm {
+    /// Parse the `scope` field into a vector of individual scope strings.
+    #[must_use]
+    pub fn scopes(&self) -> Vec<String> {
+        if self.scope.is_empty() {
+            Vec::new()
+        } else {
+            self.scope.split(' ').map(String::from).collect()
+        }
+    }
+}
+
+/// Parse form body into key-value pairs and extract a field by name.
+fn extract_form_body(
+    ctx: &RequestContext,
+    req: &mut Request,
+) -> Result<QueryParams, OAuth2PasswordFormError> {
+    // Validate Content-Type
+    let ct = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| std::str::from_utf8(v).ok());
+    let is_form = ct.is_some_and(|c| {
+        c.to_ascii_lowercase()
+            .starts_with("application/x-www-form-urlencoded")
+    });
+    if !is_form {
+        return Err(OAuth2PasswordFormError::UnsupportedMediaType {
+            actual: ct.map(String::from),
+        });
+    }
+
+    // Extract body
+    let body = req.take_body();
+    let bytes = match body {
+        Body::Empty => Vec::new(),
+        Body::Bytes(b) => b,
+        Body::Stream(_) => return Err(OAuth2PasswordFormError::StreamingNotSupported),
+    };
+
+    // Check size limit
+    let limit = ctx.max_body_size();
+    if bytes.len() > limit {
+        return Err(OAuth2PasswordFormError::PayloadTooLarge {
+            size: bytes.len(),
+            limit,
+        });
+    }
+
+    // Parse form body
+    let body_str =
+        std::str::from_utf8(&bytes).map_err(|_| OAuth2PasswordFormError::InvalidUtf8)?;
+    Ok(QueryParams::parse(body_str))
+}
+
+impl FromRequest for OAuth2PasswordRequestForm {
+    type Error = OAuth2PasswordFormError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let _ = ctx.checkpoint();
+        let params = extract_form_body(ctx, req)?;
+        let _ = ctx.checkpoint();
+
+        let username = params
+            .get("username")
+            .ok_or(OAuth2PasswordFormError::MissingUsername)?
+            .to_string();
+
+        let password = params
+            .get("password")
+            .ok_or(OAuth2PasswordFormError::MissingPassword)?
+            .to_string();
+
+        let grant_type = params.get("grant_type").map(String::from);
+        let scope = params
+            .get("scope")
+            .map(String::from)
+            .unwrap_or_default();
+        let client_id = params.get("client_id").map(String::from);
+        let client_secret = params.get("client_secret").map(String::from);
+
+        let _ = ctx.checkpoint();
+        Ok(OAuth2PasswordRequestForm {
+            grant_type,
+            username,
+            password,
+            scope,
+            client_id,
+            client_secret,
+        })
+    }
+}
+
+/// Strict variant of [`OAuth2PasswordRequestForm`].
+///
+/// Same as [`OAuth2PasswordRequestForm`], but requires `grant_type` to be
+/// present and equal to `"password"`. Returns an error if `grant_type` is
+/// missing or has any other value.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::OAuth2PasswordRequestFormStrict;
+///
+/// async fn login(form: OAuth2PasswordRequestFormStrict) -> Response {
+///     // grant_type is guaranteed to be "password"
+///     let username = &form.form.username;
+///     let scopes = form.form.scopes();
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OAuth2PasswordRequestFormStrict {
+    /// The validated form data. The `grant_type` is guaranteed to be `Some("password")`.
+    pub form: OAuth2PasswordRequestForm,
+}
+
+impl OAuth2PasswordRequestFormStrict {
+    /// Get a reference to the inner form.
+    #[must_use]
+    pub fn inner(&self) -> &OAuth2PasswordRequestForm {
+        &self.form
+    }
+
+    /// Consume self and return the inner form.
+    #[must_use]
+    pub fn into_inner(self) -> OAuth2PasswordRequestForm {
+        self.form
+    }
+}
+
+impl std::ops::Deref for OAuth2PasswordRequestFormStrict {
+    type Target = OAuth2PasswordRequestForm;
+
+    fn deref(&self) -> &Self::Target {
+        &self.form
+    }
+}
+
+impl FromRequest for OAuth2PasswordRequestFormStrict {
+    type Error = OAuth2PasswordFormError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let _ = ctx.checkpoint();
+        let params = extract_form_body(ctx, req)?;
+        let _ = ctx.checkpoint();
+
+        let grant_type_value = params
+            .get("grant_type")
+            .ok_or(OAuth2PasswordFormError::MissingGrantType)?;
+
+        if grant_type_value != "password" {
+            return Err(OAuth2PasswordFormError::InvalidGrantType {
+                actual: grant_type_value.to_string(),
+            });
+        }
+
+        let username = params
+            .get("username")
+            .ok_or(OAuth2PasswordFormError::MissingUsername)?
+            .to_string();
+
+        let password = params
+            .get("password")
+            .ok_or(OAuth2PasswordFormError::MissingPassword)?
+            .to_string();
+
+        let scope = params
+            .get("scope")
+            .map(String::from)
+            .unwrap_or_default();
+        let client_id = params.get("client_id").map(String::from);
+        let client_secret = params.get("client_secret").map(String::from);
+
+        let _ = ctx.checkpoint();
+        Ok(OAuth2PasswordRequestFormStrict {
+            form: OAuth2PasswordRequestForm {
+                grant_type: Some("password".to_string()),
+                username,
+                password,
+                scope,
+                client_id,
+                client_secret,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod oauth2_password_form_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    fn form_request(body: &str) -> Request {
+        let mut req = Request::new(Method::Post, "/token");
+        req.headers_mut()
+            .insert("content-type", b"application/x-www-form-urlencoded".to_vec());
+        req.set_body(Body::Bytes(body.as_bytes().to_vec()));
+        req
+    }
+
+    // ---- OAuth2PasswordRequestForm tests ----
+
+    #[test]
+    fn basic_form_extraction() {
+        let ctx = test_context();
+        let mut req = form_request("username=alice&password=secret123");
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(form.username, "alice");
+        assert_eq!(form.password, "secret123");
+        assert!(form.grant_type.is_none());
+        assert_eq!(form.scope, "");
+        assert!(form.client_id.is_none());
+        assert!(form.client_secret.is_none());
+    }
+
+    #[test]
+    fn full_form_extraction() {
+        let ctx = test_context();
+        let body = "grant_type=password&username=bob&password=s3cret&scope=read+write&client_id=myapp&client_secret=appsecret";
+        let mut req = form_request(body);
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(form.grant_type.as_deref(), Some("password"));
+        assert_eq!(form.username, "bob");
+        assert_eq!(form.password, "s3cret");
+        assert_eq!(form.scope, "read write");
+        assert_eq!(form.client_id.as_deref(), Some("myapp"));
+        assert_eq!(form.client_secret.as_deref(), Some("appsecret"));
+    }
+
+    #[test]
+    fn scopes_parsing() {
+        let ctx = test_context();
+        let mut req = form_request("username=u&password=p&scope=read+write+admin");
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        let scopes = form.scopes();
+        assert_eq!(scopes, vec!["read", "write", "admin"]);
+    }
+
+    #[test]
+    fn empty_scope_returns_empty_vec() {
+        let ctx = test_context();
+        let mut req = form_request("username=u&password=p");
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        assert!(form.scopes().is_empty());
+    }
+
+    #[test]
+    fn missing_username_error() {
+        let ctx = test_context();
+        let mut req = form_request("password=secret");
+        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+
+        assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
+        assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
+    fn missing_password_error() {
+        let ctx = test_context();
+        let mut req = form_request("username=alice");
+        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+
+        assert_eq!(err, OAuth2PasswordFormError::MissingPassword);
+        assert!(err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn wrong_content_type_error() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/token");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Bytes(b"username=a&password=b".to_vec()));
+
+        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+
+        match err {
+            OAuth2PasswordFormError::UnsupportedMediaType { actual } => {
+                assert_eq!(actual.as_deref(), Some("application/json"));
+            }
+            other => panic!("Expected UnsupportedMediaType, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_content_type_error() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/token");
+        req.set_body(Body::Bytes(b"username=a&password=b".to_vec()));
+
+        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+
+        match err {
+            OAuth2PasswordFormError::UnsupportedMediaType { actual } => {
+                assert!(actual.is_none());
+            }
+            other => panic!("Expected UnsupportedMediaType, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_encoded_values() {
+        let ctx = test_context();
+        let mut req = form_request("username=user%40example.com&password=p%26ss%3Dword");
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(form.username, "user@example.com");
+        assert_eq!(form.password, "p&ss=word");
+    }
+
+    #[test]
+    fn plus_decoded_as_space_in_scope() {
+        let ctx = test_context();
+        let mut req = form_request("username=u&password=p&scope=read+write+admin");
+        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+
+        // '+' is decoded as space in application/x-www-form-urlencoded
+        assert_eq!(form.scope, "read write admin");
+    }
+
+    #[test]
+    fn empty_body_returns_missing_username() {
+        let ctx = test_context();
+        let mut req = form_request("");
+        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
+    }
+
+    #[test]
+    fn streaming_not_supported_error_type() {
+        // Verify the streaming error variant exists and has correct display
+        let err = OAuth2PasswordFormError::StreamingNotSupported;
+        assert!(err.to_string().contains("Streaming"));
+
+        // Verify it converts to a 400 Bad Request response
+        let resp = err.into_response();
+        assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    #[test]
+    fn error_display_messages() {
+        assert!(OAuth2PasswordFormError::MissingUsername.to_string().contains("username"));
+        assert!(OAuth2PasswordFormError::MissingPassword.to_string().contains("password"));
+        assert!(OAuth2PasswordFormError::InvalidUtf8.to_string().contains("UTF-8"));
+        assert!(OAuth2PasswordFormError::StreamingNotSupported.to_string().contains("Streaming"));
+
+        let err = OAuth2PasswordFormError::InvalidGrantType { actual: "code".to_string() };
+        assert!(err.to_string().contains("code"));
+
+        let err = OAuth2PasswordFormError::PayloadTooLarge { size: 100, limit: 50 };
+        assert!(err.to_string().contains("100"));
+    }
+
+    #[test]
+    fn error_into_response_status_codes() {
+        let resp = OAuth2PasswordFormError::MissingUsername.into_response();
+        assert_eq!(resp.status().as_u16(), 422);
+
+        let resp = OAuth2PasswordFormError::MissingPassword.into_response();
+        assert_eq!(resp.status().as_u16(), 422);
+
+        let resp = OAuth2PasswordFormError::UnsupportedMediaType { actual: None }.into_response();
+        assert_eq!(resp.status().as_u16(), 415);
+
+        let resp = OAuth2PasswordFormError::PayloadTooLarge { size: 100, limit: 50 }.into_response();
+        assert_eq!(resp.status().as_u16(), 413);
+
+        let resp = OAuth2PasswordFormError::InvalidGrantType { actual: "code".to_string() }.into_response();
+        assert_eq!(resp.status().as_u16(), 422);
+    }
+
+    // ---- OAuth2PasswordRequestFormStrict tests ----
+
+    #[test]
+    fn strict_accepts_password_grant_type() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=password&username=alice&password=secret");
+        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(form.form.grant_type.as_deref(), Some("password"));
+        assert_eq!(form.username, "alice");
+        assert_eq!(form.password, "secret");
+    }
+
+    #[test]
+    fn strict_rejects_missing_grant_type() {
+        let ctx = test_context();
+        let mut req = form_request("username=alice&password=secret");
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+
+        assert_eq!(err, OAuth2PasswordFormError::MissingGrantType);
+    }
+
+    #[test]
+    fn strict_rejects_wrong_grant_type() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=authorization_code&username=alice&password=secret");
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+
+        match err {
+            OAuth2PasswordFormError::InvalidGrantType { actual } => {
+                assert_eq!(actual, "authorization_code");
+            }
+            other => panic!("Expected InvalidGrantType, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_with_all_fields() {
+        let ctx = test_context();
+        let body = "grant_type=password&username=bob&password=pw&scope=read+write&client_id=app&client_secret=sec";
+        let mut req = form_request(body);
+        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+
+        assert_eq!(form.username, "bob");
+        assert_eq!(form.password, "pw");
+        assert_eq!(form.scope, "read write");
+        assert_eq!(form.client_id.as_deref(), Some("app"));
+        assert_eq!(form.client_secret.as_deref(), Some("sec"));
+        assert_eq!(form.scopes(), vec!["read", "write"]);
+    }
+
+    #[test]
+    fn strict_deref_to_inner() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=password&username=alice&password=pw");
+        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+
+        // Deref allows accessing inner form fields directly
+        let _: &str = &strict.username;
+        let _: &str = &strict.password;
+        assert_eq!(strict.inner().username, "alice");
+    }
+
+    #[test]
+    fn strict_into_inner() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=password&username=alice&password=pw");
+        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+
+        let form = strict.into_inner();
+        assert_eq!(form.username, "alice");
+        assert_eq!(form.grant_type.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn strict_missing_username_after_grant_type() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=password&password=secret");
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
+    }
+
+    #[test]
+    fn strict_missing_password_after_grant_type() {
+        let ctx = test_context();
+        let mut req = form_request("grant_type=password&username=alice");
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        assert_eq!(err, OAuth2PasswordFormError::MissingPassword);
+    }
+}
+
+// ============================================================================
+// OAuth2 Authorization Code Bearer Extractor
+// ============================================================================
+
+/// Configuration for OAuth2 authorization code bearer extraction.
+///
+/// This configures the authorization code flow for OpenAPI documentation.
+/// The actual token extraction is identical to [`OAuth2PasswordBearer`] —
+/// the difference is in the OpenAPI security scheme generated.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::OAuth2AuthorizationCodeBearerConfig;
+///
+/// let config = OAuth2AuthorizationCodeBearerConfig::new(
+///     "https://auth.example.com/authorize",
+///     "https://auth.example.com/token",
+/// )
+/// .with_refresh_url("https://auth.example.com/refresh")
+/// .with_scope("read", "Read access")
+/// .with_scope("write", "Write access");
+/// ```
+#[derive(Debug, Clone)]
+pub struct OAuth2AuthorizationCodeBearerConfig {
+    /// URL for the authorization endpoint. Required for OpenAPI documentation.
+    pub authorization_url: String,
+    /// URL for the token endpoint. Required for OpenAPI documentation.
+    pub token_url: String,
+    /// URL to refresh the token. Optional.
+    pub refresh_url: Option<String>,
+    /// OAuth2 scopes with their descriptions.
+    pub scopes: std::collections::HashMap<String, String>,
+    /// Custom scheme name for OpenAPI documentation.
+    pub scheme_name: Option<String>,
+    /// Description for OpenAPI documentation.
+    pub description: Option<String>,
+    /// Whether to automatically return 401 on missing/invalid token.
+    /// Default: true.
+    pub auto_error: bool,
+}
+
+impl OAuth2AuthorizationCodeBearerConfig {
+    /// Create a new configuration with the given authorization and token URLs.
+    #[must_use]
+    pub fn new(
+        authorization_url: impl Into<String>,
+        token_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            authorization_url: authorization_url.into(),
+            token_url: token_url.into(),
+            refresh_url: None,
+            scopes: std::collections::HashMap::new(),
+            scheme_name: None,
+            description: None,
+            auto_error: true,
+        }
+    }
+
+    /// Set the refresh URL.
+    #[must_use]
+    pub fn with_refresh_url(mut self, url: impl Into<String>) -> Self {
+        self.refresh_url = Some(url.into());
+        self
+    }
+
+    /// Add an OAuth2 scope.
+    #[must_use]
+    pub fn with_scope(
+        mut self,
+        scope: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.scopes.insert(scope.into(), description.into());
+        self
+    }
+
+    /// Set the scheme name for OpenAPI.
+    #[must_use]
+    pub fn with_scheme_name(mut self, name: impl Into<String>) -> Self {
+        self.scheme_name = Some(name.into());
+        self
+    }
+
+    /// Set the description for OpenAPI.
+    #[must_use]
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+
+    /// Set whether to auto-error on missing/invalid tokens.
+    #[must_use]
+    pub fn with_auto_error(mut self, auto_error: bool) -> Self {
+        self.auto_error = auto_error;
+        self
+    }
+}
+
+/// OAuth2 authorization code bearer extractor.
+///
+/// Extracts a bearer token from the `Authorization` header, identical to
+/// [`OAuth2PasswordBearer`]. The difference is purely in OpenAPI documentation:
+/// this generates an `oauth2` security scheme with `authorizationCode` flow
+/// instead of `password` flow.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::OAuth2AuthorizationCodeBearer;
+///
+/// async fn protected(token: OAuth2AuthorizationCodeBearer) -> impl IntoResponse {
+///     let access_token = token.token();
+///     // Verify token with your auth provider...
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OAuth2AuthorizationCodeBearer {
+    /// The extracted bearer token (without the "Bearer " prefix).
+    pub token: String,
+}
+
+impl OAuth2AuthorizationCodeBearer {
+    /// Create a new instance with the given token.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
+    }
+
+    /// Get the token value.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Consume self and return the token.
+    #[must_use]
+    pub fn into_token(self) -> String {
+        self.token
+    }
+}
+
+impl Deref for OAuth2AuthorizationCodeBearer {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.token
+    }
+}
+
+impl FromRequest for OAuth2AuthorizationCodeBearer {
+    type Error = OAuth2BearerError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Token extraction is identical to OAuth2PasswordBearer.
+        // The difference is in the OpenAPI security scheme (authorizationCode flow).
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .ok_or_else(OAuth2BearerError::missing_header)?;
+
+        let auth_str =
+            std::str::from_utf8(auth_header).map_err(|_| OAuth2BearerError::invalid_scheme())?;
+
+        const BEARER_PREFIX: &str = "Bearer ";
+        const BEARER_PREFIX_LOWER: &str = "bearer ";
+
+        let token = if auth_str.starts_with(BEARER_PREFIX) {
+            &auth_str[BEARER_PREFIX.len()..]
+        } else if auth_str.starts_with(BEARER_PREFIX_LOWER) {
+            &auth_str[BEARER_PREFIX_LOWER.len()..]
+        } else {
+            return Err(OAuth2BearerError::invalid_scheme());
+        };
+
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(OAuth2BearerError::empty_token());
+        }
+
+        Ok(OAuth2AuthorizationCodeBearer::new(token))
+    }
+}
+
+#[cfg(test)]
+mod oauth2_authcode_bearer_tests {
+    use super::*;
+    use crate::request::Method;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    // ---- Config tests ----
+
+    #[test]
+    fn config_new() {
+        let config = OAuth2AuthorizationCodeBearerConfig::new(
+            "https://auth.example.com/authorize",
+            "https://auth.example.com/token",
+        );
+        assert_eq!(config.authorization_url, "https://auth.example.com/authorize");
+        assert_eq!(config.token_url, "https://auth.example.com/token");
+        assert!(config.refresh_url.is_none());
+        assert!(config.scopes.is_empty());
+        assert!(config.scheme_name.is_none());
+        assert!(config.description.is_none());
+        assert!(config.auto_error);
+    }
+
+    #[test]
+    fn config_builder() {
+        let config = OAuth2AuthorizationCodeBearerConfig::new(
+            "https://auth.example.com/authorize",
+            "https://auth.example.com/token",
+        )
+        .with_refresh_url("https://auth.example.com/refresh")
+        .with_scope("read", "Read access")
+        .with_scope("write", "Write access")
+        .with_scheme_name("MyAuth")
+        .with_description("Authorization code flow")
+        .with_auto_error(false);
+
+        assert_eq!(config.refresh_url.as_deref(), Some("https://auth.example.com/refresh"));
+        assert_eq!(config.scopes.len(), 2);
+        assert_eq!(config.scopes.get("read").unwrap(), "Read access");
+        assert_eq!(config.scopes.get("write").unwrap(), "Write access");
+        assert_eq!(config.scheme_name.as_deref(), Some("MyAuth"));
+        assert_eq!(config.description.as_deref(), Some("Authorization code flow"));
+        assert!(!config.auto_error);
+    }
+
+    // ---- Extractor tests ----
+
+    #[test]
+    fn extracts_bearer_token() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"Bearer my-access-token".to_vec());
+
+        let result =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap();
+
+        assert_eq!(result.token(), "my-access-token");
+        assert_eq!(result.into_token(), "my-access-token");
+    }
+
+    #[test]
+    fn extracts_lowercase_bearer() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"bearer my-token".to_vec());
+
+        let result =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap();
+
+        assert_eq!(result.token(), "my-token");
+    }
+
+    #[test]
+    fn missing_header_returns_401() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+
+        let err =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap_err();
+
+        assert_eq!(err.kind, OAuth2BearerErrorKind::MissingHeader);
+
+        let resp = err.into_response();
+        assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn invalid_scheme_returns_401() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"Basic dXNlcjpwYXNz".to_vec());
+
+        let err =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap_err();
+
+        assert_eq!(err.kind, OAuth2BearerErrorKind::InvalidScheme);
+    }
+
+    #[test]
+    fn empty_token_returns_error() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"Bearer ".to_vec());
+
+        let err =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap_err();
+
+        assert_eq!(err.kind, OAuth2BearerErrorKind::EmptyToken);
+    }
+
+    #[test]
+    fn whitespace_only_token_returns_error() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"Bearer   ".to_vec());
+
+        let err =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap_err();
+
+        assert_eq!(err.kind, OAuth2BearerErrorKind::EmptyToken);
+    }
+
+    #[test]
+    fn token_trimmed() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut()
+            .insert("authorization", b"Bearer  my-token  ".to_vec());
+
+        let result =
+            futures_executor::block_on(OAuth2AuthorizationCodeBearer::from_request(&ctx, &mut req))
+                .unwrap();
+
+        assert_eq!(result.token(), "my-token");
+    }
+
+    #[test]
+    fn deref_to_str() {
+        let bearer = OAuth2AuthorizationCodeBearer::new("abc123");
+        let s: &str = &bearer;
+        assert_eq!(s, "abc123");
+    }
+
+    #[test]
+    fn new_constructor() {
+        let bearer = OAuth2AuthorizationCodeBearer::new("token-value");
+        assert_eq!(bearer.token, "token-value");
+        assert_eq!(bearer.token(), "token-value");
+    }
+
+    #[test]
+    fn www_authenticate_header_on_error() {
+        let err = OAuth2BearerError::missing_header();
+        let resp = err.into_response();
+
+        let has_www_auth = resp
+            .headers()
+            .iter()
+            .any(|(n, v)| {
+                n.eq_ignore_ascii_case("www-authenticate") && v == b"Bearer"
+            });
+        assert!(has_www_auth, "Response should have WWW-Authenticate: Bearer header");
     }
 }
 
@@ -14392,5 +15405,738 @@ mod security_tests {
         } else {
             panic!("Expected Bytes body");
         }
+    }
+}
+
+// ============================================================================
+// Body Size Limit Enforcement Tests (bd-dl14)
+// ============================================================================
+
+#[cfg(test)]
+mod body_size_limit_tests {
+    use super::*;
+    use crate::request::{Body, Method};
+    use crate::response::{ResponseBody, StatusCode};
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 1)
+    }
+
+    fn test_context_with_limit(limit: usize) -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::with_body_limit(cx, 1, limit)
+    }
+
+    // ---- Default limit constants ----
+
+    #[test]
+    fn default_constants_match_expected_values() {
+        assert_eq!(DEFAULT_JSON_LIMIT, 1024 * 1024); // 1MB
+        assert_eq!(DEFAULT_FORM_LIMIT, 1024 * 1024); // 1MB
+        assert_eq!(DEFAULT_RAW_BODY_LIMIT, 2 * 1024 * 1024); // 2MB
+        assert_eq!(crate::DEFAULT_MAX_BODY_SIZE, 1024 * 1024); // 1MB
+    }
+
+    // ---- JSON body limit tests ----
+
+    #[test]
+    fn json_body_under_limit_accepted() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        struct Msg {
+            text: String,
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Bytes(b"{\"text\":\"hello\"}".to_vec()));
+
+        let result = futures_executor::block_on(Json::<Msg>::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.text, "hello");
+    }
+
+    #[test]
+    fn json_body_over_default_limit_rejected() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            content: String,
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // Body exceeds the 1MB default limit
+        let large = "x".repeat(crate::DEFAULT_MAX_BODY_SIZE + 1);
+        let body = format!("{{\"content\":\"{}\"}}", large);
+        req.set_body(Body::Bytes(body.into_bytes()));
+
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(JsonExtractError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn json_body_exactly_at_limit_accepted() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            content: String,
+        }
+
+        // Use a custom small limit for easier testing
+        let ctx = test_context_with_limit(100);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // Build a body that is exactly 100 bytes
+        // {"content":"xxx..."} where content is padded to make total = 100
+        let prefix = b"{\"content\":\"";
+        let suffix = b"\"}";
+        let content_len = 100 - prefix.len() - suffix.len();
+        let content: String = "a".repeat(content_len);
+        let body = format!("{{\"content\":\"{}\"}}", content);
+        assert_eq!(body.len(), 100);
+
+        req.set_body(Body::Bytes(body.into_bytes()));
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(result.is_ok(), "Body exactly at limit should be accepted");
+    }
+
+    #[test]
+    fn json_body_one_byte_over_limit_rejected() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Data {
+            content: String,
+        }
+
+        let ctx = test_context_with_limit(100);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // 101 bytes body
+        let prefix = b"{\"content\":\"";
+        let suffix = b"\"}";
+        let content_len = 101 - prefix.len() - suffix.len();
+        let content: String = "a".repeat(content_len);
+        let body = format!("{{\"content\":\"{}\"}}", content);
+        assert_eq!(body.len(), 101);
+
+        req.set_body(Body::Bytes(body.into_bytes()));
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        match result {
+            Err(JsonExtractError::PayloadTooLarge { size, limit }) => {
+                assert_eq!(size, 101);
+                assert_eq!(limit, 100);
+            }
+            other => panic!("Expected PayloadTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_custom_body_limit_via_context() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            val: String,
+        }
+
+        // Small limit: 50 bytes
+        let ctx = test_context_with_limit(50);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // Body exceeding 50 bytes
+        let padding = "x".repeat(60);
+        let body = format!("{{\"val\":\"{}\"}}", padding);
+        assert!(body.len() > 50, "Body is {} bytes, expected > 50", body.len());
+        req.set_body(Body::Bytes(body.into_bytes()));
+
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(JsonExtractError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn json_large_custom_limit_accepts_big_body() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Data {
+            content: String,
+        }
+
+        // 10MB limit
+        let ctx = test_context_with_limit(10 * 1024 * 1024);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // 2MB body (under the 10MB custom limit)
+        let large = "x".repeat(2 * 1024 * 1024);
+        let body = format!("{{\"content\":\"{}\"}}", large);
+        req.set_body(Body::Bytes(body.into_bytes()));
+
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(result.is_ok(), "Body under custom limit should be accepted");
+    }
+
+    #[test]
+    fn json_empty_body_accepted() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Data {
+            #[serde(default)]
+            val: i32,
+        }
+
+        let ctx = test_context_with_limit(10);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Empty);
+
+        // Empty body parses to empty bytes, under any limit
+        // But it will fail deserialization (not a size issue)
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        // Empty body means 0 bytes which is under limit, but deserialization fails
+        match result {
+            Err(JsonExtractError::DeserializeError { .. }) => {} // expected
+            Err(JsonExtractError::PayloadTooLarge { .. }) => {
+                panic!("Empty body should not trigger size limit")
+            }
+            Ok(_) => {} // Also fine if serde accepts empty
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_payload_too_large_error_response_is_413() {
+        let err = JsonExtractError::PayloadTooLarge {
+            size: 2_000_000,
+            limit: 1_000_000,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status().as_u16(), 413);
+    }
+
+    // ---- Form body limit tests ----
+
+    #[test]
+    fn form_body_under_limit_accepted() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        struct Login {
+            user: String,
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/login");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+        req.set_body(Body::Bytes(b"user=alice".to_vec()));
+
+        let result = futures_executor::block_on(Form::<Login>::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.user, "alice");
+    }
+
+    #[test]
+    fn form_body_over_limit_rejected() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            field: String,
+        }
+
+        let ctx = test_context(); // default 1MB limit
+        let mut req = Request::new(Method::Post, "/submit");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+
+        // Build form body larger than 1MB
+        let large_value = "x".repeat(crate::DEFAULT_MAX_BODY_SIZE + 1);
+        let body = format!("field={}", large_value);
+        req.set_body(Body::Bytes(body.into_bytes()));
+
+        let result = futures_executor::block_on(Form::<Data>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(FormExtractError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn form_custom_limit_via_context() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Data {
+            field: String,
+        }
+
+        let ctx = test_context_with_limit(20);
+        let mut req = Request::new(Method::Post, "/submit");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+
+        // 30-byte body exceeds 20-byte limit
+        let body = "field=abcdefghijklmnopqrstuv";
+        assert!(body.len() > 20);
+        req.set_body(Body::Bytes(body.as_bytes().to_vec()));
+
+        let result = futures_executor::block_on(Form::<Data>::from_request(&ctx, &mut req));
+        match result {
+            Err(FormExtractError::PayloadTooLarge { size, limit }) => {
+                assert_eq!(limit, 20);
+                assert!(size > 20);
+            }
+            other => panic!("Expected PayloadTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn form_payload_too_large_error_response_is_413() {
+        let err = FormExtractError::PayloadTooLarge {
+            size: 2_000_000,
+            limit: 1_000_000,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ---- Raw body (Bytes) limit tests ----
+
+    #[test]
+    fn bytes_body_under_limit_accepted() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.set_body(Body::Bytes(b"small payload".to_vec()));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_slice(), b"small payload");
+    }
+
+    #[test]
+    fn bytes_body_over_default_limit_rejected() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        let large_body = vec![0u8; DEFAULT_RAW_BODY_LIMIT + 1];
+        req.set_body(Body::Bytes(large_body));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        match result {
+            Err(RawBodyError::PayloadTooLarge { size, limit }) => {
+                assert_eq!(size, DEFAULT_RAW_BODY_LIMIT + 1);
+                assert_eq!(limit, DEFAULT_RAW_BODY_LIMIT);
+            }
+            other => panic!("Expected PayloadTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bytes_custom_limit_via_extension() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.insert_extension(RawBodyConfig::new().limit(50));
+        req.set_body(Body::Bytes(vec![0u8; 80]));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        match result {
+            Err(RawBodyError::PayloadTooLarge { size, limit }) => {
+                assert_eq!(size, 80);
+                assert_eq!(limit, 50);
+            }
+            other => panic!("Expected PayloadTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bytes_custom_limit_accepts_body_under() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.insert_extension(RawBodyConfig::new().limit(200));
+        req.set_body(Body::Bytes(vec![0u8; 100]));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 100);
+    }
+
+    #[test]
+    fn bytes_empty_body_always_accepted() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+        req.insert_extension(RawBodyConfig::new().limit(0));
+        req.set_body(Body::Empty);
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn bytes_payload_too_large_error_response_is_413() {
+        let err = RawBodyError::PayloadTooLarge {
+            size: 5_000_000,
+            limit: 2_000_000,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ---- StringBody limit tests ----
+
+    #[test]
+    fn string_body_over_limit_rejected() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        req.insert_extension(RawBodyConfig::new().limit(10));
+        req.set_body(Body::Bytes(b"this is longer than ten bytes".to_vec()));
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(RawBodyError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn string_body_under_limit_accepted() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/text");
+        req.insert_extension(RawBodyConfig::new().limit(100));
+        req.set_body(Body::Bytes(b"short".to_vec()));
+
+        let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "short");
+    }
+
+    // ---- RawBodyConfig tests ----
+
+    #[test]
+    fn raw_body_config_default() {
+        let config = RawBodyConfig::default();
+        assert_eq!(config.get_limit(), DEFAULT_RAW_BODY_LIMIT);
+        assert_eq!(config.get_limit(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn raw_body_config_builder() {
+        let config = RawBodyConfig::new().limit(500);
+        assert_eq!(config.get_limit(), 500);
+    }
+
+    // ---- JsonConfig tests ----
+
+    #[test]
+    fn json_config_default() {
+        let config = JsonConfig::default();
+        assert_eq!(config.get_limit(), DEFAULT_JSON_LIMIT);
+    }
+
+    #[test]
+    fn json_config_builder() {
+        let config = JsonConfig::new().limit(2048);
+        assert_eq!(config.get_limit(), 2048);
+    }
+
+    // ---- FormConfig tests ----
+
+    #[test]
+    fn form_config_default() {
+        let config = FormConfig::default();
+        assert_eq!(config.get_limit(), DEFAULT_FORM_LIMIT);
+    }
+
+    #[test]
+    fn form_config_builder() {
+        let config = FormConfig::new().limit(4096);
+        assert_eq!(config.get_limit(), 4096);
+    }
+
+    // ---- Cross-extractor limit behavior ----
+
+    #[test]
+    fn json_uses_context_body_limit_not_json_config() {
+        // Verify Json extractor uses ctx.max_body_size(), not JsonConfig.limit
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            val: String,
+        }
+
+        // Context with 50 byte limit
+        let ctx = test_context_with_limit(50);
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        // Body of 60 bytes
+        let body = "{\"val\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+        assert!(body.len() > 50);
+        req.set_body(Body::Bytes(body.as_bytes().to_vec()));
+
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(
+            matches!(result, Err(JsonExtractError::PayloadTooLarge { .. })),
+            "Json should use context body limit (50), not default"
+        );
+    }
+
+    #[test]
+    fn form_uses_context_body_limit() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            val: String,
+        }
+
+        // Context with 30 byte limit
+        let ctx = test_context_with_limit(30);
+        let mut req = Request::new(Method::Post, "/form");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+
+        // Body of 35 bytes
+        let body = "val=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(body.len() > 30);
+        req.set_body(Body::Bytes(body.as_bytes().to_vec()));
+
+        let result = futures_executor::block_on(Form::<Data>::from_request(&ctx, &mut req));
+        assert!(
+            matches!(result, Err(FormExtractError::PayloadTooLarge { .. })),
+            "Form should use context body limit"
+        );
+    }
+
+    #[test]
+    fn bytes_uses_extension_config_not_context_limit() {
+        // Bytes uses RawBodyConfig extension, not ctx.max_body_size()
+        let ctx = test_context_with_limit(10); // Small context limit
+        let mut req = Request::new(Method::Post, "/upload");
+        // RawBodyConfig with a large limit
+        req.insert_extension(RawBodyConfig::new().limit(1000));
+        req.set_body(Body::Bytes(vec![0u8; 500]));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        // Should use extension config (1000), not context limit (10)
+        assert!(
+            result.is_ok(),
+            "Bytes should use RawBodyConfig from extension, not context limit"
+        );
+    }
+
+    #[test]
+    fn bytes_without_config_uses_default_raw_limit() {
+        // When no RawBodyConfig extension, Bytes uses DEFAULT_RAW_BODY_LIMIT
+        let ctx = test_context_with_limit(10); // Small context limit
+        let mut req = Request::new(Method::Post, "/upload");
+        // No extension set, body under DEFAULT_RAW_BODY_LIMIT (2MB)
+        req.set_body(Body::Bytes(vec![0u8; 500]));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        // Uses DEFAULT_RAW_BODY_LIMIT (2MB), not context limit (10)
+        assert!(result.is_ok());
+    }
+
+    // ---- Error detail tests ----
+
+    #[test]
+    fn json_error_response_body_contains_size_info() {
+        let err = JsonExtractError::PayloadTooLarge {
+            size: 2_500_000,
+            limit: 1_048_576,
+        };
+        let response = err.into_response();
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let body = std::str::from_utf8(bytes).unwrap();
+            assert!(
+                body.contains("2500000"),
+                "Error should contain actual size, got: {}",
+                body
+            );
+            assert!(
+                body.contains("1048576"),
+                "Error should contain limit, got: {}",
+                body
+            );
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn form_error_response_body_contains_size_info() {
+        let err = FormExtractError::PayloadTooLarge {
+            size: 3_000_000,
+            limit: 1_048_576,
+        };
+        let response = err.into_response();
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let body = std::str::from_utf8(bytes).unwrap();
+            assert!(
+                body.contains("3000000"),
+                "Error should contain actual size, got: {}",
+                body
+            );
+            assert!(
+                body.contains("1048576"),
+                "Error should contain limit, got: {}",
+                body
+            );
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    #[test]
+    fn raw_body_error_response_contains_size_info() {
+        let err = RawBodyError::PayloadTooLarge {
+            size: 5_000_000,
+            limit: 2_097_152,
+        };
+        let response = err.into_response();
+        if let ResponseBody::Bytes(bytes) = response.body_ref() {
+            let body = std::str::from_utf8(bytes).unwrap();
+            assert!(
+                body.contains("5000000"),
+                "Error should contain actual size, got: {}",
+                body
+            );
+            assert!(
+                body.contains("2097152"),
+                "Error should contain limit, got: {}",
+                body
+            );
+        } else {
+            panic!("Expected Bytes body");
+        }
+    }
+
+    // ---- Streaming body rejection tests ----
+
+    #[test]
+    fn json_streaming_body_rejected() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            val: i32,
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/api");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+
+        let stream = asupersync::stream::iter(
+            vec![Ok(b"chunk".to_vec())]
+                .into_iter()
+                .map(|r: Result<Vec<u8>, crate::request::RequestBodyStreamError>| r),
+        );
+        req.set_body(Body::streaming(stream));
+
+        let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(JsonExtractError::StreamingNotSupported)
+        ));
+    }
+
+    #[test]
+    fn form_streaming_body_rejected() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Data {
+            field: String,
+        }
+
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/form");
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
+
+        let stream = asupersync::stream::iter(
+            vec![Ok(b"chunk".to_vec())]
+                .into_iter()
+                .map(|r: Result<Vec<u8>, crate::request::RequestBodyStreamError>| r),
+        );
+        req.set_body(Body::streaming(stream));
+
+        let result = futures_executor::block_on(Form::<Data>::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(FormExtractError::StreamingNotSupported)
+        ));
+    }
+
+    #[test]
+    fn bytes_streaming_body_rejected() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/upload");
+
+        let stream = asupersync::stream::iter(
+            vec![Ok(b"chunk".to_vec())]
+                .into_iter()
+                .map(|r: Result<Vec<u8>, crate::request::RequestBodyStreamError>| r),
+        );
+        req.set_body(Body::streaming(stream));
+
+        let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
+        assert!(matches!(
+            result,
+            Err(RawBodyError::StreamingNotSupported)
+        ));
     }
 }

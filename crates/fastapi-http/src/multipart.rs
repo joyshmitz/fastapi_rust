@@ -325,9 +325,7 @@ impl MultipartParser {
 
             // Check if this is the final boundary (--boundary--)
             let boundary_end = pos + self.boundary.len();
-            if boundary_end + 2 <= body.len()
-                && body[boundary_end..boundary_end + 2] == *b"--"
-            {
+            if boundary_end + 2 <= body.len() && body[boundary_end..boundary_end + 2] == *b"--" {
                 // End of multipart data
                 break;
             }

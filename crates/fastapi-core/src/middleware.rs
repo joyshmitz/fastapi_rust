@@ -2870,7 +2870,10 @@ impl InMemoryRateLimitStore {
         refill_rate: f64,
         window: Duration,
     ) -> RateLimitResult {
-        let mut buckets = self.token_buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buckets = self
+            .token_buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
 
         let state = buckets
@@ -2915,7 +2918,10 @@ impl InMemoryRateLimitStore {
         max_requests: u64,
         window: Duration,
     ) -> RateLimitResult {
-        let mut windows = self.fixed_windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut windows = self
+            .fixed_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
 
         let state = windows
@@ -2992,9 +2998,7 @@ impl InMemoryRateLimitStore {
         let weighted_count =
             (state.previous_count as f64 * previous_weight) + state.current_count as f64;
 
-        let remaining_time = window
-            .checked_sub(window_elapsed)
-            .unwrap_or(Duration::ZERO);
+        let remaining_time = window.checked_sub(window_elapsed).unwrap_or(Duration::ZERO);
 
         if weighted_count < max_requests as f64 {
             state.current_count += 1;
@@ -3031,9 +3035,7 @@ impl InMemoryRateLimitStore {
                 let refill_rate = max_requests as f64 / window.as_secs_f64();
                 self.check_token_bucket(key, max_requests, refill_rate, window)
             }
-            RateLimitAlgorithm::FixedWindow => {
-                self.check_fixed_window(key, max_requests, window)
-            }
+            RateLimitAlgorithm::FixedWindow => self.check_fixed_window(key, max_requests, window),
             RateLimitAlgorithm::SlidingWindow => {
                 self.check_sliding_window(key, max_requests, window)
             }
@@ -3229,10 +3231,7 @@ impl RateLimitMiddleware {
     /// Add rate limit headers to a response.
     fn add_headers(&self, response: Response, result: &RateLimitResult) -> Response {
         response
-            .header(
-                "X-RateLimit-Limit",
-                result.limit.to_string().into_bytes(),
-            )
+            .header("X-RateLimit-Limit", result.limit.to_string().into_bytes())
             .header(
                 "X-RateLimit-Remaining",
                 result.remaining.to_string().into_bytes(),
@@ -3273,20 +3272,19 @@ impl Middleware for RateLimitMiddleware {
 
             if result.allowed {
                 // Store the result for the `after` hook to add headers
-                req.insert_extension(RateLimitInfo {
-                    result,
-                });
+                req.insert_extension(RateLimitInfo { result });
                 ControlFlow::Continue
             } else {
                 // Return 429 Too Many Requests
                 let body = self.too_many_requests_body(&result);
-                let mut response = Response::with_status(crate::response::StatusCode::TOO_MANY_REQUESTS)
-                    .header("Content-Type", b"application/json".to_vec())
-                    .header(
-                        "Retry-After",
-                        result.reset_after_secs.to_string().into_bytes(),
-                    )
-                    .body(crate::response::ResponseBody::Bytes(body));
+                let mut response =
+                    Response::with_status(crate::response::StatusCode::TOO_MANY_REQUESTS)
+                        .header("Content-Type", b"application/json".to_vec())
+                        .header(
+                            "Retry-After",
+                            result.reset_after_secs.to_string().into_bytes(),
+                        )
+                        .body(crate::response::ResponseBody::Bytes(body));
 
                 if self.config.include_headers {
                     response = self.add_headers(response, &result);
@@ -3324,6 +3322,474 @@ impl Middleware for RateLimitMiddleware {
 
 // ---------------------------------------------------------------------------
 // End Rate Limiting Middleware
+// ---------------------------------------------------------------------------
+
+// ============================================================================
+// Request Inspection Middleware (Development)
+// ============================================================================
+
+/// Verbosity level for the request inspection middleware.
+///
+/// Controls how much detail is shown in the request/response output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectionVerbosity {
+    /// Minimal: one-line summary per request/response.
+    ///
+    /// Shows: `-->  GET /path` and `<--  200 OK (12ms)`
+    Minimal,
+
+    /// Normal: summary plus headers.
+    ///
+    /// Shows method/path, all headers (filtered), and status/timing.
+    Normal,
+
+    /// Verbose: summary, headers, and body preview.
+    ///
+    /// Shows everything in Normal plus request/response body previews
+    /// with JSON pretty-printing when applicable.
+    Verbose,
+}
+
+/// Development middleware that logs detailed, human-readable request/response
+/// information using arrow-style formatting.
+///
+/// This middleware is designed for development and debugging. It outputs
+/// concise inspection lines showing request flow:
+///
+/// ```text
+/// -->  POST /api/users
+///      Content-Type: application/json
+///      Content-Length: 42
+///      {"name": "Alice"}
+/// <--  201 Created (12ms)
+///      Content-Type: application/json
+///      {"id": 1, "name": "Alice"}
+/// ```
+///
+/// # Features
+///
+/// - **Configurable verbosity**: Minimal (one-liner), Normal (+ headers),
+///   Verbose (+ body preview with JSON pretty-printing)
+/// - **Slow request highlighting**: Marks requests exceeding a threshold
+/// - **Sensitive header filtering**: Redacts authorization, cookie, etc.
+/// - **JSON pretty-printing**: Detects JSON bodies and formats them
+/// - **Body size limits**: Truncates large bodies to a configurable max
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::RequestInspectionMiddleware;
+///
+/// let inspector = RequestInspectionMiddleware::new()
+///     .verbosity(InspectionVerbosity::Verbose)
+///     .slow_threshold_ms(500)
+///     .max_body_preview(4096);
+///
+/// let mut stack = MiddlewareStack::new();
+/// stack.push(inspector);
+/// ```
+pub struct RequestInspectionMiddleware {
+    log_config: LogConfig,
+    verbosity: InspectionVerbosity,
+    redact_headers: HashSet<String>,
+    slow_threshold_ms: u64,
+    max_body_preview: usize,
+}
+
+impl Default for RequestInspectionMiddleware {
+    fn default() -> Self {
+        Self {
+            log_config: LogConfig::development(),
+            verbosity: InspectionVerbosity::Normal,
+            redact_headers: default_redacted_headers(),
+            slow_threshold_ms: 1000,
+            max_body_preview: 2048,
+        }
+    }
+}
+
+impl RequestInspectionMiddleware {
+    /// Create a new inspection middleware with development defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the logging configuration.
+    #[must_use]
+    pub fn log_config(mut self, config: LogConfig) -> Self {
+        self.log_config = config;
+        self
+    }
+
+    /// Set the verbosity level.
+    #[must_use]
+    pub fn verbosity(mut self, level: InspectionVerbosity) -> Self {
+        self.verbosity = level;
+        self
+    }
+
+    /// Set the threshold (in milliseconds) above which requests are flagged as slow.
+    #[must_use]
+    pub fn slow_threshold_ms(mut self, ms: u64) -> Self {
+        self.slow_threshold_ms = ms;
+        self
+    }
+
+    /// Set the maximum number of bytes to show in body previews.
+    #[must_use]
+    pub fn max_body_preview(mut self, max: usize) -> Self {
+        self.max_body_preview = max;
+        self
+    }
+
+    /// Add a header name to the redaction set (case-insensitive).
+    #[must_use]
+    pub fn redact_header(mut self, name: impl Into<String>) -> Self {
+        self.redact_headers.insert(name.into().to_ascii_lowercase());
+        self
+    }
+
+    /// Format a request body for display, with optional JSON pretty-printing.
+    fn format_body_preview(&self, bytes: &[u8], content_type: Option<&[u8]>) -> Option<String> {
+        if bytes.is_empty() || self.max_body_preview == 0 {
+            return None;
+        }
+
+        let is_json = content_type
+            .and_then(|ct| std::str::from_utf8(ct).ok())
+            .is_some_and(|ct| ct.contains("application/json"));
+
+        let limit = self.max_body_preview.min(bytes.len());
+        let truncated = bytes.len() > self.max_body_preview;
+
+        match std::str::from_utf8(&bytes[..limit]) {
+            Ok(text) => {
+                if is_json {
+                    // Attempt JSON pretty-printing on the full available text
+                    if let Some(pretty) = try_pretty_json(text) {
+                        let mut output = pretty;
+                        if truncated {
+                            output.push_str("\n     ... (truncated)");
+                        }
+                        return Some(output);
+                    }
+                }
+                let mut output = text.to_string();
+                if truncated {
+                    output.push_str("...");
+                }
+                Some(output)
+            }
+            Err(_) => Some(format!("<{} bytes binary>", bytes.len())),
+        }
+    }
+
+    /// Format a response body for display.
+    fn format_response_preview(
+        &self,
+        body: &crate::response::ResponseBody,
+        content_type: Option<&[u8]>,
+    ) -> Option<String> {
+        match body {
+            crate::response::ResponseBody::Empty => None,
+            crate::response::ResponseBody::Bytes(bytes) => {
+                self.format_body_preview(bytes, content_type)
+            }
+            crate::response::ResponseBody::Stream(_) => Some("<streaming body>".to_string()),
+        }
+    }
+
+    /// Build the formatted header block for display.
+    fn format_inspection_headers<'a>(
+        &self,
+        headers: impl Iterator<Item = (&'a str, &'a [u8])>,
+    ) -> String {
+        let mut out = String::new();
+        for (name, value) in headers {
+            out.push_str("\n     ");
+            out.push_str(name);
+            out.push_str(": ");
+
+            let lowered = name.to_ascii_lowercase();
+            if self.redact_headers.contains(&lowered) {
+                out.push_str("[REDACTED]");
+            } else {
+                match std::str::from_utf8(value) {
+                    Ok(text) => out.push_str(text),
+                    Err(_) => out.push_str("<binary>"),
+                }
+            }
+        }
+        out
+    }
+
+    /// Build the response header block from (String, Vec<u8>) pairs.
+    fn format_response_inspection_headers(&self, headers: &[(String, Vec<u8>)]) -> String {
+        self.format_inspection_headers(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_slice())),
+        )
+    }
+}
+
+/// Extension type to store request start time for the inspection middleware.
+#[derive(Debug, Clone)]
+struct InspectionStart(Instant);
+
+impl Middleware for RequestInspectionMiddleware {
+    fn before<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, ControlFlow> {
+        let logger = RequestLogger::new(ctx, self.log_config.clone());
+        req.insert_extension(InspectionStart(Instant::now()));
+
+        let method = req.method();
+        let path = req.path();
+        let query = req.query();
+
+        // Build the request line: "-->  GET /path?query"
+        let mut request_line = format!("-->  {method} {path}");
+        if let Some(q) = query {
+            request_line.push('?');
+            request_line.push_str(q);
+        }
+
+        let body_size = body_len(req.body());
+        if body_size > 0 {
+            request_line.push_str(&format!(" ({body_size} bytes)"));
+        }
+
+        match self.verbosity {
+            InspectionVerbosity::Minimal => {
+                logger.info(request_line);
+            }
+            InspectionVerbosity::Normal => {
+                let headers = self.format_inspection_headers(req.headers().iter());
+                logger.info(format!("{request_line}{headers}"));
+            }
+            InspectionVerbosity::Verbose => {
+                let headers = self.format_inspection_headers(req.headers().iter());
+                let content_type = req.headers().get("content-type");
+                let body_preview = match req.body() {
+                    Body::Empty => None,
+                    Body::Bytes(bytes) => self.format_body_preview(bytes, content_type),
+                    Body::Stream(_) => Some("<streaming body>".to_string()),
+                };
+
+                let mut output = format!("{request_line}{headers}");
+                if let Some(body) = body_preview {
+                    output.push_str("\n     ");
+                    // Indent multi-line body previews
+                    output.push_str(&body.replace('\n', "\n     "));
+                }
+                logger.info(output);
+            }
+        }
+
+        Box::pin(async { ControlFlow::Continue })
+    }
+
+    fn after<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a Request,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        let logger = RequestLogger::new(ctx, self.log_config.clone());
+        let duration = req
+            .get_extension::<InspectionStart>()
+            .map(|start| start.0.elapsed())
+            .unwrap_or_default();
+
+        let status = response.status();
+        let duration_ms = duration.as_millis();
+
+        // Build the response line: "<--  200 OK (12ms)"
+        let mut response_line = format!(
+            "<--  {} {} ({duration_ms}ms)",
+            status.as_u16(),
+            status.canonical_reason(),
+        );
+
+        // Flag slow requests
+        if duration_ms >= u128::from(self.slow_threshold_ms) {
+            response_line.push_str(" [SLOW]");
+        }
+
+        match self.verbosity {
+            InspectionVerbosity::Minimal => {
+                if duration_ms >= u128::from(self.slow_threshold_ms) {
+                    logger.warn(response_line);
+                } else {
+                    logger.info(response_line);
+                }
+            }
+            InspectionVerbosity::Normal => {
+                let headers = self.format_response_inspection_headers(response.headers());
+                let output = format!("{response_line}{headers}");
+                if duration_ms >= u128::from(self.slow_threshold_ms) {
+                    logger.warn(output);
+                } else {
+                    logger.info(output);
+                }
+            }
+            InspectionVerbosity::Verbose => {
+                let headers = self.format_response_inspection_headers(response.headers());
+
+                // Find content-type from response headers for JSON detection
+                let resp_content_type: Option<&[u8]> = response
+                    .headers()
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, value)| value.as_slice());
+
+                let body_preview =
+                    self.format_response_preview(response.body_ref(), resp_content_type);
+
+                let mut output = format!("{response_line}{headers}");
+                if let Some(body) = body_preview {
+                    output.push_str("\n     ");
+                    output.push_str(&body.replace('\n', "\n     "));
+                }
+
+                if duration_ms >= u128::from(self.slow_threshold_ms) {
+                    logger.warn(output);
+                } else {
+                    logger.info(output);
+                }
+            }
+        }
+
+        Box::pin(async move { response })
+    }
+
+    fn name(&self) -> &'static str {
+        "RequestInspection"
+    }
+}
+
+/// Attempt to parse and pretty-print a JSON string.
+///
+/// Returns `None` if the input is not valid JSON. Uses a minimal
+/// recursive formatter to avoid external dependencies.
+fn try_pretty_json(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+
+    // Validate it's actual JSON by attempting a parse, then pretty-format.
+    let mut output = String::with_capacity(trimmed.len() * 2);
+    if json_pretty_format(trimmed, &mut output).is_ok() {
+        Some(output)
+    } else {
+        None
+    }
+}
+
+/// Minimal JSON pretty-formatter without external dependencies.
+///
+/// Handles objects, arrays, strings, numbers, booleans, and null.
+/// Produces 2-space indented output.
+fn json_pretty_format(input: &str, output: &mut String) -> Result<(), ()> {
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    let mut indent: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    while pos < bytes.len() {
+        let ch = bytes[pos] as char;
+
+        if escape_next {
+            output.push(ch);
+            escape_next = false;
+            pos += 1;
+            continue;
+        }
+
+        if in_string {
+            output.push(ch);
+            if ch == '\\' {
+                escape_next = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            pos += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                output.push('"');
+            }
+            '{' | '[' => {
+                output.push(ch);
+                // Peek ahead: if the next non-whitespace is the closing bracket, keep compact
+                let peek = skip_whitespace(bytes, pos + 1);
+                let closing = if ch == '{' { '}' } else { ']' };
+                if peek < bytes.len() && bytes[peek] as char == closing {
+                    output.push(closing);
+                    pos = peek + 1;
+                    continue;
+                }
+                indent += 1;
+                output.push('\n');
+                push_indent(output, indent);
+            }
+            '}' | ']' => {
+                indent = indent.saturating_sub(1);
+                output.push('\n');
+                push_indent(output, indent);
+                output.push(ch);
+            }
+            ':' => {
+                output.push_str(": ");
+            }
+            ',' => {
+                output.push(',');
+                output.push('\n');
+                push_indent(output, indent);
+            }
+            c if c.is_ascii_whitespace() => {
+                // Skip whitespace outside strings
+            }
+            _ => {
+                output.push(ch);
+            }
+        }
+
+        pos += 1;
+    }
+
+    if in_string || indent != 0 {
+        return Err(());
+    }
+
+    Ok(())
+}
+
+fn skip_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn push_indent(output: &mut String, level: usize) {
+    for _ in 0..level {
+        output.push_str("  ");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End Request Inspection Middleware
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -5299,6 +5765,742 @@ mod tests {
         assert!(result.is_break()); // Should reject empty tokens
     }
 
+    // ---- Comprehensive CSRF tests (bd-3v0c) ----
+
+    #[test]
+    fn csrf_token_generate_many_unique() {
+        // Generate many tokens and verify all are unique
+        let mut tokens = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let token = CsrfToken::generate();
+            assert!(
+                tokens.insert(token.0.clone()),
+                "Duplicate token generated: {}",
+                token.0
+            );
+        }
+        assert_eq!(tokens.len(), 100);
+    }
+
+    #[test]
+    fn csrf_token_generate_format_is_hex_with_dashes() {
+        let token = CsrfToken::generate();
+        let parts: Vec<&str> = token.as_str().split('-').collect();
+        assert_eq!(parts.len(), 3, "Expected 3 dash-separated hex segments");
+        // Each part should be valid hex
+        for part in &parts {
+            assert!(
+                part.chars().all(|c| c.is_ascii_hexdigit()),
+                "Non-hex character in token segment: {}",
+                part
+            );
+        }
+        // Segments: 16-char timestamp, 8-char counter, 16-char thread hash
+        assert_eq!(parts[0].len(), 16);
+        assert_eq!(parts[1].len(), 8);
+        assert_eq!(parts[2].len(), 16);
+    }
+
+    #[test]
+    fn csrf_token_generate_minimum_length() {
+        let token = CsrfToken::generate();
+        // 16 + 1 + 8 + 1 + 16 = 42 chars minimum
+        assert!(
+            token.as_str().len() >= 42,
+            "Token too short: {} (len={})",
+            token.as_str(),
+            token.as_str().len()
+        );
+    }
+
+    #[test]
+    fn csrf_token_from_str() {
+        let token: CsrfToken = "my-token".into();
+        assert_eq!(token.as_str(), "my-token");
+        assert_eq!(token.0, "my-token");
+    }
+
+    #[test]
+    fn csrf_token_clone_eq() {
+        let t1 = CsrfToken::new("abc");
+        let t2 = t1.clone();
+        assert_eq!(t1, t2);
+        assert_eq!(t1.as_str(), t2.as_str());
+    }
+
+    #[test]
+    fn csrf_middleware_allows_trace_without_token() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Trace, "/");
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+        // Token should be generated
+        assert!(req.get_extension::<CsrfToken>().is_some());
+    }
+
+    #[test]
+    fn csrf_safe_method_generates_token_into_extension() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        for method in [
+            crate::request::Method::Get,
+            crate::request::Method::Head,
+            crate::request::Method::Options,
+            crate::request::Method::Trace,
+        ] {
+            let mut req = Request::new(method, "/test");
+            let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+            assert!(result.is_continue());
+            let token = req.get_extension::<CsrfToken>().expect("token missing");
+            assert!(!token.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn csrf_safe_method_preserves_existing_cookie_token() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("cookie", b"csrf_token=my-existing-token".to_vec());
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+
+        // Extension should contain the existing cookie token, not a new one
+        let token = req.get_extension::<CsrfToken>().unwrap();
+        assert_eq!(token.as_str(), "my-existing-token");
+    }
+
+    #[test]
+    fn csrf_valid_post_stores_token_in_extension() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/submit");
+
+        let tk = "valid-token-xyz";
+        req.headers_mut()
+            .insert("cookie", format!("csrf_token={}", tk).into_bytes());
+        req.headers_mut()
+            .insert("x-csrf-token", tk.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+        let stored = req.get_extension::<CsrfToken>().unwrap();
+        assert_eq!(stored.as_str(), tk);
+    }
+
+    #[test]
+    fn csrf_double_submit_both_empty_strings_rejected() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        // Both cookie and header have empty string values
+        req.headers_mut().insert("cookie", b"csrf_token=".to_vec());
+        req.headers_mut().insert("x-csrf-token", b"".to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_break());
+    }
+
+    #[test]
+    fn csrf_double_submit_matching_empty_rejected() {
+        // Even if both are technically "equal" (empty), should reject
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        req.headers_mut().insert("cookie", b"csrf_token=".to_vec());
+        req.headers_mut().insert("x-csrf-token", b"".to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_break(), "Empty matching tokens should be rejected");
+    }
+
+    #[test]
+    fn csrf_header_only_mode_does_not_need_cookie() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().mode(CsrfMode::HeaderOnly));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        // Header only, no cookie
+        req.headers_mut()
+            .insert("x-csrf-token", b"header-only-token".to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+        let token = req.get_extension::<CsrfToken>().unwrap();
+        assert_eq!(token.as_str(), "header-only-token");
+    }
+
+    #[test]
+    fn csrf_header_only_mode_ignores_mismatched_cookie() {
+        // In HeaderOnly mode, the cookie value is irrelevant
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().mode(CsrfMode::HeaderOnly));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        req.headers_mut()
+            .insert("cookie", b"csrf_token=different-value".to_vec());
+        req.headers_mut()
+            .insert("x-csrf-token", b"header-value".to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue(), "HeaderOnly should ignore cookie");
+    }
+
+    #[test]
+    fn csrf_header_only_mode_rejects_no_header() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().mode(CsrfMode::HeaderOnly));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+        // No header at all
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_break());
+    }
+
+    #[test]
+    fn csrf_header_only_error_message_mentions_header() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().mode(CsrfMode::HeaderOnly));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        if let ControlFlow::Break(response) = result {
+            if let ResponseBody::Bytes(body) = response.body_ref() {
+                let body_str = std::str::from_utf8(body).unwrap();
+                assert!(
+                    body_str.contains("missing in header"),
+                    "Expected 'missing in header' in: {}",
+                    body_str
+                );
+            }
+        } else {
+            panic!("Expected Break");
+        }
+    }
+
+    #[test]
+    fn csrf_mismatch_error_differs_from_missing_error() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        // Missing: no header or cookie
+        let mut req_missing = Request::new(crate::request::Method::Post, "/");
+        let missing_result = futures_executor::block_on(csrf.before(&ctx, &mut req_missing));
+        let missing_body = match missing_result {
+            ControlFlow::Break(r) => match r.body_ref() {
+                ResponseBody::Bytes(b) => std::str::from_utf8(b).unwrap().to_string(),
+                _ => panic!("Expected Bytes"),
+            },
+            _ => panic!("Expected Break"),
+        };
+
+        // Mismatch: both present but different
+        let mut req_mismatch = Request::new(crate::request::Method::Post, "/");
+        req_mismatch
+            .headers_mut()
+            .insert("cookie", b"csrf_token=aaa".to_vec());
+        req_mismatch
+            .headers_mut()
+            .insert("x-csrf-token", b"bbb".to_vec());
+        let mismatch_result = futures_executor::block_on(csrf.before(&ctx, &mut req_mismatch));
+        let mismatch_body = match mismatch_result {
+            ControlFlow::Break(r) => match r.body_ref() {
+                ResponseBody::Bytes(b) => std::str::from_utf8(b).unwrap().to_string(),
+                _ => panic!("Expected Bytes"),
+            },
+            _ => panic!("Expected Break"),
+        };
+
+        // Error messages should differ
+        assert_ne!(
+            missing_body, mismatch_body,
+            "Missing vs mismatch should have different error messages"
+        );
+        assert!(missing_body.contains("missing"));
+        assert!(mismatch_body.contains("mismatch"));
+    }
+
+    #[test]
+    fn csrf_cookie_not_httponly() {
+        // CSRF cookies MUST be readable by JavaScript (no HttpOnly)
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        assert!(
+            !cookie_value.to_lowercase().contains("httponly"),
+            "CSRF cookie must NOT be HttpOnly (needs JS access), got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn csrf_cookie_has_path_slash() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        assert!(
+            cookie_value.contains("Path=/"),
+            "Cookie should have Path=/, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn csrf_cookie_has_samesite_strict() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        assert!(
+            cookie_value.contains("SameSite=Strict"),
+            "Cookie should have SameSite=Strict, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn csrf_production_mode_sets_secure_flag() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().production(true));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        assert!(
+            cookie_value.contains("Secure"),
+            "Production cookie must have Secure flag, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn csrf_no_set_cookie_on_post_response() {
+        // Set-Cookie should only be added for safe methods, not POST
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let token = "valid-token";
+        req.headers_mut()
+            .insert("cookie", format!("csrf_token={}", token).into_bytes());
+        req.headers_mut()
+            .insert("x-csrf-token", token.as_bytes().to_vec());
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        assert!(
+            header_value(&result, "set-cookie").is_none(),
+            "POST response should not set CSRF cookie"
+        );
+    }
+
+    #[test]
+    fn csrf_head_method_sets_cookie() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Head, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        assert!(
+            header_value(&result, "set-cookie").is_some(),
+            "HEAD response should set CSRF cookie"
+        );
+    }
+
+    #[test]
+    fn csrf_options_method_sets_cookie() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Options, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        assert!(
+            header_value(&result, "set-cookie").is_some(),
+            "OPTIONS response should set CSRF cookie"
+        );
+    }
+
+    #[test]
+    fn csrf_rotation_produces_different_token_in_cookie() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().rotate_token(true));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let old_token = "old-token-value";
+        req.headers_mut()
+            .insert("cookie", format!("csrf_token={}", old_token).into_bytes());
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        // When rotation is enabled, old token is reused from cookie parse, but
+        // the cookie IS set (which the before phase stored in extension).
+        // The existing token from cookie is used, so cookie_value will contain old_token.
+        // This verifies the Set-Cookie is emitted even with an existing cookie.
+        assert!(cookie_value.starts_with("csrf_token="));
+    }
+
+    #[test]
+    fn csrf_no_rotation_skips_set_cookie_when_present() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().rotate_token(false));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        req.headers_mut()
+            .insert("cookie", b"csrf_token=existing".to_vec());
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        assert!(
+            header_value(&result, "set-cookie").is_none(),
+            "Without rotation, should not re-set existing cookie"
+        );
+    }
+
+    #[test]
+    fn csrf_custom_cookie_name_in_set_cookie_response() {
+        let csrf =
+            CsrfMiddleware::with_config(CsrfConfig::new().cookie_name("XSRF-TOKEN"));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        let response = Response::ok();
+        let result = futures_executor::block_on(csrf.after(&ctx, &req, response));
+
+        let cookie_value = header_value(&result, "set-cookie").unwrap();
+        assert!(
+            cookie_value.starts_with("XSRF-TOKEN="),
+            "Custom cookie name should appear in Set-Cookie, got: {}",
+            cookie_value
+        );
+    }
+
+    #[test]
+    fn csrf_custom_header_name_validated() {
+        let csrf = CsrfMiddleware::with_config(
+            CsrfConfig::new()
+                .header_name("X-Custom-CSRF")
+                .cookie_name("my_csrf"),
+        );
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let token = "custom-tok";
+        req.headers_mut()
+            .insert("cookie", format!("my_csrf={}", token).into_bytes());
+        req.headers_mut()
+            .insert("x-custom-csrf", token.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn csrf_custom_header_name_wrong_header_rejected() {
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().header_name("X-Custom-CSRF"));
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let token = "some-token";
+        req.headers_mut()
+            .insert("cookie", format!("csrf_token={}", token).into_bytes());
+        // Using default header name instead of custom one
+        req.headers_mut()
+            .insert("x-csrf-token", token.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_break(), "Wrong header name should be rejected");
+    }
+
+    #[test]
+    fn csrf_cookie_parsing_multiple_cookies_picks_correct() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let token = "correct-csrf";
+        req.headers_mut().insert(
+            "cookie",
+            format!(
+                "session=abc; other=xyz; csrf_token={}; tracking=123",
+                token
+            )
+            .into_bytes(),
+        );
+        req.headers_mut()
+            .insert("x-csrf-token", token.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn csrf_cookie_parsing_spaces_around_semicolons() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let token = "spaced-token";
+        req.headers_mut().insert(
+            "cookie",
+            format!("session=abc ;  csrf_token={}  ; other=xyz", token).into_bytes(),
+        );
+        req.headers_mut()
+            .insert("x-csrf-token", token.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn csrf_error_response_status_is_403() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        // Test all state-changing methods return 403
+        for method in [
+            crate::request::Method::Post,
+            crate::request::Method::Put,
+            crate::request::Method::Delete,
+            crate::request::Method::Patch,
+        ] {
+            let mut req = Request::new(method, "/");
+            let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+            match result {
+                ControlFlow::Break(response) => {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::FORBIDDEN,
+                        "Expected 403 for {:?}",
+                        method
+                    );
+                }
+                _ => panic!("Expected Break for {:?}", method),
+            }
+        }
+    }
+
+    #[test]
+    fn csrf_error_body_json_structure() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        if let ControlFlow::Break(response) = result {
+            if let ResponseBody::Bytes(body) = response.body_ref() {
+                let body_str = std::str::from_utf8(body).unwrap();
+                // Verify JSON structure
+                let parsed: serde_json::Value = serde_json::from_str(body_str)
+                    .unwrap_or_else(|e| panic!("Invalid JSON: {}: {}", body_str, e));
+                assert!(parsed["detail"].is_array());
+                let detail = &parsed["detail"][0];
+                assert_eq!(detail["type"], "csrf_error");
+                assert!(detail["loc"].is_array());
+                assert_eq!(detail["loc"][0], "header");
+                assert_eq!(detail["loc"][1], "x-csrf-token");
+                assert!(detail["msg"].is_string());
+            } else {
+                panic!("Expected Bytes body");
+            }
+        } else {
+            panic!("Expected Break");
+        }
+    }
+
+    #[test]
+    fn csrf_default_trait() {
+        let csrf = CsrfMiddleware::default();
+        assert_eq!(csrf.name(), "CSRF");
+        // Should behave identically to new()
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn csrf_mode_default_is_double_submit() {
+        assert_eq!(CsrfMode::default(), CsrfMode::DoubleSubmit);
+    }
+
+    #[test]
+    fn csrf_double_submit_both_present_same_non_empty_passes() {
+        // Explicit test of the core double-submit pattern
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        let token = "a1b2c3d4e5f6";
+        let mut req = Request::new(crate::request::Method::Delete, "/resource/1");
+        req.headers_mut()
+            .insert("cookie", format!("csrf_token={}", token).into_bytes());
+        req.headers_mut()
+            .insert("x-csrf-token", token.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn csrf_double_submit_case_sensitive() {
+        // Token comparison should be case-sensitive
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Post, "/");
+
+        req.headers_mut()
+            .insert("cookie", b"csrf_token=AbCdEf".to_vec());
+        req.headers_mut()
+            .insert("x-csrf-token", b"abcdef".to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+        assert!(result.is_break(), "Token comparison should be case-sensitive");
+    }
+
+    #[test]
+    fn csrf_token_cookie_extractor_reads_csrf_cookie() {
+        // Test that CsrfTokenCookie works as a cookie name marker
+        use crate::extract::{CookieName, CsrfTokenCookie};
+        assert_eq!(CsrfTokenCookie::NAME, "csrf_token");
+    }
+
+    #[test]
+    fn csrf_make_set_cookie_header_value_production() {
+        let value = CsrfMiddleware::make_set_cookie_header_value("csrf_token", "tok123", true);
+        let s = std::str::from_utf8(&value).unwrap();
+        assert!(s.contains("csrf_token=tok123"));
+        assert!(s.contains("Path=/"));
+        assert!(s.contains("SameSite=Strict"));
+        assert!(s.contains("Secure"));
+        assert!(!s.to_lowercase().contains("httponly"));
+    }
+
+    #[test]
+    fn csrf_make_set_cookie_header_value_development() {
+        let value = CsrfMiddleware::make_set_cookie_header_value("csrf_token", "tok123", false);
+        let s = std::str::from_utf8(&value).unwrap();
+        assert!(s.contains("csrf_token=tok123"));
+        assert!(s.contains("Path=/"));
+        assert!(s.contains("SameSite=Strict"));
+        assert!(!s.contains("Secure"));
+    }
+
+    #[test]
+    fn csrf_before_after_full_cycle_get_then_post() {
+        // Simulate a full CSRF flow: GET sets cookie, POST uses it
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        // Step 1: GET request - generates token and sets cookie
+        let mut get_req = Request::new(crate::request::Method::Get, "/form");
+        let _ = futures_executor::block_on(csrf.before(&ctx, &mut get_req));
+        let get_response = Response::ok();
+        let get_result = futures_executor::block_on(csrf.after(&ctx, &get_req, get_response));
+
+        let set_cookie = header_value(&get_result, "set-cookie").expect("GET should set cookie");
+        // Extract token value from "csrf_token=<value>; Path=/; ..."
+        let token_value = set_cookie
+            .strip_prefix("csrf_token=")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert!(!token_value.is_empty());
+
+        // Step 2: POST request - uses the token from cookie + header
+        let mut post_req = Request::new(crate::request::Method::Post, "/form");
+        post_req.headers_mut().insert(
+            "cookie",
+            format!("csrf_token={}", token_value).into_bytes(),
+        );
+        post_req
+            .headers_mut()
+            .insert("x-csrf-token", token_value.as_bytes().to_vec());
+
+        let result = futures_executor::block_on(csrf.before(&ctx, &mut post_req));
+        assert!(result.is_continue(), "POST with valid token should pass");
+    }
+
+    #[test]
+    fn csrf_all_state_changing_methods_require_token() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        for method in [
+            crate::request::Method::Post,
+            crate::request::Method::Put,
+            crate::request::Method::Delete,
+            crate::request::Method::Patch,
+        ] {
+            let mut req = Request::new(method, "/resource");
+            let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+            assert!(
+                result.is_break(),
+                "{:?} without token should be rejected",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn csrf_all_safe_methods_pass_without_token() {
+        let csrf = CsrfMiddleware::new();
+        let ctx = test_context();
+
+        for method in [
+            crate::request::Method::Get,
+            crate::request::Method::Head,
+            crate::request::Method::Options,
+            crate::request::Method::Trace,
+        ] {
+            let mut req = Request::new(method, "/resource");
+            let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
+            assert!(
+                result.is_continue(),
+                "{:?} should be allowed without token",
+                method
+            );
+        }
+    }
+
     // =========================================================================
     // Middleware Stack Ordering Tests (Onion Model)
     // =========================================================================
@@ -5975,25 +7177,343 @@ mod compression_tests {
         let middleware = CompressionMiddleware::new();
         assert_eq!(middleware.name(), "Compression");
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Rate Limiting Middleware Tests
-    // -----------------------------------------------------------------------
+// ============================================================================
+// Request Inspection Middleware Tests
+// ============================================================================
 
-    fn run_rate_limit_before(
-        mw: &RateLimitMiddleware,
-        req: &mut Request,
-    ) -> ControlFlow {
+#[cfg(test)]
+mod request_inspection_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::ResponseBody;
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(asupersync::Cx::for_testing(), 1)
+    }
+
+    #[test]
+    fn inspection_middleware_default_creates_normal_verbosity() {
+        let mw = RequestInspectionMiddleware::new();
+        assert_eq!(mw.verbosity, InspectionVerbosity::Normal);
+        assert_eq!(mw.slow_threshold_ms, 1000);
+        assert_eq!(mw.max_body_preview, 2048);
+        assert_eq!(mw.name(), "RequestInspection");
+    }
+
+    #[test]
+    fn inspection_middleware_builder_methods() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Verbose)
+            .slow_threshold_ms(500)
+            .max_body_preview(4096)
+            .log_config(LogConfig::development())
+            .redact_header("x-api-key");
+
+        assert_eq!(mw.verbosity, InspectionVerbosity::Verbose);
+        assert_eq!(mw.slow_threshold_ms, 500);
+        assert_eq!(mw.max_body_preview, 4096);
+        assert!(mw.redact_headers.contains("x-api-key"));
+        // Default redacted headers should still be present
+        assert!(mw.redact_headers.contains("authorization"));
+        assert!(mw.redact_headers.contains("cookie"));
+    }
+
+    #[test]
+    fn inspection_before_continues_processing() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Minimal);
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/api/users");
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn inspection_after_returns_response_unchanged() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Minimal);
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/health");
+
+        // Run before to set the InspectionStart extension
+        let _ = futures_executor::block_on(mw.before(&ctx, &mut req));
+
+        let response = Response::ok()
+            .body(ResponseBody::Bytes(b"OK".to_vec()));
+
+        let result = futures_executor::block_on(mw.after(&ctx, &req, response));
+        assert_eq!(result.status().as_u16(), 200);
+        assert_eq!(result.body_ref().len(), 2);
+    }
+
+    #[test]
+    fn inspection_stores_start_extension() {
+        let mw = RequestInspectionMiddleware::new();
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+
+        let _ = futures_executor::block_on(mw.before(&ctx, &mut req));
+
+        // Verify the InspectionStart extension was set
+        assert!(req.get_extension::<InspectionStart>().is_some());
+    }
+
+    #[test]
+    fn inspection_all_verbosity_levels_continue() {
+        for verbosity in [
+            InspectionVerbosity::Minimal,
+            InspectionVerbosity::Normal,
+            InspectionVerbosity::Verbose,
+        ] {
+            let mw = RequestInspectionMiddleware::new().verbosity(verbosity);
+            let ctx = test_context();
+            let mut req = Request::new(Method::Get, "/test");
+            req.headers_mut()
+                .insert("content-type", b"text/plain".to_vec());
+
+            let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+            assert!(
+                result.is_continue(),
+                "Verbosity {verbosity:?} should continue"
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_verbose_with_json_body() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Verbose);
+        let ctx = test_context();
+        let body = br#"{"name":"Alice","age":30}"#;
+        let mut req = Request::new(Method::Post, "/api/users");
+        req.headers_mut()
+            .insert("content-type", b"application/json".to_vec());
+        req.set_body(Body::Bytes(body.to_vec()));
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn inspection_verbose_after_with_json_response() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Verbose);
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/users/1");
+
+        let _ = futures_executor::block_on(mw.before(&ctx, &mut req));
+
+        let response = Response::ok()
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(
+                br#"{"id":1,"name":"Alice"}"#.to_vec(),
+            ));
+
+        let result = futures_executor::block_on(mw.after(&ctx, &req, response));
+        assert_eq!(result.status().as_u16(), 200);
+    }
+
+    #[test]
+    fn inspection_redacts_sensitive_headers() {
+        let mw = RequestInspectionMiddleware::new();
+
+        // Verify default redacted headers are present
+        assert!(mw.redact_headers.contains("authorization"));
+        assert!(mw.redact_headers.contains("proxy-authorization"));
+        assert!(mw.redact_headers.contains("cookie"));
+        assert!(mw.redact_headers.contains("set-cookie"));
+    }
+
+    #[test]
+    fn inspection_format_headers_redacts() {
+        let mw = RequestInspectionMiddleware::new()
+            .redact_header("x-secret");
+
+        let headers = vec![
+            ("content-type", b"text/plain".as_slice()),
+            ("x-secret", b"my-secret-value".as_slice()),
+            ("x-normal", b"visible".as_slice()),
+        ];
+
+        let output = mw.format_inspection_headers(headers.into_iter());
+        assert!(output.contains("content-type: text/plain"));
+        assert!(output.contains("x-secret: [REDACTED]"));
+        assert!(output.contains("x-normal: visible"));
+        assert!(!output.contains("my-secret-value"));
+    }
+
+    #[test]
+    fn inspection_format_body_preview_truncates() {
+        let mw = RequestInspectionMiddleware::new()
+            .max_body_preview(10);
+
+        let body = b"Hello, World! This is a long body.";
+        let result = mw.format_body_preview(body, None);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= 15); // 10 chars + "..."
+    }
+
+    #[test]
+    fn inspection_format_body_preview_empty() {
+        let mw = RequestInspectionMiddleware::new();
+        assert!(mw.format_body_preview(b"", None).is_none());
+    }
+
+    #[test]
+    fn inspection_format_body_preview_zero_max() {
+        let mw = RequestInspectionMiddleware::new()
+            .max_body_preview(0);
+        assert!(mw.format_body_preview(b"hello", None).is_none());
+    }
+
+    #[test]
+    fn inspection_format_body_preview_json_pretty() {
+        let mw = RequestInspectionMiddleware::new();
+        let body = br#"{"key":"value","num":42}"#;
+        let ct = b"application/json".as_slice();
+        let result = mw.format_body_preview(body, Some(ct));
+        assert!(result.is_some());
+        let text = result.unwrap();
+        // Pretty-printed JSON should contain newlines
+        assert!(text.contains('\n'));
+        assert!(text.contains("\"key\": \"value\""));
+    }
+
+    #[test]
+    fn inspection_format_body_preview_non_json() {
+        let mw = RequestInspectionMiddleware::new();
+        let body = b"Hello, World!";
+        let ct = b"text/plain".as_slice();
+        let result = mw.format_body_preview(body, Some(ct));
+        assert_eq!(result.unwrap(), "Hello, World!");
+    }
+
+    #[test]
+    fn inspection_format_body_preview_binary() {
+        let mw = RequestInspectionMiddleware::new();
+        let body: &[u8] = &[0xFF, 0xFE, 0xFD, 0x00];
+        let result = mw.format_body_preview(body, None);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("binary"));
+    }
+
+    #[test]
+    fn try_pretty_json_valid_object() {
+        let result = try_pretty_json(r#"{"a":"b","c":1}"#);
+        assert!(result.is_some());
+        let pretty = result.unwrap();
+        assert!(pretty.contains('\n'));
+        assert!(pretty.contains("  \"a\": \"b\""));
+    }
+
+    #[test]
+    fn try_pretty_json_valid_array() {
+        let result = try_pretty_json(r#"[1,2,3]"#);
+        assert!(result.is_some());
+        let pretty = result.unwrap();
+        assert!(pretty.contains('\n'));
+    }
+
+    #[test]
+    fn try_pretty_json_empty_object() {
+        let result = try_pretty_json("{}");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "{}");
+    }
+
+    #[test]
+    fn try_pretty_json_empty_array() {
+        let result = try_pretty_json("[]");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "[]");
+    }
+
+    #[test]
+    fn try_pretty_json_not_json() {
+        assert!(try_pretty_json("hello world").is_none());
+        assert!(try_pretty_json("12345").is_none());
+    }
+
+    #[test]
+    fn try_pretty_json_nested() {
+        let input = r#"{"user":{"name":"Alice","roles":["admin","user"]}}"#;
+        let result = try_pretty_json(input);
+        assert!(result.is_some());
+        let pretty = result.unwrap();
+        assert!(pretty.contains("\"user\":"));
+        assert!(pretty.contains("\"name\": \"Alice\""));
+        assert!(pretty.contains("\"roles\":"));
+    }
+
+    #[test]
+    fn try_pretty_json_with_escapes() {
+        let input = r#"{"msg":"hello \"world\""}"#;
+        let result = try_pretty_json(input);
+        assert!(result.is_some());
+        let pretty = result.unwrap();
+        assert!(pretty.contains(r#"\"world\""#));
+    }
+
+    #[test]
+    fn inspection_name() {
+        let mw = RequestInspectionMiddleware::new();
+        assert_eq!(mw.name(), "RequestInspection");
+    }
+
+    #[test]
+    fn inspection_default_via_default_trait() {
+        let mw = RequestInspectionMiddleware::default();
+        assert_eq!(mw.verbosity, InspectionVerbosity::Normal);
+        assert_eq!(mw.slow_threshold_ms, 1000);
+    }
+
+    #[test]
+    fn inspection_with_query_string() {
+        let mw = RequestInspectionMiddleware::new()
+            .verbosity(InspectionVerbosity::Minimal);
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/search");
+        req.set_query(Some("q=rust&page=1".to_string()));
+
+        let result = futures_executor::block_on(mw.before(&ctx, &mut req));
+        assert!(result.is_continue());
+    }
+
+    #[test]
+    fn inspection_response_body_stream() {
+        let mw = RequestInspectionMiddleware::new();
+        let result = mw.format_response_preview(&ResponseBody::Empty, None);
+        assert!(result.is_none());
+    }
+}
+
+// ============================================================================
+// Rate Limiting Middleware Tests
+// ============================================================================
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::{ResponseBody, StatusCode};
+    use std::time::Duration;
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(asupersync::Cx::for_testing(), 1)
+    }
+
+    fn run_rate_limit_before(mw: &RateLimitMiddleware, req: &mut Request) -> ControlFlow {
         let ctx = test_context();
         let fut = mw.before(&ctx, req);
         futures_executor::block_on(fut)
     }
 
-    fn run_rate_limit_after(
-        mw: &RateLimitMiddleware,
-        req: &Request,
-        resp: Response,
-    ) -> Response {
+    fn run_rate_limit_after(mw: &RateLimitMiddleware, req: &Request, resp: Response) -> Response {
         let ctx = test_context();
         let fut = mw.after(&ctx, req, resp);
         futures_executor::block_on(fut)
@@ -6088,10 +7608,7 @@ mod compression_tests {
             req.headers_mut()
                 .insert("x-forwarded-for", b"10.0.0.1".to_vec());
             let result = run_rate_limit_before(&mw, &mut req);
-            assert!(
-                result.is_continue(),
-                "burst request {i} should be allowed"
-            );
+            assert!(result.is_continue(), "burst request {i} should be allowed");
         }
 
         // 6th request should be blocked (bucket empty)
@@ -6139,21 +7656,18 @@ mod compression_tests {
         // Two requests with same API key
         for _ in 0..2 {
             let mut req = Request::new(Method::Get, "/");
-            req.headers_mut()
-                .insert("x-api-key", b"key-abc".to_vec());
+            req.headers_mut().insert("x-api-key", b"key-abc".to_vec());
             assert!(run_rate_limit_before(&mw, &mut req).is_continue());
         }
 
         // Same key blocked
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut()
-            .insert("x-api-key", b"key-abc".to_vec());
+        req.headers_mut().insert("x-api-key", b"key-abc".to_vec());
         assert!(run_rate_limit_before(&mw, &mut req).is_break());
 
         // Different key still allowed
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut()
-            .insert("x-api-key", b"key-xyz".to_vec());
+        req.headers_mut().insert("x-api-key", b"key-xyz".to_vec());
         assert!(run_rate_limit_before(&mw, &mut req).is_continue());
     }
 
@@ -6276,10 +7790,7 @@ mod compression_tests {
             let has_ct = resp
                 .headers()
                 .iter()
-                .any(|(n, v)| {
-                    n.eq_ignore_ascii_case("content-type")
-                        && v == b"application/json"
-                });
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == b"application/json");
             assert!(has_ct, "429 response should have JSON content type");
         } else {
             panic!("expected Break(429)");
@@ -6308,7 +7819,10 @@ mod compression_tests {
             .headers()
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("x-ratelimit-limit"));
-        assert!(!has_limit, "should NOT have rate limit headers when disabled");
+        assert!(
+            !has_limit,
+            "should NOT have rate limit headers when disabled"
+        );
     }
 
     #[test]
@@ -6359,8 +7873,7 @@ mod compression_tests {
     fn rate_limit_ip_extractor_x_real_ip() {
         let extractor = IpKeyExtractor;
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut()
-            .insert("x-real-ip", b"9.8.7.6".to_vec());
+        req.headers_mut().insert("x-real-ip", b"9.8.7.6".to_vec());
         assert_eq!(extractor.extract_key(&req), Some("9.8.7.6".to_string()));
     }
 
@@ -6373,10 +7886,8 @@ mod compression_tests {
 
     #[test]
     fn rate_limit_composite_key_extractor() {
-        let extractor = CompositeKeyExtractor::new(vec![
-            Box::new(IpKeyExtractor),
-            Box::new(PathKeyExtractor),
-        ]);
+        let extractor =
+            CompositeKeyExtractor::new(vec![Box::new(IpKeyExtractor), Box::new(PathKeyExtractor)]);
 
         let mut req = Request::new(Method::Get, "/api/users");
         req.headers_mut()

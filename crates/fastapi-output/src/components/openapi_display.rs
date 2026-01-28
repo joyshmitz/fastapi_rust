@@ -610,19 +610,16 @@ impl OpenApiDisplay {
                 endpoint.path.clone()
             };
 
-            let summary_text = endpoint
-                .summary
-                .as_ref()
-                .map_or_else(
-                    || "-".to_string(),
-                    |s| {
-                        if s.len() > summary_width {
-                            format!("{}...", &s[..summary_width - 3])
-                        } else {
-                            s.clone()
-                        }
-                    },
-                );
+            let summary_text = endpoint.summary.as_ref().map_or_else(
+                || "-".to_string(),
+                |s| {
+                    if s.len() > summary_width {
+                        format!("{}...", &s[..summary_width - 3])
+                    } else {
+                        s.clone()
+                    }
+                },
+            );
 
             let deprecated_marker = if endpoint.deprecated {
                 format!(" {muted}⚠{ANSI_RESET}")

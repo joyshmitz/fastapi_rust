@@ -277,7 +277,9 @@ fn test_request_logging_performance() {
                 status: if i % 10 == 0 { 500 } else { 200 },
                 timing: Some(ResponseTiming::new(Duration::from_micros(
                     #[allow(clippy::cast_sign_loss)]
-                    { (i % 100) as u64 * 100 },
+                    {
+                        (i % 100) as u64 * 100
+                    },
                 ))),
                 client_ip: Some("127.0.0.1".to_string()),
                 request_id: None,
