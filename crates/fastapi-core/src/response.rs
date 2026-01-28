@@ -473,6 +473,50 @@ impl IntoResponse for std::convert::Infallible {
 }
 
 // =============================================================================
+// Response Type Checking (OpenAPI)
+// =============================================================================
+
+/// Marker trait for compile-time response type verification.
+///
+/// This trait is used by the route macros to verify at compile time that
+/// a handler's return type can produce the declared OpenAPI response schema.
+///
+/// # How It Works
+///
+/// When you declare `#[get("/users", response(200, User))]`, the macro
+/// generates a compile-time assertion that checks if the handler's return
+/// type implements `ResponseProduces<User>`.
+///
+/// The implementation uses a simple blanket implementation: any type `T`
+/// that implements `IntoResponse` trivially produces itself as a schema.
+///
+/// For wrapper types like `Json<T>`, they implement `ResponseProduces<T>`
+/// to indicate they produce the inner type's schema.
+///
+/// # Example
+///
+/// ```ignore
+/// // This compiles because User produces User schema
+/// #[get("/user/{id}", response(200, User))]
+/// async fn get_user(Path(id): Path<i64>) -> User {
+///     User { id, name: "Alice".into() }
+/// }
+///
+/// // This also compiles because Json<User> produces User schema
+/// #[get("/user/{id}", response(200, User))]
+/// async fn get_user(Path(id): Path<i64>) -> Json<User> {
+///     Json(User { id, name: "Alice".into() })
+/// }
+/// ```
+pub trait ResponseProduces<T> {}
+
+// A type trivially produces itself
+impl<T> ResponseProduces<T> for T {}
+
+// Json<T> produces T schema (in addition to producing Json<T>)
+impl<T: serde::Serialize + 'static> ResponseProduces<T> for crate::extract::Json<T> {}
+
+// =============================================================================
 // Specialized Response Types
 // =============================================================================
 

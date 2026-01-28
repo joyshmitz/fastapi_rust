@@ -383,6 +383,42 @@ pub fn extract_path_params(path: &str) -> Vec<ParamInfo> {
         .collect()
 }
 
+/// Response declaration for OpenAPI documentation.
+///
+/// Describes a possible response from a route, including status code,
+/// schema type, and description.
+#[derive(Debug, Clone)]
+pub struct RouteResponse {
+    /// HTTP status code (e.g., 200, 201, 404).
+    pub status: u16,
+    /// Schema type name for the response body (e.g., "User", "Vec<Item>").
+    pub schema_name: String,
+    /// Description of when this response is returned.
+    pub description: String,
+    /// Content type for the response (defaults to "application/json").
+    pub content_type: String,
+}
+
+impl RouteResponse {
+    /// Create a new response declaration.
+    #[must_use]
+    pub fn new(status: u16, schema_name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            status,
+            schema_name: schema_name.into(),
+            description: description.into(),
+            content_type: "application/json".to_string(),
+        }
+    }
+
+    /// Set a custom content type for this response.
+    #[must_use]
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = content_type.into();
+        self
+    }
+}
+
 /// Security requirement for a route.
 ///
 /// Specifies a security scheme and optional scopes required to access a route.
@@ -458,6 +494,10 @@ pub struct Route {
     /// Each requirement specifies a security scheme name and optional scopes.
     /// Multiple requirements means any one of them can be used (OR logic).
     pub security: Vec<RouteSecurityRequirement>,
+    /// Declared responses for OpenAPI documentation.
+    ///
+    /// Each response specifies a status code, schema type, and description.
+    pub responses: Vec<RouteResponse>,
     /// Handler function that processes matching requests.
     handler: Arc<dyn Handler>,
 }
@@ -494,6 +534,9 @@ impl fmt::Debug for Route {
         }
         if !self.security.is_empty() {
             s.field("security", &self.security);
+        }
+        if !self.responses.is_empty() {
+            s.field("responses", &self.responses);
         }
         s.field("handler", &"<handler>").finish()
     }
@@ -626,6 +669,7 @@ impl Route {
             request_body_content_type: None,
             request_body_required: false,
             security: Vec::new(),
+            responses: Vec::new(),
             handler: Arc::new(handler),
         }
     }
@@ -654,6 +698,7 @@ impl Route {
             request_body_content_type: None,
             request_body_required: false,
             security: Vec::new(),
+            responses: Vec::new(),
             handler,
         }
     }
@@ -783,6 +828,44 @@ impl Route {
     pub fn security_scheme(mut self, scheme: impl Into<String>) -> Self {
         self.security.push(RouteSecurityRequirement::new(scheme));
         self
+    }
+
+    /// Add a response declaration for OpenAPI documentation.
+    ///
+    /// The response type is verified at compile time to ensure it implements
+    /// `JsonSchema`, enabling OpenAPI schema generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - HTTP status code (e.g., 200, 201, 404)
+    /// * `schema_name` - Type name for the response body (e.g., "User")
+    /// * `description` - Description of when this response is returned
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_router::Route;
+    /// use fastapi_core::Method;
+    ///
+    /// let route = Route::with_placeholder_handler(Method::Get, "/users/{id}")
+    ///     .response(200, "User", "User found")
+    ///     .response(404, "ErrorResponse", "User not found");
+    /// ```
+    #[must_use]
+    pub fn response(
+        mut self,
+        status: u16,
+        schema_name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.responses.push(RouteResponse::new(status, schema_name, description));
+        self
+    }
+
+    /// Check if this route has response declarations.
+    #[must_use]
+    pub fn has_responses(&self) -> bool {
+        !self.responses.is_empty()
     }
 
     /// Check if this route has a request body defined.

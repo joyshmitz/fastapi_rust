@@ -16,6 +16,18 @@ use syn::{
     parse::ParseStream, parse_macro_input, punctuated::Punctuated,
 };
 
+/// A declared response type for OpenAPI documentation.
+struct ResponseDecl {
+    /// HTTP status code (e.g., 200, 201, 404).
+    status: u16,
+    /// The response type name.
+    type_name: String,
+    /// The full type path for compile-time checking.
+    type_path: Type,
+    /// Optional description for the response.
+    description: Option<String>,
+}
+
 /// Parsed route attributes from `#[get("/path", summary = "...", ...)]`.
 struct RouteAttrs {
     /// The route path (required).
@@ -30,6 +42,8 @@ struct RouteAttrs {
     tags: Vec<String>,
     /// Whether the route is deprecated.
     deprecated: bool,
+    /// Declared response types for compile-time checking and OpenAPI.
+    responses: Vec<ResponseDecl>,
 }
 
 impl Parse for RouteAttrs {
@@ -44,6 +58,7 @@ impl Parse for RouteAttrs {
             operation_id: None,
             tags: Vec::new(),
             deprecated: false,
+            responses: Vec::new(),
         };
 
         // Parse optional comma-separated key=value pairs
@@ -87,12 +102,45 @@ impl Parse for RouteAttrs {
                         attrs.tags.push(tag.value());
                     }
                 }
+                "response" => {
+                    // Parse response(status, Type) or response(status, Type, "description")
+                    let content;
+                    syn::parenthesized!(content in input);
+
+                    // Parse status code
+                    let status_lit: syn::LitInt = content.parse()?;
+                    let status: u16 = status_lit.base10_parse().map_err(|_| {
+                        syn::Error::new(status_lit.span(), "expected HTTP status code (e.g., 200)")
+                    })?;
+
+                    content.parse::<Token![,]>()?;
+
+                    // Parse the response type
+                    let type_path: Type = content.parse()?;
+                    let type_name = extract_type_name(&type_path);
+
+                    // Parse optional description
+                    let description = if content.peek(Token![,]) {
+                        content.parse::<Token![,]>()?;
+                        let desc: LitStr = content.parse()?;
+                        Some(desc.value())
+                    } else {
+                        None
+                    };
+
+                    attrs.responses.push(ResponseDecl {
+                        status,
+                        type_name,
+                        type_path,
+                        description,
+                    });
+                }
                 _ => {
                     return Err(syn::Error::new(
                         ident.span(),
                         format!(
                             "unknown route attribute `{ident_str}`.\n\
-                             Valid attributes: summary, description, operation_id, tags, deprecated"
+                             Valid attributes: summary, description, operation_id, tags, deprecated, response"
                         ),
                     ));
                 }
@@ -509,6 +557,86 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
         quote! { .request_body(#schema, #content_type, #required) }
     });
 
+    // Generate compile-time assertions for declared response types
+    // Each declared response type must implement JsonSchema
+    let response_schema_checks: Vec<proc_macro2::TokenStream> = attrs
+        .responses
+        .iter()
+        .enumerate()
+        .map(|(idx, resp)| {
+            let check_fn_name = syn::Ident::new(
+                &format!("__assert_response_schema_{fn_name}_{idx}"),
+                Span::call_site(),
+            );
+            let ty = &resp.type_path;
+            let status = resp.status;
+            quote! {
+                #[doc(hidden)]
+                #[allow(dead_code)]
+                const _: () = {
+                    // This function will fail to compile if the response type doesn't implement
+                    // JsonSchema. This ensures the declared response type can be used in OpenAPI.
+                    fn #check_fn_name<T: fastapi_openapi::JsonSchema>() {}
+
+                    fn __trigger_check() {
+                        // Assert that the declared response type implements JsonSchema
+                        #check_fn_name::<#ty>();
+                    }
+
+                    // Store the status code and type name for debugging
+                    const _STATUS: u16 = #status;
+                };
+            }
+        })
+        .collect();
+
+    // Generate response type verification (compile-time check that return matches declared)
+    // This uses a marker trait to verify the handler's return type can produce the declared schema
+    let response_type_checks: Vec<proc_macro2::TokenStream> = if let Some(ref return_ty) = get_return_type(fn_output) {
+        attrs
+            .responses
+            .iter()
+            .filter(|r| r.status == 200) // Only check 200 responses against return type
+            .map(|resp| {
+                let check_fn_name = syn::Ident::new(
+                    &format!("__assert_response_type_{fn_name}"),
+                    Span::call_site(),
+                );
+                let resp_ty = &resp.type_path;
+                quote! {
+                    #[doc(hidden)]
+                    #[allow(dead_code)]
+                    const _: () = {
+                        // Verify the handler can produce the declared response type.
+                        // This checks that ReturnType: ResponseProduces<DeclaredType>
+                        fn #check_fn_name<R, T>()
+                        where
+                            R: fastapi_core::ResponseProduces<T>,
+                        {}
+
+                        fn __trigger_check() {
+                            #check_fn_name::<#return_ty, #resp_ty>();
+                        }
+                    };
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Generate response metadata builder calls
+    let response_calls: Vec<proc_macro2::TokenStream> = attrs
+        .responses
+        .iter()
+        .map(|resp| {
+            let status = resp.status;
+            let type_name = &resp.type_name;
+            let description = resp.description.as_deref().unwrap_or("Successful response");
+            quote! { .response(#status, #type_name, #description) }
+        })
+        .collect();
+
     // Generate the expanded code
     let expanded = quote! {
         #fn_vis #fn_asyncness fn #fn_name(#fn_inputs) #fn_output #fn_block
@@ -518,6 +646,12 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
 
         // Compile-time assertion: return type must implement IntoResponse
         #into_response_check
+
+        // Compile-time assertions: declared response types must implement JsonSchema
+        #(#response_schema_checks)*
+
+        // Compile-time assertion: return type matches declared 200 response
+        #(#response_type_checks)*
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -532,6 +666,7 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
             #tags_call
             #deprecated_call
             #request_body_call
+            #(#response_calls)*
         }
 
         #[doc(hidden)]
