@@ -7125,10 +7125,7 @@ impl FromRequest for ApiKeyQuery {
         );
 
         // Parse the query string if present
-        let query_params = req
-            .query()
-            .map(QueryParams::parse)
-            .unwrap_or_default();
+        let query_params = req.query().map(QueryParams::parse).unwrap_or_default();
 
         // Get the API key parameter
         let key_value = query_params
@@ -7142,6 +7139,279 @@ impl FromRequest for ApiKeyQuery {
         }
 
         Ok(ApiKeyQuery::with_param_name(key, param_name))
+    }
+}
+
+// ============================================================================
+// API Key Cookie Extractor
+// ============================================================================
+
+/// Default cookie name for API key extraction.
+pub const DEFAULT_API_KEY_COOKIE: &str = "api_key";
+
+/// Configuration for API key cookie extraction.
+#[derive(Debug, Clone)]
+pub struct ApiKeyCookieConfig {
+    /// Cookie name to extract API key from.
+    cookie_name: String,
+}
+
+impl Default for ApiKeyCookieConfig {
+    fn default() -> Self {
+        Self {
+            cookie_name: DEFAULT_API_KEY_COOKIE.to_string(),
+        }
+    }
+}
+
+impl ApiKeyCookieConfig {
+    /// Create a new configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the cookie name to extract the API key from.
+    #[must_use]
+    pub fn cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.cookie_name = name.into();
+        self
+    }
+
+    /// Get the configured cookie name.
+    #[must_use]
+    pub fn get_cookie_name(&self) -> &str {
+        &self.cookie_name
+    }
+}
+
+/// Extracts an API key from a cookie.
+///
+/// This extractor pulls the API key from a configurable cookie
+/// (default: `api_key`). Returns 401 Unauthorized if missing or empty.
+///
+/// # Security Considerations
+///
+/// Cookie-based API keys have different security characteristics than headers:
+/// - Automatically sent by browsers (enables browser-based API access)
+/// - Subject to CSRF attacks (use with CSRF protection middleware)
+/// - Can be marked `HttpOnly` to prevent JavaScript access
+/// - Can be marked `Secure` to require HTTPS
+///
+/// For browser-based APIs, consider pairing with CSRF protection.
+/// For programmatic API access, prefer [`ApiKeyHeader`].
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::extract::ApiKeyCookie;
+///
+/// async fn protected_endpoint(api_key: ApiKeyCookie) -> impl IntoResponse {
+///     // Validate the API key
+///     if api_key.secure_eq(expected_key) {
+///         "Access granted"
+///     } else {
+///         "Invalid API key"
+///     }
+/// }
+/// ```
+///
+/// # Custom Cookie Name
+///
+/// Configure a custom cookie name by adding `ApiKeyCookieConfig` to request extensions:
+///
+/// ```ignore
+/// // In middleware or app setup:
+/// req.insert_extension(ApiKeyCookieConfig::new().cookie_name("auth_token"));
+/// // Then the auth_token cookie will be used
+/// ```
+///
+/// # OpenAPI Security Scheme
+///
+/// This generates the following OpenAPI security scheme:
+/// ```yaml
+/// securitySchemes:
+///   ApiKeyCookie:
+///     type: apiKey
+///     in: cookie
+///     name: api_key
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyCookie {
+    /// The extracted API key value.
+    key: String,
+    /// The cookie name it was extracted from.
+    cookie_name: String,
+}
+
+impl ApiKeyCookie {
+    /// Create a new ApiKeyCookie with the given key.
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            cookie_name: DEFAULT_API_KEY_COOKIE.to_string(),
+        }
+    }
+
+    /// Create a new ApiKeyCookie with a custom cookie name.
+    #[must_use]
+    pub fn with_cookie_name(key: impl Into<String>, cookie_name: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            cookie_name: cookie_name.into(),
+        }
+    }
+
+    /// Get the API key value.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Get the cookie name it was extracted from.
+    #[must_use]
+    pub fn cookie_name(&self) -> &str {
+        &self.cookie_name
+    }
+
+    /// Consume and return the key value.
+    #[must_use]
+    pub fn into_key(self) -> String {
+        self.key
+    }
+}
+
+impl Deref for ApiKeyCookie {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+impl AsRef<str> for ApiKeyCookie {
+    fn as_ref(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Implement SecureCompare for timing-safe API key validation.
+impl SecureCompare for ApiKeyCookie {
+    fn secure_eq(&self, other: &str) -> bool {
+        constant_time_str_eq(&self.key, other)
+    }
+
+    fn secure_eq_bytes(&self, other: &[u8]) -> bool {
+        constant_time_eq(self.key.as_bytes(), other)
+    }
+}
+
+/// Error returned when API key cookie extraction fails.
+#[derive(Debug, Clone)]
+pub enum ApiKeyCookieError {
+    /// The API key cookie is missing.
+    MissingCookie {
+        /// Name of the expected cookie.
+        cookie_name: String,
+    },
+    /// The API key cookie is present but empty.
+    EmptyKey {
+        /// Name of the cookie.
+        cookie_name: String,
+    },
+}
+
+impl ApiKeyCookieError {
+    /// Create a missing cookie error.
+    #[must_use]
+    pub fn missing_cookie(cookie_name: impl Into<String>) -> Self {
+        Self::MissingCookie {
+            cookie_name: cookie_name.into(),
+        }
+    }
+
+    /// Create an empty key error.
+    #[must_use]
+    pub fn empty_key(cookie_name: impl Into<String>) -> Self {
+        Self::EmptyKey {
+            cookie_name: cookie_name.into(),
+        }
+    }
+
+    /// Get the detail message for error responses.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::MissingCookie { cookie_name } => {
+                format!("API key required. Include '{cookie_name}' cookie.")
+            }
+            Self::EmptyKey { cookie_name } => {
+                format!("API key cannot be empty. Provide a value for '{cookie_name}' cookie.")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ApiKeyCookieError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingCookie { cookie_name } => {
+                write!(f, "Missing API key cookie: {cookie_name}")
+            }
+            Self::EmptyKey { cookie_name } => {
+                write!(f, "Empty API key in cookie: {cookie_name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyCookieError {}
+
+impl IntoResponse for ApiKeyCookieError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        let body = serde_json::json!({
+            "detail": self.detail()
+        });
+
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+impl FromRequest for ApiKeyCookie {
+    type Error = ApiKeyCookieError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Get config from request extensions or use default
+        let cookie_name = req.get_extension::<ApiKeyCookieConfig>().map_or_else(
+            || DEFAULT_API_KEY_COOKIE.to_string(),
+            |c| c.get_cookie_name().to_string(),
+        );
+
+        // Parse cookies from the Cookie header
+        let cookies = req
+            .headers()
+            .get("cookie")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .map(RequestCookies::from_header)
+            .unwrap_or_default();
+
+        // Get the API key cookie
+        let key_value = cookies
+            .get(&cookie_name)
+            .ok_or_else(|| ApiKeyCookieError::missing_cookie(&cookie_name))?;
+
+        // Trim whitespace and check for empty key
+        let key = key_value.trim();
+        if key.is_empty() {
+            return Err(ApiKeyCookieError::empty_key(&cookie_name));
+        }
+
+        Ok(ApiKeyCookie::with_cookie_name(key, cookie_name))
     }
 }
 
@@ -9478,6 +9748,192 @@ mod api_key_query_tests {
         let key1 = ApiKeyQuery::new("same_key");
         let key2 = ApiKeyQuery::new("same_key");
         let key3 = ApiKeyQuery::new("different_key");
+
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+    }
+}
+
+#[cfg(test)]
+mod api_key_cookie_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::IntoResponse;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 77777)
+    }
+
+    #[test]
+    fn api_key_cookie_basic_extraction() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("cookie", b"api_key=test_key_123".to_vec());
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "test_key_123");
+        assert_eq!(api_key.cookie_name(), "api_key");
+    }
+
+    #[test]
+    fn api_key_cookie_missing_header() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        // No cookie header
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyCookieError::MissingCookie { .. }));
+    }
+
+    #[test]
+    fn api_key_cookie_other_cookies_present() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("cookie", b"session_id=abc123; theme=dark".to_vec());
+        // api_key cookie is missing
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyCookieError::MissingCookie { .. }));
+    }
+
+    #[test]
+    fn api_key_cookie_empty_value() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut().insert("cookie", b"api_key=".to_vec());
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyCookieError::EmptyKey { .. }));
+    }
+
+    #[test]
+    fn api_key_cookie_whitespace_only() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut().insert("cookie", b"api_key=   ".to_vec());
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ApiKeyCookieError::EmptyKey { .. }));
+    }
+
+    #[test]
+    fn api_key_cookie_trims_whitespace() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("cookie", b"api_key=  my_key_123  ".to_vec());
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "my_key_123");
+    }
+
+    #[test]
+    fn api_key_cookie_custom_name() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut()
+            .insert("cookie", b"auth_token=custom_key".to_vec());
+        req.insert_extension(ApiKeyCookieConfig::new().cookie_name("auth_token"));
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "custom_key");
+        assert_eq!(api_key.cookie_name(), "auth_token");
+    }
+
+    #[test]
+    fn api_key_cookie_with_multiple_cookies() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/api/protected");
+        req.headers_mut().insert(
+            "cookie",
+            b"session_id=sess123; api_key=my_api_key; theme=dark".to_vec(),
+        );
+
+        let result = futures_executor::block_on(ApiKeyCookie::from_request(&ctx, &mut req));
+        let api_key = result.unwrap();
+        assert_eq!(api_key.key(), "my_api_key");
+    }
+
+    #[test]
+    fn api_key_cookie_error_response_401() {
+        let err = ApiKeyCookieError::missing_cookie("api_key");
+        let response = err.into_response();
+        assert_eq!(response.status().as_u16(), 401);
+    }
+
+    #[test]
+    fn api_key_cookie_error_response_json() {
+        let err = ApiKeyCookieError::missing_cookie("api_key");
+        let response = err.into_response();
+
+        let has_json_content_type = response
+            .headers()
+            .iter()
+            .any(|(n, v)| n == "content-type" && v.starts_with(b"application/json"));
+        assert!(has_json_content_type);
+    }
+
+    #[test]
+    fn api_key_cookie_secure_compare() {
+        let api_key = ApiKeyCookie::new("secret_key_123");
+
+        // Timing-safe comparison
+        assert!(api_key.secure_eq("secret_key_123"));
+        assert!(!api_key.secure_eq("secret_key_124"));
+        assert!(!api_key.secure_eq("wrong"));
+
+        // Byte comparison
+        assert!(api_key.secure_eq_bytes(b"secret_key_123"));
+        assert!(!api_key.secure_eq_bytes(b"secret_key_124"));
+    }
+
+    #[test]
+    fn api_key_cookie_deref_and_as_ref() {
+        let api_key = ApiKeyCookie::new("deref_test");
+
+        // Deref to &str
+        let s: &str = &api_key;
+        assert_eq!(s, "deref_test");
+
+        // AsRef<str>
+        let s: &str = api_key.as_ref();
+        assert_eq!(s, "deref_test");
+    }
+
+    #[test]
+    fn api_key_cookie_config_defaults() {
+        let config = ApiKeyCookieConfig::default();
+        assert_eq!(config.get_cookie_name(), DEFAULT_API_KEY_COOKIE);
+    }
+
+    #[test]
+    fn api_key_cookie_error_display() {
+        let err = ApiKeyCookieError::missing_cookie("api_key");
+        assert!(err.to_string().contains("api_key"));
+
+        let err = ApiKeyCookieError::empty_key("api_key");
+        assert!(err.to_string().contains("Empty"));
+    }
+
+    #[test]
+    fn api_key_cookie_equality() {
+        let key1 = ApiKeyCookie::new("same_key");
+        let key2 = ApiKeyCookie::new("same_key");
+        let key3 = ApiKeyCookie::new("different_key");
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);

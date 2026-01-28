@@ -78,10 +78,11 @@ pub use error::{
     ValidationErrors, disable_debug_mode, enable_debug_mode, is_debug_mode_enabled,
 };
 pub use extract::{
-    Accept, ApiKeyHeader, ApiKeyHeaderConfig, ApiKeyHeaderError, ApiKeyQuery, ApiKeyQueryConfig,
-    ApiKeyQueryError, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BasicAuth,
-    BasicAuthError, BearerToken, BearerTokenError, ContentType, Cookie, CookieExtractError,
-    CookieName, CookiePrefix, CookiePrefixError, CsrfTokenCookie, DEFAULT_API_KEY_HEADER,
+    Accept, ApiKeyCookie, ApiKeyCookieConfig, ApiKeyCookieError, ApiKeyHeader, ApiKeyHeaderConfig,
+    ApiKeyHeaderError, ApiKeyQuery, ApiKeyQueryConfig, ApiKeyQueryError, AppState, Authorization,
+    BackgroundTasks, BackgroundTasksInner, BasicAuth, BasicAuthError, BearerToken,
+    BearerTokenError, ContentType, Cookie, CookieExtractError, CookieName, CookiePrefix,
+    CookiePrefixError, CsrfTokenCookie, DEFAULT_API_KEY_COOKIE, DEFAULT_API_KEY_HEADER,
     DEFAULT_API_KEY_QUERY_PARAM, DEFAULT_FORM_LIMIT, DEFAULT_JSON_LIMIT, DEFAULT_PAGE,
     DEFAULT_PER_PAGE, Form, FormConfig, FormExtractError, FromHeaderValue, FromRequest, Header,
     HeaderExtractError, HeaderName, HeaderValues, Host, Json, JsonConfig, JsonExtractError,
