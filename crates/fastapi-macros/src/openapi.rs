@@ -160,6 +160,11 @@ fn generate_type_schema(ty: &Type, attrs: &SchemaAttrs) -> TokenStream2 {
                 nullable: #nullable,
                 minimum: None,
                 maximum: None,
+                exclusive_minimum: None,
+                exclusive_maximum: None,
+                min_length: None,
+                max_length: None,
+                pattern: None,
                 enum_values: None,
             })
         };
@@ -300,6 +305,11 @@ fn generate_variant_schema(variant: &Variant) -> TokenStream2 {
                     nullable: false,
                     minimum: None,
                     maximum: None,
+                    exclusive_minimum: None,
+                    exclusive_maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    pattern: None,
                     enum_values: Some(vec![#variant_name.to_string()]),
                 })
             }

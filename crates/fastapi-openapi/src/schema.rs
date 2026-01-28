@@ -128,6 +128,11 @@ impl Schema {
             nullable: false,
             minimum: None,
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: Some(values),
         })
     }
@@ -260,12 +265,43 @@ pub struct PrimitiveSchema {
     /// Nullable flag (OpenAPI 3.1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub nullable: bool,
-    /// Minimum value constraint (for unsigned integers).
+    /// Minimum value constraint (>= for numbers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum: Option<i64>,
-    /// Maximum value constraint.
+    /// Maximum value constraint (<= for numbers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum: Option<i64>,
+    /// Exclusive minimum value constraint (> for numbers).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "exclusiveMinimum"
+    )]
+    pub exclusive_minimum: Option<i64>,
+    /// Exclusive maximum value constraint (< for numbers).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "exclusiveMaximum"
+    )]
+    pub exclusive_maximum: Option<i64>,
+    /// Minimum length constraint (for strings).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "minLength"
+    )]
+    pub min_length: Option<usize>,
+    /// Maximum length constraint (for strings).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "maxLength"
+    )]
+    pub max_length: Option<usize>,
+    /// Pattern constraint (regex for strings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// Enum values (for string enums with unit variants).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "enum")]
     pub enum_values: Option<Vec<String>>,
@@ -280,6 +316,11 @@ impl PrimitiveSchema {
             nullable: false,
             minimum: None,
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: None,
         }
     }
@@ -292,6 +333,11 @@ impl PrimitiveSchema {
             nullable: false,
             minimum: None,
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: None,
         }
     }
@@ -304,6 +350,11 @@ impl PrimitiveSchema {
             nullable: false,
             minimum: Some(0),
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: None,
         }
     }
@@ -316,6 +367,11 @@ impl PrimitiveSchema {
             nullable: false,
             minimum: None,
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: None,
         }
     }
@@ -328,8 +384,62 @@ impl PrimitiveSchema {
             nullable: false,
             minimum: None,
             maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            min_length: None,
+            max_length: None,
+            pattern: None,
             enum_values: None,
         }
+    }
+
+    /// Set minimum value constraint (>=).
+    #[must_use]
+    pub fn with_minimum(mut self, value: i64) -> Self {
+        self.minimum = Some(value);
+        self
+    }
+
+    /// Set maximum value constraint (<=).
+    #[must_use]
+    pub fn with_maximum(mut self, value: i64) -> Self {
+        self.maximum = Some(value);
+        self
+    }
+
+    /// Set exclusive minimum value constraint (>).
+    #[must_use]
+    pub fn with_exclusive_minimum(mut self, value: i64) -> Self {
+        self.exclusive_minimum = Some(value);
+        self
+    }
+
+    /// Set exclusive maximum value constraint (<).
+    #[must_use]
+    pub fn with_exclusive_maximum(mut self, value: i64) -> Self {
+        self.exclusive_maximum = Some(value);
+        self
+    }
+
+    /// Set minimum length constraint (for strings).
+    #[must_use]
+    pub fn with_min_length(mut self, len: usize) -> Self {
+        self.min_length = Some(len);
+        self
+    }
+
+    /// Set maximum length constraint (for strings).
+    #[must_use]
+    pub fn with_max_length(mut self, len: usize) -> Self {
+        self.max_length = Some(len);
+        self
+    }
+
+    /// Set pattern constraint (regex for strings).
+    #[must_use]
+    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
     }
 }
 
@@ -784,5 +894,84 @@ mod tests {
         assert!(json.contains(r#""oneOf""#));
         assert!(json.contains(r#""discriminator""#));
         assert!(json.contains(r#""propertyName":"petType""#));
+    }
+
+    // =========================================================================
+    // Schema Constraint Tests
+    // =========================================================================
+
+    #[test]
+    fn test_exclusive_minimum_serialization() {
+        let schema = PrimitiveSchema::integer(Some("int32")).with_exclusive_minimum(5);
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""exclusiveMinimum":5"#));
+        // Should not have regular minimum
+        assert!(!json.contains(r#""minimum""#));
+    }
+
+    #[test]
+    fn test_exclusive_maximum_serialization() {
+        let schema = PrimitiveSchema::integer(Some("int32")).with_exclusive_maximum(100);
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""exclusiveMaximum":100"#));
+        // Should not have regular maximum
+        assert!(!json.contains(r#""maximum""#));
+    }
+
+    #[test]
+    fn test_min_length_serialization() {
+        let schema = PrimitiveSchema::string().with_min_length(3);
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""minLength":3"#));
+    }
+
+    #[test]
+    fn test_max_length_serialization() {
+        let schema = PrimitiveSchema::string().with_max_length(255);
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""maxLength":255"#));
+    }
+
+    #[test]
+    fn test_pattern_serialization() {
+        let schema = PrimitiveSchema::string().with_pattern(r"^[a-z]+$");
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""pattern":"^[a-z]+$""#));
+    }
+
+    #[test]
+    fn test_combined_string_constraints() {
+        let schema = PrimitiveSchema::string()
+            .with_min_length(1)
+            .with_max_length(50)
+            .with_pattern(r"^[A-Z][a-z]+$");
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""minLength":1"#));
+        assert!(json.contains(r#""maxLength":50"#));
+        assert!(json.contains(r#""pattern":"^[A-Z][a-z]+$""#));
+    }
+
+    #[test]
+    fn test_combined_number_constraints() {
+        let schema = PrimitiveSchema::integer(Some("int32"))
+            .with_minimum(0)
+            .with_maximum(100);
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        assert!(json.contains(r#""minimum":0"#));
+        assert!(json.contains(r#""maximum":100"#));
+    }
+
+    #[test]
+    fn test_constraints_not_serialized_when_none() {
+        let schema = PrimitiveSchema::string();
+        let json = serde_json::to_string(&Schema::Primitive(schema)).unwrap();
+        // None of the constraint fields should appear
+        assert!(!json.contains("minimum"));
+        assert!(!json.contains("maximum"));
+        assert!(!json.contains("exclusiveMinimum"));
+        assert!(!json.contains("exclusiveMaximum"));
+        assert!(!json.contains("minLength"));
+        assert!(!json.contains("maxLength"));
+        assert!(!json.contains("pattern"));
     }
 }

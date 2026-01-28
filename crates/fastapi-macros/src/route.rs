@@ -12,8 +12,8 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitStr, PathArguments, ReturnType, Token,
-    Type, parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated,
+    FnArg, GenericArgument, ItemFn, LitStr, PathArguments, ReturnType, Token, Type,
+    parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated,
 };
 
 /// Parsed route attributes from `#[get("/path", summary = "...", ...)]`.
@@ -80,7 +80,7 @@ impl Parse for RouteAttrs {
                         let content;
                         syn::bracketed!(content in input);
                         let tags: Punctuated<LitStr, Token![,]> =
-                            content.parse_terminated(LitStr::parse, Token![,])?;
+                            Punctuated::parse_terminated(&content)?;
                         attrs.tags = tags.into_iter().map(|s| s.value()).collect();
                     } else {
                         let tag: LitStr = input.parse()?;
@@ -559,5 +559,86 @@ mod tests {
         let result = get_return_type(&ret);
         // impl Trait should return None (compiler validates)
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_route_attrs_path_only() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users" };
+        assert_eq!(attrs.path.value(), "/users");
+        assert!(attrs.summary.is_none());
+        assert!(attrs.description.is_none());
+        assert!(attrs.operation_id.is_none());
+        assert!(attrs.tags.is_empty());
+        assert!(!attrs.deprecated);
+    }
+
+    #[test]
+    fn test_route_attrs_with_summary() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", summary = "List all users" };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.summary.as_deref(), Some("List all users"));
+    }
+
+    #[test]
+    fn test_route_attrs_with_description() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", description = "A detailed description" };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.description.as_deref(), Some("A detailed description"));
+    }
+
+    #[test]
+    fn test_route_attrs_with_operation_id() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", operation_id = "getUsers" };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.operation_id.as_deref(), Some("getUsers"));
+    }
+
+    #[test]
+    fn test_route_attrs_with_single_tag() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", tags = "users" };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.tags, vec!["users"]);
+    }
+
+    #[test]
+    fn test_route_attrs_with_multiple_tags() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", tags = ["users", "api", "v1"] };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.tags, vec!["users", "api", "v1"]);
+    }
+
+    #[test]
+    fn test_route_attrs_deprecated() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", deprecated };
+        assert_eq!(attrs.path.value(), "/users");
+        assert!(attrs.deprecated);
+    }
+
+    #[test]
+    fn test_route_attrs_all_options() {
+        let attrs: RouteAttrs = syn::parse_quote! {
+            "/items/{id}",
+            summary = "Get an item",
+            description = "Retrieves an item by its unique identifier",
+            operation_id = "getItemById",
+            tags = ["items", "crud"],
+            deprecated
+        };
+        assert_eq!(attrs.path.value(), "/items/{id}");
+        assert_eq!(attrs.summary.as_deref(), Some("Get an item"));
+        assert_eq!(
+            attrs.description.as_deref(),
+            Some("Retrieves an item by its unique identifier")
+        );
+        assert_eq!(attrs.operation_id.as_deref(), Some("getItemById"));
+        assert_eq!(attrs.tags, vec!["items", "crud"]);
+        assert!(attrs.deprecated);
+    }
+
+    #[test]
+    fn test_route_attrs_trailing_comma() {
+        let attrs: RouteAttrs = syn::parse_quote! { "/users", summary = "Test", };
+        assert_eq!(attrs.path.value(), "/users");
+        assert_eq!(attrs.summary.as_deref(), Some("Test"));
     }
 }

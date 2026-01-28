@@ -663,6 +663,87 @@ impl Router {
         &self.routes
     }
 
+    /// Mount a child router at a path prefix.
+    ///
+    /// All routes from the child router will be accessible under the given prefix.
+    /// This is useful for organizing routes into modules or API versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - Path prefix for all child routes (e.g., "/api/v1")
+    /// * `child` - The router to mount
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_router::Router;
+    /// use fastapi_core::Method;
+    ///
+    /// let api = Router::new()
+    ///     .route(get_users)   // /users
+    ///     .route(get_items);  // /items
+    ///
+    /// let app = Router::new()
+    ///     .mount("/api/v1", api);  // /api/v1/users, /api/v1/items
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any mounted route conflicts with existing routes.
+    pub fn mount(mut self, prefix: &str, child: Router) -> Result<Self, RouteAddError> {
+        let prefix = prefix.trim_end_matches('/');
+
+        for route in child.routes {
+            let child_path = if route.path == "/" {
+                String::new()
+            } else if route.path.starts_with('/') {
+                route.path.clone()
+            } else {
+                format!("/{}", route.path)
+            };
+
+            let full_path = if prefix.is_empty() {
+                if child_path.is_empty() {
+                    "/".to_string()
+                } else {
+                    child_path
+                }
+            } else if child_path.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{}{}", prefix, child_path)
+            };
+
+            let mounted = Route {
+                path: full_path,
+                method: route.method,
+                operation_id: route.operation_id,
+                summary: route.summary,
+                description: route.description,
+                tags: route.tags,
+                deprecated: route.deprecated,
+                handler: route.handler,
+            };
+
+            self.add(mounted)?;
+        }
+
+        Ok(self)
+    }
+
+    /// Mount a child router at a path prefix (builder pattern).
+    ///
+    /// Same as [`mount`] but panics on conflict. Use for static route definitions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any mounted route conflicts with existing routes.
+    #[must_use]
+    pub fn nest(self, prefix: &str, child: Router) -> Self {
+        self.mount(prefix, child)
+            .expect("route conflict when nesting router")
+    }
+
     fn find_conflict(&self, route: &Route) -> Option<RouteConflictError> {
         for existing in &self.routes {
             if existing.method != route.method {
