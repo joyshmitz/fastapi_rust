@@ -1618,9 +1618,8 @@ mod tests {
         let ctx = test_context(Some(overrides.clone()));
         let mut req = empty_request();
 
-        let dep1 =
-            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
-                .expect("OverrideDep override failed");
+        let dep1 = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect("OverrideDep override failed");
         assert_eq!(dep1.value, 10);
 
         let mut req2 = empty_request();
@@ -1672,7 +1671,8 @@ mod tests {
         let mut req = empty_request();
 
         // NestedInnerDep is NOT overridden, resolve should return None
-        let result = futures_executor::block_on(overrides.resolve::<NestedInnerDep>(&ctx, &mut req));
+        let result =
+            futures_executor::block_on(overrides.resolve::<NestedInnerDep>(&ctx, &mut req));
         assert!(result.is_none(), "Unregistered type should resolve to None");
     }
 
@@ -1704,7 +1704,10 @@ mod tests {
         // OverrideDep should still use its real implementation (returns value: 1)
         let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
             .expect("should resolve from real implementation");
-        assert_eq!(dep.value, 1, "Unoverridden dep should use real implementation");
+        assert_eq!(
+            dep.value, 1,
+            "Unoverridden dep should use real implementation"
+        );
     }
 
     #[test]
@@ -1729,16 +1732,17 @@ mod tests {
         let overrides = Arc::new(DependencyOverrides::new());
 
         overrides.insert::<OverrideDep, _, _>(|_ctx, _req| async move {
-            Err(HttpError::new(crate::response::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_detail("override error"))
+            Err(
+                HttpError::new(crate::response::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_detail("override error"),
+            )
         });
 
         let ctx = test_context(Some(overrides));
         let mut req = empty_request();
 
-        let err =
-            futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
-                .expect_err("override should return error");
+        let err = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
+            .expect_err("override should return error");
         assert_eq!(err.status.as_u16(), 500);
     }
 
@@ -1765,10 +1769,7 @@ mod tests {
 
         // Dynamic resolver that reads from request extensions
         overrides.insert::<OverrideDep, _, _>(|_ctx, req| {
-            let value = req
-                .get_extension::<usize>()
-                .copied()
-                .unwrap_or(0);
+            let value = req.get_extension::<usize>().copied().unwrap_or(0);
             async move { Ok(OverrideDep { value }) }
         });
 
@@ -1811,7 +1812,10 @@ mod tests {
 
         let dep = futures_executor::block_on(Depends::<OverrideDep>::from_request(&ctx, &mut req))
             .unwrap();
-        assert_eq!(dep.value, 1, "Without overrides, real dependency should be used");
+        assert_eq!(
+            dep.value, 1,
+            "Without overrides, real dependency should be used"
+        );
     }
 
     // Test: ResolutionGuard properly cleans up on drop

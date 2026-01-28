@@ -5917,7 +5917,10 @@ mod tests {
         req.headers_mut().insert("x-csrf-token", b"".to_vec());
 
         let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
-        assert!(result.is_break(), "Empty matching tokens should be rejected");
+        assert!(
+            result.is_break(),
+            "Empty matching tokens should be rejected"
+        );
     }
 
     #[test]
@@ -6196,8 +6199,7 @@ mod tests {
 
     #[test]
     fn csrf_custom_cookie_name_in_set_cookie_response() {
-        let csrf =
-            CsrfMiddleware::with_config(CsrfConfig::new().cookie_name("XSRF-TOKEN"));
+        let csrf = CsrfMiddleware::with_config(CsrfConfig::new().cookie_name("XSRF-TOKEN"));
         let ctx = test_context();
         let mut req = Request::new(crate::request::Method::Get, "/");
 
@@ -6259,11 +6261,7 @@ mod tests {
         let token = "correct-csrf";
         req.headers_mut().insert(
             "cookie",
-            format!(
-                "session=abc; other=xyz; csrf_token={}; tracking=123",
-                token
-            )
-            .into_bytes(),
+            format!("session=abc; other=xyz; csrf_token={}; tracking=123", token).into_bytes(),
         );
         req.headers_mut()
             .insert("x-csrf-token", token.as_bytes().to_vec());
@@ -6388,11 +6386,13 @@ mod tests {
 
         req.headers_mut()
             .insert("cookie", b"csrf_token=AbCdEf".to_vec());
-        req.headers_mut()
-            .insert("x-csrf-token", b"abcdef".to_vec());
+        req.headers_mut().insert("x-csrf-token", b"abcdef".to_vec());
 
         let result = futures_executor::block_on(csrf.before(&ctx, &mut req));
-        assert!(result.is_break(), "Token comparison should be case-sensitive");
+        assert!(
+            result.is_break(),
+            "Token comparison should be case-sensitive"
+        );
     }
 
     #[test]
@@ -6447,10 +6447,9 @@ mod tests {
 
         // Step 2: POST request - uses the token from cookie + header
         let mut post_req = Request::new(crate::request::Method::Post, "/form");
-        post_req.headers_mut().insert(
-            "cookie",
-            format!("csrf_token={}", token_value).into_bytes(),
-        );
+        post_req
+            .headers_mut()
+            .insert("cookie", format!("csrf_token={}", token_value).into_bytes());
         post_req
             .headers_mut()
             .insert("x-csrf-token", token_value.as_bytes().to_vec());
@@ -7222,8 +7221,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_before_continues_processing() {
-        let mw = RequestInspectionMiddleware::new()
-            .verbosity(InspectionVerbosity::Minimal);
+        let mw = RequestInspectionMiddleware::new().verbosity(InspectionVerbosity::Minimal);
         let ctx = test_context();
         let mut req = Request::new(Method::Post, "/api/users");
 
@@ -7233,16 +7231,14 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_after_returns_response_unchanged() {
-        let mw = RequestInspectionMiddleware::new()
-            .verbosity(InspectionVerbosity::Minimal);
+        let mw = RequestInspectionMiddleware::new().verbosity(InspectionVerbosity::Minimal);
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/health");
 
         // Run before to set the InspectionStart extension
         let _ = futures_executor::block_on(mw.before(&ctx, &mut req));
 
-        let response = Response::ok()
-            .body(ResponseBody::Bytes(b"OK".to_vec()));
+        let response = Response::ok().body(ResponseBody::Bytes(b"OK".to_vec()));
 
         let result = futures_executor::block_on(mw.after(&ctx, &req, response));
         assert_eq!(result.status().as_u16(), 200);
@@ -7284,8 +7280,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_verbose_with_json_body() {
-        let mw = RequestInspectionMiddleware::new()
-            .verbosity(InspectionVerbosity::Verbose);
+        let mw = RequestInspectionMiddleware::new().verbosity(InspectionVerbosity::Verbose);
         let ctx = test_context();
         let body = br#"{"name":"Alice","age":30}"#;
         let mut req = Request::new(Method::Post, "/api/users");
@@ -7299,8 +7294,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_verbose_after_with_json_response() {
-        let mw = RequestInspectionMiddleware::new()
-            .verbosity(InspectionVerbosity::Verbose);
+        let mw = RequestInspectionMiddleware::new().verbosity(InspectionVerbosity::Verbose);
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/users/1");
 
@@ -7308,9 +7302,7 @@ mod request_inspection_tests {
 
         let response = Response::ok()
             .header("content-type", b"application/json".to_vec())
-            .body(ResponseBody::Bytes(
-                br#"{"id":1,"name":"Alice"}"#.to_vec(),
-            ));
+            .body(ResponseBody::Bytes(br#"{"id":1,"name":"Alice"}"#.to_vec()));
 
         let result = futures_executor::block_on(mw.after(&ctx, &req, response));
         assert_eq!(result.status().as_u16(), 200);
@@ -7329,8 +7321,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_format_headers_redacts() {
-        let mw = RequestInspectionMiddleware::new()
-            .redact_header("x-secret");
+        let mw = RequestInspectionMiddleware::new().redact_header("x-secret");
 
         let headers = vec![
             ("content-type", b"text/plain".as_slice()),
@@ -7347,8 +7338,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_format_body_preview_truncates() {
-        let mw = RequestInspectionMiddleware::new()
-            .max_body_preview(10);
+        let mw = RequestInspectionMiddleware::new().max_body_preview(10);
 
         let body = b"Hello, World! This is a long body.";
         let result = mw.format_body_preview(body, None);
@@ -7366,8 +7356,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_format_body_preview_zero_max() {
-        let mw = RequestInspectionMiddleware::new()
-            .max_body_preview(0);
+        let mw = RequestInspectionMiddleware::new().max_body_preview(0);
         assert!(mw.format_body_preview(b"hello", None).is_none());
     }
 
@@ -7474,8 +7463,7 @@ mod request_inspection_tests {
 
     #[test]
     fn inspection_with_query_string() {
-        let mw = RequestInspectionMiddleware::new()
-            .verbosity(InspectionVerbosity::Minimal);
+        let mw = RequestInspectionMiddleware::new().verbosity(InspectionVerbosity::Minimal);
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/search");
         req.set_query(Some("q=rust&page=1".to_string()));

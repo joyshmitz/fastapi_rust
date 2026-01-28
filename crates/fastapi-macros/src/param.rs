@@ -23,6 +23,9 @@
 //! - `#[param(min_length = N)]` - Minimum string length
 //! - `#[param(max_length = N)]` - Maximum string length
 //! - `#[param(pattern = "...")]` - Regex pattern
+//! - `#[param(alias = "...")]` - Alternative name in request (propagates to validation/serialization)
+//! - `#[param(validation_alias = "...")]` - Name for validation (overrides alias)
+//! - `#[param(serialization_alias = "...")]` - Name for OpenAPI serialization (overrides alias)
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -43,6 +46,14 @@ pub struct ParamAttrs {
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,
     pub pattern: Option<String>,
+    /// Alternative name used in request (query/header/form).
+    /// If set and `validation_alias` is None, this is also used for validation.
+    /// If set and `serialization_alias` is None, this is also used for serialization.
+    pub alias: Option<String>,
+    /// Name used specifically for validation (overrides `alias` for validation).
+    pub validation_alias: Option<String>,
+    /// Name used specifically for serialization/OpenAPI (overrides `alias` for serialization).
+    pub serialization_alias: Option<String>,
 }
 
 impl ParamAttrs {
@@ -128,6 +139,24 @@ impl ParamAttrs {
                             result.pattern = Some(s.value());
                         }
                     }
+                } else if meta.path.is_ident("alias") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(Lit::Str(s)) = value.parse::<Lit>() {
+                            result.alias = Some(s.value());
+                        }
+                    }
+                } else if meta.path.is_ident("validation_alias") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(Lit::Str(s)) = value.parse::<Lit>() {
+                            result.validation_alias = Some(s.value());
+                        }
+                    }
+                } else if meta.path.is_ident("serialization_alias") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(Lit::Str(s)) = value.parse::<Lit>() {
+                            result.serialization_alias = Some(s.value());
+                        }
+                    }
                 }
                 Ok(())
             });
@@ -205,6 +234,21 @@ impl ParamAttrs {
             None => quote! {},
         };
 
+        let alias = match &self.alias {
+            Some(a) => quote! { .alias(#a) },
+            None => quote! {},
+        };
+
+        let validation_alias = match &self.validation_alias {
+            Some(a) => quote! { .validation_alias(#a) },
+            None => quote! {},
+        };
+
+        let serialization_alias = match &self.serialization_alias {
+            Some(a) => quote! { .serialization_alias(#a) },
+            None => quote! {},
+        };
+
         quote! {
             fastapi_openapi::ParamMeta::new()
                 #title
@@ -219,6 +263,9 @@ impl ParamAttrs {
                 #min_length
                 #max_length
                 #pattern
+                #alias
+                #validation_alias
+                #serialization_alias
         }
     }
 }
@@ -262,5 +309,42 @@ mod tests {
         assert!(attrs.description.is_none());
         assert!(!attrs.deprecated);
         assert!(!attrs.exclude);
+        assert!(attrs.alias.is_none());
+        assert!(attrs.validation_alias.is_none());
+        assert!(attrs.serialization_alias.is_none());
+    }
+
+    #[test]
+    fn test_param_attrs_alias_defaults() {
+        let attrs = ParamAttrs::default();
+
+        // All alias fields should be None by default
+        assert!(attrs.alias.is_none());
+        assert!(attrs.validation_alias.is_none());
+        assert!(attrs.serialization_alias.is_none());
+    }
+
+    #[test]
+    fn test_param_attrs_alias_set() {
+        let mut attrs = ParamAttrs::default();
+        attrs.alias = Some("q".to_string());
+        attrs.validation_alias = Some("query_param".to_string());
+        attrs.serialization_alias = Some("search_query".to_string());
+
+        assert_eq!(attrs.alias.as_deref(), Some("q"));
+        assert_eq!(attrs.validation_alias.as_deref(), Some("query_param"));
+        assert_eq!(attrs.serialization_alias.as_deref(), Some("search_query"));
+    }
+
+    #[test]
+    fn test_to_param_meta_tokens_with_alias() {
+        let mut attrs = ParamAttrs::default();
+        attrs.alias = Some("x-custom-token".to_string());
+
+        let tokens = attrs.to_param_meta_tokens();
+        let token_string = tokens.to_string();
+
+        // The tokens should include .alias("x-custom-token")
+        assert!(token_string.contains("alias"));
     }
 }

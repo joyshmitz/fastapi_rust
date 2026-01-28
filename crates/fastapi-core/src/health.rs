@@ -144,9 +144,8 @@ impl HealthReport {
 }
 
 /// A boxed future for health check functions.
-type CheckFn = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync,
->;
+type CheckFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
 /// A single health check entry.
 struct HealthCheckEntry {
@@ -284,10 +283,8 @@ impl Default for HealthCheckRegistry {
 ///
 /// This is the simplest health check — always returns 200 OK. Useful as a
 /// basic liveness probe when you just need to confirm the process is running.
-pub fn basic_health_handler() -> impl Fn(&RequestContext, &mut Request) -> std::future::Ready<Response>
-       + Send
-       + Sync
-       + 'static {
+pub fn basic_health_handler()
+-> impl Fn(&RequestContext, &mut Request) -> std::future::Ready<Response> + Send + Sync + 'static {
     |_ctx: &RequestContext, _req: &mut Request| {
         let body = br#"{"status":"healthy"}"#.to_vec();
         std::future::ready(
@@ -307,9 +304,9 @@ pub fn basic_health_handler() -> impl Fn(&RequestContext, &mut Request) -> std::
 pub fn detailed_health_handler(
     registry: Arc<HealthCheckRegistry>,
 ) -> impl Fn(&RequestContext, &mut Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-       + Send
-       + Sync
-       + 'static {
++ Send
++ Sync
++ 'static {
     move |_ctx: &RequestContext, _req: &mut Request| {
         let registry = Arc::clone(&registry);
         Box::pin(async move {
@@ -329,10 +326,8 @@ pub fn detailed_health_handler(
 ///
 /// Returns 200 OK if the process is alive. This is equivalent to `basic_health_handler()`
 /// but semantically represents a liveness check.
-pub fn liveness_handler() -> impl Fn(&RequestContext, &mut Request) -> std::future::Ready<Response>
-       + Send
-       + Sync
-       + 'static {
+pub fn liveness_handler()
+-> impl Fn(&RequestContext, &mut Request) -> std::future::Ready<Response> + Send + Sync + 'static {
     basic_health_handler()
 }
 
@@ -346,9 +341,9 @@ pub fn liveness_handler() -> impl Fn(&RequestContext, &mut Request) -> std::futu
 pub fn readiness_handler(
     registry: Arc<HealthCheckRegistry>,
 ) -> impl Fn(&RequestContext, &mut Request) -> Pin<Box<dyn Future<Output = Response> + Send>>
-       + Send
-       + Sync
-       + 'static {
++ Send
++ Sync
++ 'static {
     detailed_health_handler(registry)
 }
 
@@ -554,9 +549,7 @@ mod tests {
     #[test]
     fn detailed_health_handler_unhealthy_returns_503() {
         let mut registry = HealthCheckRegistry::new();
-        registry.add("db", true, || async {
-            Err("down".to_string())
-        });
+        registry.add("db", true, || async { Err("down".to_string()) });
         let handler = detailed_health_handler(Arc::new(registry));
 
         let ctx = RequestContext::new(asupersync::Cx::for_testing(), 1);
@@ -584,11 +577,11 @@ mod tests {
         let has_no_cache = resp
             .headers()
             .iter()
-            .any(|(n, v)| {
-                n.eq_ignore_ascii_case("cache-control")
-                    && v == b"no-cache, no-store"
-            });
-        assert!(has_no_cache, "should have Cache-Control: no-cache, no-store");
+            .any(|(n, v)| n.eq_ignore_ascii_case("cache-control") && v == b"no-cache, no-store");
+        assert!(
+            has_no_cache,
+            "should have Cache-Control: no-cache, no-store"
+        );
     }
 
     #[test]
@@ -624,9 +617,7 @@ mod tests {
     #[test]
     fn readiness_handler_unhealthy_returns_503() {
         let mut registry = HealthCheckRegistry::new();
-        registry.add("db", true, || async {
-            Err("down".to_string())
-        });
+        registry.add("db", true, || async { Err("down".to_string()) });
         let handler = readiness_handler(Arc::new(registry));
 
         let ctx = RequestContext::new(asupersync::Cx::for_testing(), 1);

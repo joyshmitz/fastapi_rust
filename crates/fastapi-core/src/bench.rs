@@ -97,7 +97,11 @@ impl LatencyHistogram {
     ///
     /// Returns `None` if no samples have been recorded.
     /// Uses nearest-rank method for percentile computation.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn percentile(&mut self, p: f64) -> Option<Duration> {
         if self.samples.is_empty() {
             return None;
@@ -134,7 +138,11 @@ impl LatencyHistogram {
 
     /// Standard deviation of latency samples.
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn std_dev(&self) -> Option<Duration> {
         if self.samples.len() < 2 {
             return None;
@@ -177,7 +185,11 @@ impl LatencyHistogram {
     /// Build histogram buckets with the specified number of bins.
     ///
     /// Returns a list of `(bucket_start, bucket_end, count)` tuples.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn histogram_buckets(&mut self, num_buckets: usize) -> Vec<HistogramBucket> {
         if self.samples.is_empty() || num_buckets == 0 {
             return Vec::new();
@@ -289,7 +301,11 @@ impl LatencyReport {
 }
 
 impl fmt::Display for LatencyReport {
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Latency Report ({} samples)", self.count)?;
         writeln!(f, "  min:    {}", format_duration(self.min))?;
@@ -377,8 +393,16 @@ impl fmt::Display for LatencyComparison {
             self.current.count, self.baseline.count
         )?;
         writeln!(f)?;
-        writeln!(f, "  {:>8}  {:>10}  {:>10}  {:>8}", "metric", "current", "baseline", "change")?;
-        writeln!(f, "  {:>8}  {:>10}  {:>10}  {:>8}", "------", "-------", "--------", "------")?;
+        writeln!(
+            f,
+            "  {:>8}  {:>10}  {:>10}  {:>8}",
+            "metric", "current", "baseline", "change"
+        )?;
+        writeln!(
+            f,
+            "  {:>8}  {:>10}  {:>10}  {:>8}",
+            "------", "-------", "--------", "------"
+        )?;
 
         for (label, cur, base) in [
             ("p50", self.current.p50, self.baseline.p50),
@@ -500,7 +524,9 @@ impl BenchmarkRunner {
     }
 
     /// Run multiple named benchmarks and return all reports.
-    pub fn run_suite(suite: Vec<(BenchmarkConfig, Box<dyn FnMut()>)>) -> Vec<(String, LatencyReport)> {
+    pub fn run_suite(
+        suite: Vec<(BenchmarkConfig, Box<dyn FnMut()>)>,
+    ) -> Vec<(String, LatencyReport)> {
         suite
             .into_iter()
             .map(|(config, mut f)| {
@@ -671,11 +697,7 @@ impl MemoryTracker {
     /// Generate a memory usage report.
     #[must_use]
     pub fn report(&self) -> MemoryReport {
-        let current = self
-            .samples
-            .last()
-            .copied()
-            .unwrap_or(self.baseline);
+        let current = self.samples.last().copied().unwrap_or(self.baseline);
 
         let delta_rss = current.rss_bytes.saturating_sub(self.baseline.rss_bytes);
 
@@ -867,13 +889,19 @@ fn read_proc_memory() -> Option<MemorySnapshot> {
         }
     }
 
-    Some(MemorySnapshot { rss_bytes, vms_bytes })
+    Some(MemorySnapshot {
+        rss_bytes,
+        vms_bytes,
+    })
 }
 
 /// Parse a value like "  12345 kB" from /proc/self/status.
 fn parse_proc_kb(value: &str) -> Option<usize> {
     let trimmed = value.trim();
-    let num_str = trimmed.strip_suffix("kB").or_else(|| trimmed.strip_suffix("KB"))?.trim();
+    let num_str = trimmed
+        .strip_suffix("kB")
+        .or_else(|| trimmed.strip_suffix("KB"))?
+        .trim();
     let kb: usize = num_str.parse().ok()?;
     Some(kb * 1024)
 }
@@ -1214,11 +1242,15 @@ mod tests {
     fn benchmark_suite_runs_all() {
         let suite: Vec<(BenchmarkConfig, Box<dyn FnMut()>)> = vec![
             (
-                BenchmarkConfig::new("a").warmup_iterations(1).iterations(10),
+                BenchmarkConfig::new("a")
+                    .warmup_iterations(1)
+                    .iterations(10),
                 Box::new(|| {}),
             ),
             (
-                BenchmarkConfig::new("b").warmup_iterations(1).iterations(10),
+                BenchmarkConfig::new("b")
+                    .warmup_iterations(1)
+                    .iterations(10),
                 Box::new(|| {}),
             ),
         ];

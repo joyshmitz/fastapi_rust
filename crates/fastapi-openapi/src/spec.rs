@@ -246,6 +246,14 @@ pub struct ParamMeta {
     pub max_length: Option<usize>,
     /// Pattern constraint (regex).
     pub pattern: Option<String>,
+    /// Alternative name used in request (query/header/form).
+    /// If set and `validation_alias` is None, this is also used for validation.
+    /// If set and `serialization_alias` is None, this is used for OpenAPI schema.
+    pub alias: Option<String>,
+    /// Name used specifically for validation (overrides `alias` for validation).
+    pub validation_alias: Option<String>,
+    /// Name used specifically for serialization/OpenAPI (overrides `alias` for serialization).
+    pub serialization_alias: Option<String>,
 }
 
 impl ParamMeta {
@@ -342,7 +350,68 @@ impl ParamMeta {
         self
     }
 
+    /// Set an alias for this parameter.
+    ///
+    /// The alias is the alternative name used in the request (query string, header, etc.).
+    /// If `validation_alias` is not set, this value is also used for validation.
+    /// If `serialization_alias` is not set, this value is used in OpenAPI schema.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[param(alias = "q")]
+    /// query: String,  // Accepts ?q=value instead of ?query=value
+    /// ```
+    #[must_use]
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.alias = Some(alias.into());
+        self
+    }
+
+    /// Set a validation-specific alias.
+    ///
+    /// This name is used when validating/extracting the parameter from the request.
+    /// Overrides the general `alias` for validation purposes.
+    #[must_use]
+    pub fn validation_alias(mut self, alias: impl Into<String>) -> Self {
+        self.validation_alias = Some(alias.into());
+        self
+    }
+
+    /// Set a serialization-specific alias.
+    ///
+    /// This name is used in the OpenAPI schema for this parameter.
+    /// Overrides the general `alias` for serialization/OpenAPI purposes.
+    #[must_use]
+    pub fn serialization_alias(mut self, alias: impl Into<String>) -> Self {
+        self.serialization_alias = Some(alias.into());
+        self
+    }
+
+    /// Get the effective name for extraction/validation.
+    ///
+    /// Returns `validation_alias` if set, otherwise `alias` if set, otherwise `None`.
+    #[must_use]
+    pub fn effective_validation_name(&self) -> Option<&str> {
+        self.validation_alias
+            .as_deref()
+            .or(self.alias.as_deref())
+    }
+
+    /// Get the effective name for OpenAPI/serialization.
+    ///
+    /// Returns `serialization_alias` if set, otherwise `alias` if set, otherwise `None`.
+    #[must_use]
+    pub fn effective_serialization_name(&self) -> Option<&str> {
+        self.serialization_alias
+            .as_deref()
+            .or(self.alias.as_deref())
+    }
+
     /// Convert to an OpenAPI Parameter.
+    ///
+    /// If a serialization alias is configured (via `serialization_alias` or `alias`),
+    /// it will be used as the parameter name in the OpenAPI schema.
     #[must_use]
     pub fn to_parameter(
         &self,
@@ -351,8 +420,13 @@ impl ParamMeta {
         required: bool,
         schema: Option<Schema>,
     ) -> Parameter {
+        // Use the effective serialization name if set, otherwise use the provided name
+        let effective_name = self
+            .effective_serialization_name()
+            .map(String::from)
+            .unwrap_or_else(|| name.into());
         Parameter {
-            name: name.into(),
+            name: effective_name,
             location,
             required,
             schema,

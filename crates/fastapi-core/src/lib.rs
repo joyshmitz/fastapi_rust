@@ -57,8 +57,8 @@ pub mod bench;
 mod context;
 mod dependency;
 pub mod error;
-pub mod health;
 mod extract;
+pub mod health;
 pub mod logging;
 pub mod middleware;
 mod request;
@@ -90,26 +90,24 @@ pub use extract::{
     DEFAULT_PAGE, DEFAULT_PER_PAGE, DEFAULT_RAW_BODY_LIMIT, File, FileConfig, Form, FormConfig,
     FormExtractError, FromHeaderValue, FromRequest, Header, HeaderExtractError, HeaderName,
     HeaderValues, Host, Json, JsonConfig, JsonExtractError, MAX_PER_PAGE, Multipart,
-    MultipartConfig, MultipartExtractError, MultipartPart, NamedHeader, OAuth2BearerError,
-    OAuth2AuthorizationCodeBearer, OAuth2AuthorizationCodeBearerConfig,
+    MultipartConfig, MultipartExtractError, MultipartPart, NamedHeader,
+    OAuth2AuthorizationCodeBearer, OAuth2AuthorizationCodeBearerConfig, OAuth2BearerError,
     OAuth2BearerErrorKind, OAuth2PasswordBearer, OAuth2PasswordBearerConfig,
-    OAuth2PasswordFormError, OAuth2PasswordRequestForm, OAuth2PasswordRequestFormStrict,
-    Page, Pagination,
-    PaginationConfig, Path, PathExtractError, PathParams, Query, QueryExtractError, QueryParams,
-    RawBodyConfig, RawBodyError, RequestCookie, RequestCookies, RequestRef, ResponseMut,
-    ResponseMutations, SameSite, SecureCompare, SecurityScopes, SecurityScopesError,
-    SessionIdCookie, State, StateExtractError,
-    StringBody, UploadedFile, UserAgent, XRequestId, constant_time_eq, constant_time_str_eq,
-    snake_to_header_case,
+    OAuth2PasswordFormError, OAuth2PasswordRequestForm, OAuth2PasswordRequestFormStrict, Page,
+    Pagination, PaginationConfig, Path, PathExtractError, PathParams, Query, QueryExtractError,
+    QueryParams, RawBodyConfig, RawBodyError, RequestCookie, RequestCookies, RequestRef,
+    ResponseMut, ResponseMutations, SameSite, SecureCompare, SecurityScopes, SecurityScopesError,
+    SessionIdCookie, State, StateExtractError, StringBody, UploadedFile, UserAgent, XRequestId,
+    constant_time_eq, constant_time_str_eq, snake_to_header_case,
 };
 pub use middleware::{
     AddResponseHeader, BoxFuture, CompositeKeyExtractor, ControlFlow, Cors, CorsConfig, CsrfConfig,
-    CsrfMiddleware, CsrfMode, CsrfToken, Handler, HeaderKeyExtractor, IpKeyExtractor, KeyExtractor,
-    Layer, Layered, Middleware, MiddlewareStack, NoopMiddleware, OriginPattern, PathKeyExtractor,
-    PathPrefixFilter, RateLimitAlgorithm, RateLimitBuilder, RateLimitConfig, RateLimitMiddleware,
-    RateLimitResult, ReferrerPolicy, RequestId, RequestIdConfig, RequestIdMiddleware,
-    RequestInspectionMiddleware, RequestResponseLogger, RequireHeader, SecurityHeaders,
-    SecurityHeadersConfig, InspectionVerbosity, XFrameOptions,
+    CsrfMiddleware, CsrfMode, CsrfToken, Handler, HeaderKeyExtractor, InspectionVerbosity,
+    IpKeyExtractor, KeyExtractor, Layer, Layered, Middleware, MiddlewareStack, NoopMiddleware,
+    OriginPattern, PathKeyExtractor, PathPrefixFilter, RateLimitAlgorithm, RateLimitBuilder,
+    RateLimitConfig, RateLimitMiddleware, RateLimitResult, ReferrerPolicy, RequestId,
+    RequestIdConfig, RequestIdMiddleware, RequestInspectionMiddleware, RequestResponseLogger,
+    RequireHeader, SecurityHeaders, SecurityHeadersConfig, XFrameOptions,
 };
 #[cfg(feature = "compression")]
 pub use middleware::{CompressionConfig, CompressionMiddleware};
