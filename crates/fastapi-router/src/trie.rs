@@ -1,9 +1,10 @@
 //! Radix trie router implementation.
 
 use crate::r#match::{AllowedMethods, RouteLookup, RouteMatch};
-use fastapi_core::Method;
+use fastapi_core::{Handler, Method};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Path parameter type converter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,17 +63,39 @@ pub struct ParamInfo {
     pub converter: Converter,
 }
 
-/// A route definition.
-#[derive(Debug)]
+/// A route definition with handler for request processing.
+///
+/// Routes are created with a path pattern, HTTP method, and a handler function.
+/// The handler is stored as a type-erased `Arc<dyn Handler>` for dynamic dispatch.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_router::Route;
+/// use fastapi_core::{Method, Handler, RequestContext, Request, Response};
+///
+/// let route = Route::new(Method::Get, "/users/{id}", my_handler);
+/// ```
 pub struct Route {
-    /// Route path pattern.
+    /// Route path pattern (e.g., "/users/{id}").
     pub path: String,
-    /// HTTP method.
+    /// HTTP method for this route.
     pub method: Method,
-    /// Operation ID for OpenAPI.
+    /// Operation ID for OpenAPI documentation.
     pub operation_id: String,
-    // TODO: Handler function pointer
-    // TODO: OpenAPI metadata
+    /// Handler function that processes matching requests.
+    handler: Arc<dyn Handler>,
+}
+
+impl fmt::Debug for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Route")
+            .field("path", &self.path)
+            .field("method", &self.method)
+            .field("operation_id", &self.operation_id)
+            .field("handler", &"<handler>")
+            .finish()
+    }
 }
 
 /// Error returned when a new route conflicts with an existing one.
@@ -166,16 +189,91 @@ impl From<InvalidRouteError> for RouteAddError {
 }
 
 impl Route {
-    /// Create a new route.
-    #[must_use]
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+    /// Create a new route with a handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - HTTP method for this route
+    /// * `path` - Path pattern (e.g., "/users/{id}")
+    /// * `handler` - Handler that processes matching requests
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use fastapi_router::Route;
+    /// use fastapi_core::Method;
+    ///
+    /// let route = Route::new(Method::Get, "/users/{id}", my_handler);
+    /// ```
+    pub fn new<H>(method: Method, path: impl Into<String>, handler: H) -> Self
+    where
+        H: Handler + 'static,
+    {
         let path = path.into();
         let operation_id = path.replace('/', "_").replace(['{', '}'], "");
         Self {
             path,
             method,
             operation_id,
+            handler: Arc::new(handler),
         }
+    }
+
+    /// Create a new route with a pre-wrapped Arc handler.
+    ///
+    /// Useful when the handler is already wrapped in an Arc for sharing.
+    pub fn with_arc_handler(
+        method: Method,
+        path: impl Into<String>,
+        handler: Arc<dyn Handler>,
+    ) -> Self {
+        let path = path.into();
+        let operation_id = path.replace('/', "_").replace(['{', '}'], "");
+        Self {
+            path,
+            method,
+            operation_id,
+            handler,
+        }
+    }
+
+    /// Get a reference to the handler.
+    #[must_use]
+    pub fn handler(&self) -> &Arc<dyn Handler> {
+        &self.handler
+    }
+
+    /// Create a route with a placeholder handler.
+    ///
+    /// This is used by the route registration macros during compile-time route
+    /// discovery. The placeholder handler returns 501 Not Implemented.
+    ///
+    /// **Note**: Routes created with this method should have their handlers
+    /// replaced before being used to handle actual requests.
+    #[must_use]
+    pub fn with_placeholder_handler(method: Method, path: impl Into<String>) -> Self {
+        Self::new(method, path, PlaceholderHandler)
+    }
+}
+
+/// A placeholder handler that returns 501 Not Implemented.
+///
+/// Used for routes created during macro registration before the actual
+/// handler is wired up.
+struct PlaceholderHandler;
+
+impl Handler for PlaceholderHandler {
+    fn call<'a>(
+        &'a self,
+        _ctx: &'a fastapi_core::RequestContext,
+        _req: &'a mut fastapi_core::Request,
+    ) -> fastapi_core::BoxFuture<'a, fastapi_core::Response> {
+        Box::pin(async {
+            fastapi_core::Response::builder()
+                .status(fastapi_core::StatusCode::NOT_IMPLEMENTED)
+                .body("Handler not implemented")
+                .build()
+        })
     }
 }
 
@@ -538,12 +636,32 @@ fn paths_conflict(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastapi_core::{BoxFuture, Request, RequestContext, Response};
+
+    /// Test handler that returns a 200 OK response.
+    /// Used for testing route matching without needing real handlers.
+    struct TestHandler;
+
+    impl Handler for TestHandler {
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a RequestContext,
+            _req: &'a mut Request,
+        ) -> BoxFuture<'a, Response> {
+            Box::pin(async { Response::ok() })
+        }
+    }
+
+    /// Helper to create a route with a test handler.
+    fn route(method: Method, path: &str) -> Route {
+        Route::new(method, path, TestHandler)
+    }
 
     #[test]
     fn static_route_match() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Get, "/items")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/items")).unwrap();
 
         let m = router.match_path("/users", Method::Get);
         assert!(m.is_some());
@@ -560,12 +678,8 @@ mod tests {
     #[test]
     fn nested_static_routes() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/api/v1/users"))
-            .unwrap();
-        router
-            .add(Route::new(Method::Get, "/api/v2/users"))
-            .unwrap();
+        router.add(route(Method::Get, "/api/v1/users")).unwrap();
+        router.add(route(Method::Get, "/api/v2/users")).unwrap();
 
         let m = router.match_path("/api/v1/users", Method::Get);
         assert!(m.is_some());
@@ -579,9 +693,7 @@ mod tests {
     #[test]
     fn parameter_extraction() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/users/{user_id}"))
-            .unwrap();
+        router.add(route(Method::Get, "/users/{user_id}")).unwrap();
 
         let m = router.match_path("/users/123", Method::Get);
         assert!(m.is_some());
@@ -595,7 +707,7 @@ mod tests {
     fn multiple_parameters() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/users/{user_id}/posts/{post_id}"))
+            .add(route(Method::Get, "/users/{user_id}/posts/{post_id}"))
             .unwrap();
 
         let m = router.match_path("/users/42/posts/99", Method::Get);
@@ -609,9 +721,7 @@ mod tests {
     #[test]
     fn int_converter() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/items/{id:int}"))
-            .unwrap();
+        router.add(route(Method::Get, "/items/{id:int}")).unwrap();
 
         // Valid integer
         let m = router.match_path("/items/123", Method::Get);
@@ -631,7 +741,7 @@ mod tests {
     fn float_converter() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/values/{val:float}"))
+            .add(route(Method::Get, "/values/{val:float}"))
             .unwrap();
 
         // Valid float
@@ -651,7 +761,7 @@ mod tests {
     fn uuid_converter() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/objects/{id:uuid}"))
+            .add(route(Method::Get, "/objects/{id:uuid}"))
             .unwrap();
 
         // Valid UUID
@@ -675,7 +785,7 @@ mod tests {
     fn path_converter_captures_slashes() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/files/{path:path}"))
+            .add(route(Method::Get, "/files/{path:path}"))
             .unwrap();
 
         let m = router.match_path("/files/a/b/c.txt", Method::Get).unwrap();
@@ -685,18 +795,16 @@ mod tests {
     #[test]
     fn path_converter_must_be_terminal() {
         let mut router = Router::new();
-        let result = router.add(Route::new(Method::Get, "/files/{path:path}/edit"));
+        let result = router.add(route(Method::Get, "/files/{path:path}/edit"));
         assert!(matches!(result, Err(RouteAddError::InvalidPath(_))));
     }
 
     #[test]
     fn method_dispatch() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/items")).unwrap();
-        router.add(Route::new(Method::Post, "/items")).unwrap();
-        router
-            .add(Route::new(Method::Delete, "/items/{id}"))
-            .unwrap();
+        router.add(route(Method::Get, "/items")).unwrap();
+        router.add(route(Method::Post, "/items")).unwrap();
+        router.add(route(Method::Delete, "/items/{id}")).unwrap();
 
         // GET /items
         let m = router.match_path("/items", Method::Get);
@@ -720,7 +828,7 @@ mod tests {
     #[test]
     fn lookup_method_not_allowed_includes_head() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         let result = router.lookup("/users", Method::Post);
         match result {
@@ -736,9 +844,9 @@ mod tests {
     #[test]
     fn lookup_method_not_allowed_multiple_methods() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Post, "/users")).unwrap();
-        router.add(Route::new(Method::Delete, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Post, "/users")).unwrap();
+        router.add(route(Method::Delete, "/users")).unwrap();
 
         let result = router.lookup("/users", Method::Put);
         match result {
@@ -752,7 +860,7 @@ mod tests {
     #[test]
     fn lookup_not_found_when_path_missing() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         assert!(matches!(
             router.lookup("/missing", Method::Get),
@@ -763,9 +871,7 @@ mod tests {
     #[test]
     fn lookup_not_found_when_converter_mismatch() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/items/{id:int}"))
-            .unwrap();
+        router.add(route(Method::Get, "/items/{id:int}")).unwrap();
 
         assert!(matches!(
             router.lookup("/items/abc", Method::Get),
@@ -777,8 +883,8 @@ mod tests {
     fn static_takes_priority_over_param() {
         let mut router = Router::new();
         // Order matters: add static first, then param
-        router.add(Route::new(Method::Get, "/users/me")).unwrap();
-        router.add(Route::new(Method::Get, "/users/{id}")).unwrap();
+        router.add(route(Method::Get, "/users/me")).unwrap();
+        router.add(route(Method::Get, "/users/{id}")).unwrap();
 
         // Static match for "me"
         let m = router.match_path("/users/me", Method::Get);
@@ -799,7 +905,7 @@ mod tests {
     fn route_match_get_param() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/users/{user_id}/posts/{post_id}"))
+            .add(route(Method::Get, "/users/{user_id}/posts/{post_id}"))
             .unwrap();
 
         let m = router
@@ -873,8 +979,8 @@ mod tests {
     #[test]
     fn routes_accessor() {
         let mut router = Router::new();
-        let _ = router.add(Route::new(Method::Get, "/a"));
-        let _ = router.add(Route::new(Method::Post, "/b"));
+        let _ = router.add(route(Method::Get, "/a"));
+        let _ = router.add(route(Method::Post, "/b"));
 
         assert_eq!(router.routes().len(), 2);
         assert_eq!(router.routes()[0].path, "/a");
@@ -888,9 +994,9 @@ mod tests {
     #[test]
     fn conflict_same_method_same_path() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
-        let result = router.add(Route::new(Method::Get, "/users"));
+        let result = router.add(route(Method::Get, "/users"));
         assert!(result.is_err());
         let err = match result.unwrap_err() {
             RouteAddError::Conflict(err) => err,
@@ -906,10 +1012,10 @@ mod tests {
     #[test]
     fn conflict_same_method_same_param_pattern() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users/{id}")).unwrap();
+        router.add(route(Method::Get, "/users/{id}")).unwrap();
 
         // Same structure, different param name - still conflicts
-        let result = router.add(Route::new(Method::Get, "/users/{user_id}"));
+        let result = router.add(route(Method::Get, "/users/{user_id}"));
         assert!(result.is_err());
         let err = match result.unwrap_err() {
             RouteAddError::Conflict(err) => err,
@@ -924,34 +1030,30 @@ mod tests {
     #[test]
     fn conflict_param_name_mismatch_across_lengths() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/users/{id}/posts"))
-            .unwrap();
+        router.add(route(Method::Get, "/users/{id}/posts")).unwrap();
 
-        let result = router.add(Route::new(Method::Get, "/users/{user_id}"));
+        let result = router.add(route(Method::Get, "/users/{user_id}"));
         assert!(matches!(result, Err(RouteAddError::Conflict(_))));
     }
 
     #[test]
     fn conflict_different_converter_same_position() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/items/{id:int}"))
-            .unwrap();
+        router.add(route(Method::Get, "/items/{id:int}")).unwrap();
 
         // Different converter but same structural position - conflicts
-        let result = router.add(Route::new(Method::Get, "/items/{id:uuid}"));
+        let result = router.add(route(Method::Get, "/items/{id:uuid}"));
         assert!(matches!(result, Err(RouteAddError::Conflict(_))));
     }
 
     #[test]
     fn no_conflict_different_methods() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Post, "/users")).unwrap();
-        router.add(Route::new(Method::Put, "/users")).unwrap();
-        router.add(Route::new(Method::Delete, "/users")).unwrap();
-        router.add(Route::new(Method::Patch, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Post, "/users")).unwrap();
+        router.add(route(Method::Put, "/users")).unwrap();
+        router.add(route(Method::Delete, "/users")).unwrap();
+        router.add(route(Method::Patch, "/users")).unwrap();
 
         assert_eq!(router.routes().len(), 5);
     }
@@ -959,8 +1061,8 @@ mod tests {
     #[test]
     fn no_conflict_static_vs_param() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users/me")).unwrap();
-        router.add(Route::new(Method::Get, "/users/{id}")).unwrap();
+        router.add(route(Method::Get, "/users/me")).unwrap();
+        router.add(route(Method::Get, "/users/{id}")).unwrap();
 
         // Both should be registered (static takes priority during matching)
         assert_eq!(router.routes().len(), 2);
@@ -969,11 +1071,9 @@ mod tests {
     #[test]
     fn no_conflict_different_path_lengths() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Get, "/users/{id}")).unwrap();
-        router
-            .add(Route::new(Method::Get, "/users/{id}/posts"))
-            .unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users/{id}")).unwrap();
+        router.add(route(Method::Get, "/users/{id}/posts")).unwrap();
 
         assert_eq!(router.routes().len(), 3);
     }
@@ -998,7 +1098,7 @@ mod tests {
     #[test]
     fn root_path() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/")).unwrap();
+        router.add(route(Method::Get, "/")).unwrap();
 
         let m = router.match_path("/", Method::Get);
         assert!(m.is_some());
@@ -1008,7 +1108,7 @@ mod tests {
     #[test]
     fn trailing_slash_handling() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         // Path with trailing slash should not match (strict matching)
         // Note: The router treats /users and /users/ differently
@@ -1020,7 +1120,7 @@ mod tests {
     #[test]
     fn multiple_consecutive_slashes() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         // Multiple slashes are normalized during path parsing
         // (empty segments are filtered out)
@@ -1032,8 +1132,8 @@ mod tests {
     #[test]
     fn unicode_in_static_path() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/用户")).unwrap();
-        router.add(Route::new(Method::Get, "/données")).unwrap();
+        router.add(route(Method::Get, "/用户")).unwrap();
+        router.add(route(Method::Get, "/données")).unwrap();
 
         let m = router.match_path("/用户", Method::Get);
         assert!(m.is_some());
@@ -1047,9 +1147,7 @@ mod tests {
     #[test]
     fn unicode_in_param_value() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/users/{name}"))
-            .unwrap();
+        router.add(route(Method::Get, "/users/{name}")).unwrap();
 
         let m = router.match_path("/users/田中", Method::Get);
         assert!(m.is_some());
@@ -1060,9 +1158,7 @@ mod tests {
     #[test]
     fn special_characters_in_param_value() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/files/{name}"))
-            .unwrap();
+        router.add(route(Method::Get, "/files/{name}")).unwrap();
 
         // Hyphens and underscores
         let m = router.match_path("/files/my-file_v2", Method::Get);
@@ -1078,9 +1174,7 @@ mod tests {
     #[test]
     fn empty_param_value() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/users/{id}/posts"))
-            .unwrap();
+        router.add(route(Method::Get, "/users/{id}/posts")).unwrap();
 
         // Empty segment won't match a param (filtered out during parsing)
         let m = router.match_path("/users//posts", Method::Get);
@@ -1092,7 +1186,7 @@ mod tests {
     fn very_long_path() {
         let mut router = Router::new();
         let long_path = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z";
-        router.add(Route::new(Method::Get, long_path)).unwrap();
+        router.add(route(Method::Get, long_path)).unwrap();
 
         let m = router.match_path(long_path, Method::Get);
         assert!(m.is_some());
@@ -1104,7 +1198,7 @@ mod tests {
         let mut router = Router::new();
         for i in 0..100 {
             router
-                .add(Route::new(Method::Get, &format!("/api/v{}", i)))
+                .add(route(Method::Get, &format!("/api/v{}", i)))
                 .unwrap();
         }
 
@@ -1126,7 +1220,7 @@ mod tests {
     #[test]
     fn head_matches_get_route() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         // HEAD should match GET routes
         let m = router.match_path("/users", Method::Head);
@@ -1137,8 +1231,8 @@ mod tests {
     #[test]
     fn head_with_explicit_head_route() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Head, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Head, "/users")).unwrap();
 
         // If explicit HEAD is registered, should match HEAD
         let m = router.match_path("/users", Method::Head);
@@ -1149,7 +1243,7 @@ mod tests {
     #[test]
     fn head_does_not_match_non_get() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Post, "/users")).unwrap();
+        router.add(route(Method::Post, "/users")).unwrap();
 
         // HEAD should not match POST
         let result = router.lookup("/users", Method::Head);
@@ -1169,9 +1263,7 @@ mod tests {
     #[test]
     fn int_converter_edge_cases() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/items/{id:int}"))
-            .unwrap();
+        router.add(route(Method::Get, "/items/{id:int}")).unwrap();
 
         // Zero
         let m = router.match_path("/items/0", Method::Get);
@@ -1199,7 +1291,7 @@ mod tests {
     fn float_converter_edge_cases() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/values/{val:float}"))
+            .add(route(Method::Get, "/values/{val:float}"))
             .unwrap();
 
         // Scientific notation
@@ -1223,7 +1315,7 @@ mod tests {
     fn uuid_converter_case_sensitivity() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/objects/{id:uuid}"))
+            .add(route(Method::Get, "/objects/{id:uuid}"))
             .unwrap();
 
         // Lowercase
@@ -1243,7 +1335,7 @@ mod tests {
     fn uuid_converter_invalid_formats() {
         let mut router = Router::new();
         router
-            .add(Route::new(Method::Get, "/objects/{id:uuid}"))
+            .add(route(Method::Get, "/objects/{id:uuid}"))
             .unwrap();
 
         // Wrong length
@@ -1346,8 +1438,8 @@ mod tests {
     #[test]
     fn lookup_404_no_matching_path() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
-        router.add(Route::new(Method::Get, "/items")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/items")).unwrap();
 
         assert!(matches!(
             router.lookup("/other", Method::Get),
@@ -1362,9 +1454,7 @@ mod tests {
     #[test]
     fn lookup_404_partial_path_match() {
         let mut router = Router::new();
-        router
-            .add(Route::new(Method::Get, "/api/v1/users"))
-            .unwrap();
+        router.add(route(Method::Get, "/api/v1/users")).unwrap();
 
         // Partial matches should be 404
         assert!(matches!(
@@ -1380,7 +1470,7 @@ mod tests {
     #[test]
     fn lookup_404_extra_path_segments() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         // Extra segments should be 404
         assert!(matches!(
@@ -1392,7 +1482,7 @@ mod tests {
     #[test]
     fn lookup_405_single_method() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/users")).unwrap();
+        router.add(route(Method::Get, "/users")).unwrap();
 
         let result = router.lookup("/users", Method::Post);
         match result {
@@ -1406,14 +1496,12 @@ mod tests {
     #[test]
     fn lookup_405_all_methods() {
         let mut router = Router::new();
-        router.add(Route::new(Method::Get, "/resource")).unwrap();
-        router.add(Route::new(Method::Post, "/resource")).unwrap();
-        router.add(Route::new(Method::Put, "/resource")).unwrap();
-        router.add(Route::new(Method::Delete, "/resource")).unwrap();
-        router.add(Route::new(Method::Patch, "/resource")).unwrap();
-        router
-            .add(Route::new(Method::Options, "/resource"))
-            .unwrap();
+        router.add(route(Method::Get, "/resource")).unwrap();
+        router.add(route(Method::Post, "/resource")).unwrap();
+        router.add(route(Method::Put, "/resource")).unwrap();
+        router.add(route(Method::Delete, "/resource")).unwrap();
+        router.add(route(Method::Patch, "/resource")).unwrap();
+        router.add(route(Method::Options, "/resource")).unwrap();
 
         let result = router.lookup("/resource", Method::Trace);
         match result {

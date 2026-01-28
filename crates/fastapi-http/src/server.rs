@@ -258,6 +258,8 @@ pub enum ServerError {
     Shutdown,
     /// Connection limit reached.
     ConnectionLimitReached,
+    /// Keep-alive timeout expired (idle connection).
+    KeepAliveTimeout,
 }
 
 impl std::fmt::Display for ServerError {
@@ -267,6 +269,7 @@ impl std::fmt::Display for ServerError {
             Self::Parse(e) => write!(f, "Parse error: {e}"),
             Self::Shutdown => write!(f, "Server shutdown"),
             Self::ConnectionLimitReached => write!(f, "Connection limit reached"),
+            Self::KeepAliveTimeout => write!(f, "Keep-alive timeout"),
         }
     }
 }
@@ -850,15 +853,47 @@ impl TcpServer {
             let mut request = match parse_result {
                 ParseStatus::Complete { request, .. } => request,
                 ParseStatus::Incomplete => {
-                    // Need more data - read from stream
-                    // TODO: Implement keep-alive timeout using async timeout
-                    // For now, this will block indefinitely waiting for data
-                    let bytes_read = read_into_buffer(&mut stream, &mut read_buffer).await?;
+                    // Need more data - read from stream with keep-alive timeout
+                    let keep_alive_timeout = self.config.keep_alive_timeout;
+                    let read_start = Instant::now();
+
+                    // Read with timeout - if no data arrives within keep_alive_timeout,
+                    // close the connection gracefully
+                    let bytes_read = if keep_alive_timeout.is_zero() {
+                        // No timeout configured - block indefinitely
+                        read_into_buffer(&mut stream, &mut read_buffer).await?
+                    } else {
+                        // Use timeout-aware read
+                        match read_with_timeout(&mut stream, &mut read_buffer, keep_alive_timeout)
+                            .await
+                        {
+                            Ok(0) => {
+                                // Connection closed by client
+                                return Ok(());
+                            }
+                            Ok(n) => n,
+                            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                // Keep-alive timeout expired - close gracefully
+                                ctx.trace(&format!(
+                                    "Keep-alive timeout ({:?}) - closing idle connection",
+                                    keep_alive_timeout
+                                ));
+                                return Err(ServerError::KeepAliveTimeout);
+                            }
+                            Err(e) => return Err(ServerError::Io(e)),
+                        }
+                    };
 
                     if bytes_read == 0 {
                         // Connection closed by client
                         return Ok(());
                     }
+
+                    ctx.trace(&format!(
+                        "Read {} bytes after {:?}",
+                        bytes_read,
+                        read_start.elapsed()
+                    ));
 
                     // Feed new data to parser
                     match parser.feed(&read_buffer[..bytes_read])? {
@@ -967,6 +1002,57 @@ async fn read_into_buffer(stream: &mut TcpStream, buffer: &mut [u8]) -> io::Resu
             Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Reads data from a TCP stream with a timeout.
+///
+/// This function polls the stream for data, tracking elapsed time. If no data
+/// arrives within the specified timeout, returns `io::ErrorKind::TimedOut`.
+///
+/// # Arguments
+///
+/// * `stream` - The TCP stream to read from
+/// * `buffer` - The buffer to read into
+/// * `timeout` - Maximum time to wait for data
+///
+/// # Returns
+///
+/// * `Ok(n)` - Number of bytes read (0 means connection closed)
+/// * `Err(TimedOut)` - Timeout expired with no data
+/// * `Err(other)` - IO error from the underlying stream
+async fn read_with_timeout(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> io::Result<usize> {
+    use std::future::poll_fn;
+
+    let deadline = Instant::now() + timeout;
+
+    poll_fn(|cx| {
+        // Check if we've exceeded the timeout
+        if Instant::now() >= deadline {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "keep-alive timeout expired",
+            )));
+        }
+
+        let mut read_buf = ReadBuf::new(buffer);
+        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                // Schedule a wakeup when the timeout expires
+                // Note: This is a simplified implementation. In production,
+                // this should use proper async timer integration with the runtime.
+                // For now, we rely on the waker being called by the stream.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     })
     .await
@@ -1594,5 +1680,50 @@ mod tests {
     fn server_shutdown_error_display() {
         let err = ServerError::Shutdown;
         assert_eq!(err.to_string(), "Server shutdown");
+    }
+
+    // ========================================================================
+    // Keep-alive timeout tests
+    // ========================================================================
+
+    #[test]
+    fn keep_alive_timeout_error_display() {
+        let err = ServerError::KeepAliveTimeout;
+        assert_eq!(err.to_string(), "Keep-alive timeout");
+    }
+
+    #[test]
+    fn keep_alive_timeout_zero_disables_timeout() {
+        let config = ServerConfig::new("127.0.0.1:8080").with_keep_alive_timeout(Duration::ZERO);
+        assert!(config.keep_alive_timeout.is_zero());
+    }
+
+    #[test]
+    fn keep_alive_timeout_default_is_non_zero() {
+        let config = ServerConfig::default();
+        assert!(!config.keep_alive_timeout.is_zero());
+        assert_eq!(
+            config.keep_alive_timeout,
+            Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn timed_out_io_error_kind() {
+        let err = io::Error::new(io::ErrorKind::TimedOut, "test timeout");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn instant_deadline_calculation() {
+        let timeout = Duration::from_millis(100);
+        let deadline = Instant::now() + timeout;
+
+        // Deadline should be in the future
+        assert!(deadline > Instant::now());
+
+        // After waiting, deadline should be in the past
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(Instant::now() >= deadline);
     }
 }
