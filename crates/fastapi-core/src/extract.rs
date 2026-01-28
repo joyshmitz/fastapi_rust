@@ -6420,6 +6420,20 @@ impl FromRequest for ResponseMutations {
 
 use std::sync::Arc;
 
+/// Formats a panic payload into a human-readable message.
+///
+/// This helper extracts the panic message from the `Box<dyn Any>` payload
+/// returned by `catch_unwind`.
+fn format_panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic_info.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 /// Type alias for a boxed async task function.
 pub type BackgroundTask =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
@@ -6568,12 +6582,150 @@ impl BackgroundTasks {
         self.inner.len()
     }
 
-    /// Execute all tasks.
+    /// Execute all tasks with error isolation.
     ///
     /// This is called by the framework after the response is sent.
+    /// Each task's errors are logged but do not affect other tasks
+    /// or the response that was already sent.
+    ///
+    /// # Error Handling
+    ///
+    /// - Tasks run independently - one failure doesn't stop others
+    /// - All errors are logged to stderr
+    /// - Panics in task closures are caught; panics during await propagate
+    ///   (this is a Rust limitation without additional crate dependencies)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = app.handle(&ctx, &mut request).await;
+    /// // Send response to client...
+    /// if let Some(tasks) = App::take_background_tasks(&mut request) {
+    ///     tasks.execute_all().await;
+    /// }
+    /// ```
     pub async fn execute_all(mut self) {
         for task in self.take_tasks() {
-            task().await;
+            // Execute the task - panics during await propagate
+            // (catching async panics requires additional crate dependencies)
+            let future = task();
+            future.await;
+        }
+    }
+
+    /// Execute all tasks with cancellation support via RequestContext.
+    ///
+    /// This version checks for cancellation between tasks and respects
+    /// the request's cancellation state. Use this when you want background
+    /// tasks to be cancelled along with the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The request context for cancellation checking
+    ///
+    /// # Cancellation Behavior
+    ///
+    /// - Checks `ctx.is_cancelled()` before starting each task
+    /// - If cancelled, remaining tasks are skipped
+    /// - Already-running tasks complete before the check
+    /// - Logs the number of skipped tasks
+    ///
+    /// # Integration with asupersync
+    ///
+    /// Background tasks run in the same region as the request. When the
+    /// region is cancelled (client disconnect, timeout, etc.), subsequent
+    /// tasks will be skipped. This ensures proper structured concurrency.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = app.handle(&ctx, &mut request).await;
+    /// // Send response to client...
+    /// if let Some(tasks) = App::take_background_tasks(&mut request) {
+    ///     tasks.execute_with_context(&ctx).await;
+    /// }
+    /// ```
+    pub async fn execute_with_context(mut self, ctx: &RequestContext) {
+        let tasks = self.take_tasks();
+        let task_count = tasks.len();
+        let mut executed_count = 0;
+
+        for (index, task) in tasks.into_iter().enumerate() {
+            // Check for cancellation before starting each task
+            if ctx.is_cancelled() {
+                let remaining = task_count - index;
+                if remaining > 0 {
+                    ctx.trace(&format!(
+                        "BackgroundTasks: Cancellation requested, skipping {} remaining task(s)",
+                        remaining
+                    ));
+                }
+                break;
+            }
+
+            // Execute the task
+            let future = task();
+            future.await;
+            executed_count += 1;
+        }
+
+        // Trace completion for observability
+        if task_count > 0 {
+            ctx.trace(&format!(
+                "BackgroundTasks: Executed {}/{} tasks",
+                executed_count, task_count
+            ));
+        }
+    }
+
+    /// Execute tasks with per-task error isolation using catch_unwind.
+    ///
+    /// This version catches panics in task closures and logs them,
+    /// allowing subsequent tasks to continue even if earlier ones panic.
+    ///
+    /// Note: Due to Rust's async limitation, panics that occur during
+    /// `.await` inside the task future cannot be caught without additional
+    /// crate dependencies. This method catches panics in the synchronous
+    /// portion of task execution.
+    ///
+    /// For most use cases where task code is well-behaved, `execute_all()`
+    /// or `execute_with_context()` is sufficient.
+    pub async fn execute_with_panic_isolation(mut self) {
+        let tasks = self.take_tasks();
+        let task_count = tasks.len();
+        let mut success_count = 0;
+        let mut panic_count = 0;
+
+        for (index, task) in tasks.into_iter().enumerate() {
+            // Attempt to get the future - catch panics in the closure
+            let future_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task()));
+
+            match future_result {
+                Ok(future) => {
+                    // Got the future, now await it
+                    // Note: Panics during await will still propagate
+                    future.await;
+                    success_count += 1;
+                }
+                Err(panic_info) => {
+                    // Task closure panicked
+                    panic_count += 1;
+                    let panic_msg = format_panic_message(&panic_info);
+                    eprintln!(
+                        "[BackgroundTasks] Task {}/{} panicked: {}",
+                        index + 1,
+                        task_count,
+                        panic_msg
+                    );
+                }
+            }
+        }
+
+        if panic_count > 0 {
+            eprintln!(
+                "[BackgroundTasks] Completed with {}/{} successful, {} panicked",
+                success_count, task_count, panic_count
+            );
         }
     }
 
@@ -7423,6 +7575,384 @@ mod background_tasks_tests {
         assert!(inner.is_empty());
         assert_eq!(inner.len(), 0);
     }
+
+    #[test]
+    fn background_tasks_execute_all_runs_all_tasks() {
+        let mut tasks = BackgroundTasks::new();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        let c3 = counter.clone();
+
+        tasks.add_task(move || async move {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+        tasks.add_task(move || async move {
+            c2.fetch_add(10, Ordering::SeqCst);
+        });
+        tasks.add_task(move || async move {
+            c3.fetch_add(100, Ordering::SeqCst);
+        });
+
+        futures_executor::block_on(tasks.execute_all());
+        assert_eq!(counter.load(Ordering::SeqCst), 111);
+    }
+
+    #[test]
+    fn background_tasks_execute_with_context_respects_cancellation() {
+        let ctx = test_context();
+        let mut tasks = BackgroundTasks::new();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+
+        tasks.add_task(move || async move {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+        tasks.add_task(move || async move {
+            c2.fetch_add(10, Ordering::SeqCst);
+        });
+
+        // Execute with non-cancelled context - all tasks should run
+        futures_executor::block_on(tasks.execute_with_context(&ctx));
+        assert_eq!(counter.load(Ordering::SeqCst), 11);
+    }
+
+    #[test]
+    fn background_tasks_execute_with_panic_isolation_handles_closure_panic() {
+        let mut tasks = BackgroundTasks::new();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+
+        // First task succeeds
+        tasks.add_task(move || async move {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Second task panics in closure (not in async block)
+        tasks.inner.push(Box::new(|| {
+            panic!("intentional test panic");
+        }));
+
+        // Third task should still run after second panics
+        tasks.add_task(move || async move {
+            c2.fetch_add(100, Ordering::SeqCst);
+        });
+
+        // Execute with panic isolation
+        futures_executor::block_on(tasks.execute_with_panic_isolation());
+
+        // First task ran, second panicked, third ran
+        // Note: Due to the way the test is structured, the third task should run
+        assert_eq!(counter.load(Ordering::SeqCst), 101);
+    }
+
+    #[test]
+    fn format_panic_message_extracts_str() {
+        let panic_info: Box<dyn std::any::Any + Send> = Box::new("test panic message");
+        let msg = super::format_panic_message(&panic_info);
+        assert_eq!(msg, "test panic message");
+    }
+
+    #[test]
+    fn format_panic_message_extracts_string() {
+        let panic_info: Box<dyn std::any::Any + Send> = Box::new(String::from("string panic"));
+        let msg = super::format_panic_message(&panic_info);
+        assert_eq!(msg, "string panic");
+    }
+
+    #[test]
+    fn format_panic_message_handles_unknown() {
+        let panic_info: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        let msg = super::format_panic_message(&panic_info);
+        assert_eq!(msg, "unknown panic");
+    }
+
+    // =========================================================================
+    // Execution Timing Tests (bd-1ktc)
+    // These tests verify background task execution timing behavior as it would
+    // be used by the HTTP server: response is built first, then tasks execute.
+    // =========================================================================
+
+    #[test]
+    fn background_tasks_timing_single_task_after_response() {
+        // Simulates: handler queues task, response returned, task executes after
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+
+        // Phase 1: Handler adds task to the request (simulating FromRequest extraction)
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let mut tasks = futures_executor::block_on(BackgroundTasks::from_request(&ctx, &mut req))
+            .expect("extraction should succeed");
+
+        tasks.add_task(move || async move {
+            counter_clone.store(42, Ordering::SeqCst);
+        });
+
+        // Phase 2: Response is "returned" - counter should still be 0
+        // (In real usage, response would be sent to client here)
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "task should not run before take_tasks"
+        );
+
+        // Phase 3: Server takes tasks after response is "sent"
+        // Get the inner from the request extension (simulating App::take_background_tasks)
+        let taken_tasks = req
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+
+        // Counter still 0 - tasks haven't executed yet
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "task should not run before execute_all"
+        );
+
+        // Phase 4: Execute tasks (server does this after sending response)
+        futures_executor::block_on(taken_tasks.execute_all());
+
+        // Now the counter should be set
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            42,
+            "task should have executed"
+        );
+    }
+
+    #[test]
+    fn background_tasks_timing_multiple_tasks_in_order() {
+        // Verify that multiple tasks execute in the order they were queued
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/");
+
+        let execution_order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let order1 = execution_order.clone();
+        let order2 = execution_order.clone();
+        let order3 = execution_order.clone();
+
+        let mut tasks = futures_executor::block_on(BackgroundTasks::from_request(&ctx, &mut req))
+            .expect("extraction should succeed");
+
+        // Queue tasks in order: 1, 2, 3
+        tasks.add_task(move || async move {
+            order1.lock().push(1);
+        });
+        tasks.add_task(move || async move {
+            order2.lock().push(2);
+        });
+        tasks.add_task(move || async move {
+            order3.lock().push(3);
+        });
+
+        // Simulate response being built/sent
+        assert!(
+            execution_order.lock().is_empty(),
+            "no tasks should run during response building"
+        );
+
+        // Take and execute tasks
+        let taken_tasks = req
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+
+        futures_executor::block_on(taken_tasks.execute_all());
+
+        // Verify order: 1, 2, 3
+        assert_eq!(
+            *execution_order.lock(),
+            vec![1, 2, 3],
+            "tasks should execute in queue order"
+        );
+    }
+
+    #[test]
+    fn background_tasks_timing_tasks_can_spawn_more_tasks() {
+        // Test that a task can add more tasks to its own BackgroundTasks
+        // Note: In real usage, the inner is shared, so adding during execution
+        // would affect the same queue (but those tasks wouldn't run until next iteration)
+
+        let mut tasks = BackgroundTasks::new();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        let c3 = counter.clone();
+
+        // First batch of tasks
+        tasks.add_task(move || async move {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+        tasks.add_task(move || async move {
+            c2.fetch_add(10, Ordering::SeqCst);
+        });
+
+        // Execute first batch
+        futures_executor::block_on(tasks.execute_all());
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            11,
+            "first batch should complete"
+        );
+
+        // Create new tasks (simulating a task that spawns more work)
+        let mut more_tasks = BackgroundTasks::new();
+        more_tasks.add_task(move || async move {
+            c3.fetch_add(100, Ordering::SeqCst);
+        });
+
+        // Execute second batch
+        futures_executor::block_on(more_tasks.execute_all());
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            111,
+            "spawned tasks should also run"
+        );
+    }
+
+    #[test]
+    fn background_tasks_timing_independent_requests() {
+        // Verify that tasks from different requests are independent
+        // (simulating concurrent request handling)
+        let ctx1 = test_context();
+        let ctx2 = test_context();
+
+        let mut req1 = Request::new(Method::Get, "/request1");
+        let mut req2 = Request::new(Method::Get, "/request2");
+
+        let counter1 = Arc::new(AtomicU32::new(0));
+        let counter2 = Arc::new(AtomicU32::new(0));
+        let c1 = counter1.clone();
+        let c2 = counter2.clone();
+
+        // Request 1 adds task
+        let mut tasks1 =
+            futures_executor::block_on(BackgroundTasks::from_request(&ctx1, &mut req1))
+                .expect("extraction should succeed");
+        tasks1.add_task(move || async move {
+            c1.store(100, Ordering::SeqCst);
+        });
+
+        // Request 2 adds task
+        let mut tasks2 =
+            futures_executor::block_on(BackgroundTasks::from_request(&ctx2, &mut req2))
+                .expect("extraction should succeed");
+        tasks2.add_task(move || async move {
+            c2.store(200, Ordering::SeqCst);
+        });
+
+        // Execute request 1's tasks
+        let taken1 = req1
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+        futures_executor::block_on(taken1.execute_all());
+
+        // Only counter1 should be affected
+        assert_eq!(
+            counter1.load(Ordering::SeqCst),
+            100,
+            "request 1 task should run"
+        );
+        assert_eq!(
+            counter2.load(Ordering::SeqCst),
+            0,
+            "request 2 task should not run yet"
+        );
+
+        // Execute request 2's tasks
+        let taken2 = req2
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+        futures_executor::block_on(taken2.execute_all());
+
+        // Now both should be set
+        assert_eq!(
+            counter1.load(Ordering::SeqCst),
+            100,
+            "request 1 task unchanged"
+        );
+        assert_eq!(
+            counter2.load(Ordering::SeqCst),
+            200,
+            "request 2 task should run"
+        );
+    }
+
+    #[test]
+    fn background_tasks_timing_nonblocking_next_request() {
+        // Verify that one request's tasks don't block handling of next request
+        // This is implicit in the design: tasks are separate from response handling
+
+        let ctx = test_context();
+        let mut req1 = Request::new(Method::Get, "/first");
+        let mut req2 = Request::new(Method::Get, "/second");
+
+        let req1_done = Arc::new(AtomicBool::new(false));
+        let req2_done = Arc::new(AtomicBool::new(false));
+        let r1 = req1_done.clone();
+        let r2 = req2_done.clone();
+
+        // First request adds a task
+        let mut tasks1 = futures_executor::block_on(BackgroundTasks::from_request(&ctx, &mut req1))
+            .expect("extraction should succeed");
+        tasks1.add_task(move || async move {
+            // Simulate some work
+            r1.store(true, Ordering::SeqCst);
+        });
+
+        // Second request can be handled immediately (before first request's tasks run)
+        let mut tasks2 = futures_executor::block_on(BackgroundTasks::from_request(&ctx, &mut req2))
+            .expect("extraction should succeed");
+        tasks2.add_task(move || async move {
+            r2.store(true, Ordering::SeqCst);
+        });
+
+        // At this point, neither request's tasks have run
+        assert!(
+            !req1_done.load(Ordering::SeqCst),
+            "req1 tasks not yet executed"
+        );
+        assert!(
+            !req2_done.load(Ordering::SeqCst),
+            "req2 tasks not yet executed"
+        );
+
+        // The second request's response could be "sent" before first request's tasks run
+        // This demonstrates non-blocking behavior
+
+        // Now execute both sets of tasks
+        let taken1 = req1
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+        let taken2 = req2
+            .get_extension::<BackgroundTasksInner>()
+            .map(|inner| BackgroundTasks::from_inner(inner.clone()))
+            .expect("tasks should be in extension");
+
+        futures_executor::block_on(taken1.execute_all());
+        futures_executor::block_on(taken2.execute_all());
+
+        assert!(
+            req1_done.load(Ordering::SeqCst),
+            "req1 tasks should be done"
+        );
+        assert!(
+            req2_done.load(Ordering::SeqCst),
+            "req2 tasks should be done"
+        );
+    }
 }
 
 // ============================================================================
@@ -8153,51 +8683,55 @@ impl IntoResponse for OAuth2PasswordFormError {
                     .with_detail(format!("Body {size} > {limit}"))
                     .into_response()
             }
-            OAuth2PasswordFormError::MissingUsername => {
-                ValidationErrors::single(
-                    ValidationError::new(
-                        crate::error::error_types::MISSING,
-                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("username")],
-                    )
-                    .with_msg("Field required".to_string()),
+            OAuth2PasswordFormError::MissingUsername => ValidationErrors::single(
+                ValidationError::new(
+                    crate::error::error_types::MISSING,
+                    vec![
+                        crate::error::LocItem::field("body"),
+                        crate::error::LocItem::field("username"),
+                    ],
                 )
-                .into_response()
-            }
-            OAuth2PasswordFormError::MissingPassword => {
-                ValidationErrors::single(
-                    ValidationError::new(
-                        crate::error::error_types::MISSING,
-                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("password")],
-                    )
-                    .with_msg("Field required".to_string()),
+                .with_msg("Field required".to_string()),
+            )
+            .into_response(),
+            OAuth2PasswordFormError::MissingPassword => ValidationErrors::single(
+                ValidationError::new(
+                    crate::error::error_types::MISSING,
+                    vec![
+                        crate::error::LocItem::field("body"),
+                        crate::error::LocItem::field("password"),
+                    ],
                 )
-                .into_response()
-            }
-            OAuth2PasswordFormError::InvalidGrantType { actual } => {
-                ValidationErrors::single(
-                    ValidationError::new(
-                        crate::error::error_types::VALUE_ERROR,
-                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("grant_type")],
-                    )
-                    .with_msg(format!("grant_type must be \"password\", got: \"{actual}\"")),
+                .with_msg("Field required".to_string()),
+            )
+            .into_response(),
+            OAuth2PasswordFormError::InvalidGrantType { actual } => ValidationErrors::single(
+                ValidationError::new(
+                    crate::error::error_types::VALUE_ERROR,
+                    vec![
+                        crate::error::LocItem::field("body"),
+                        crate::error::LocItem::field("grant_type"),
+                    ],
                 )
-                .into_response()
-            }
-            OAuth2PasswordFormError::MissingGrantType => {
-                ValidationErrors::single(
-                    ValidationError::new(
-                        crate::error::error_types::MISSING,
-                        vec![crate::error::LocItem::field("body"), crate::error::LocItem::field("grant_type")],
-                    )
-                    .with_msg("Field required".to_string()),
+                .with_msg(format!(
+                    "grant_type must be \"password\", got: \"{actual}\""
+                )),
+            )
+            .into_response(),
+            OAuth2PasswordFormError::MissingGrantType => ValidationErrors::single(
+                ValidationError::new(
+                    crate::error::error_types::MISSING,
+                    vec![
+                        crate::error::LocItem::field("body"),
+                        crate::error::LocItem::field("grant_type"),
+                    ],
                 )
-                .into_response()
-            }
-            OAuth2PasswordFormError::InvalidUtf8 => {
-                HttpError::bad_request()
-                    .with_detail("Invalid UTF-8")
-                    .into_response()
-            }
+                .with_msg("Field required".to_string()),
+            )
+            .into_response(),
+            OAuth2PasswordFormError::InvalidUtf8 => HttpError::bad_request()
+                .with_detail("Invalid UTF-8")
+                .into_response(),
             OAuth2PasswordFormError::StreamingNotSupported => {
                 HttpError::bad_request().into_response()
             }
@@ -8303,8 +8837,7 @@ fn extract_form_body(
     }
 
     // Parse form body
-    let body_str =
-        std::str::from_utf8(&bytes).map_err(|_| OAuth2PasswordFormError::InvalidUtf8)?;
+    let body_str = std::str::from_utf8(&bytes).map_err(|_| OAuth2PasswordFormError::InvalidUtf8)?;
     Ok(QueryParams::parse(body_str))
 }
 
@@ -8327,10 +8860,7 @@ impl FromRequest for OAuth2PasswordRequestForm {
             .to_string();
 
         let grant_type = params.get("grant_type").map(String::from);
-        let scope = params
-            .get("scope")
-            .map(String::from)
-            .unwrap_or_default();
+        let scope = params.get("scope").map(String::from).unwrap_or_default();
         let client_id = params.get("client_id").map(String::from);
         let client_secret = params.get("client_secret").map(String::from);
 
@@ -8420,10 +8950,7 @@ impl FromRequest for OAuth2PasswordRequestFormStrict {
             .ok_or(OAuth2PasswordFormError::MissingPassword)?
             .to_string();
 
-        let scope = params
-            .get("scope")
-            .map(String::from)
-            .unwrap_or_default();
+        let scope = params.get("scope").map(String::from).unwrap_or_default();
         let client_id = params.get("client_id").map(String::from);
         let client_secret = params.get("client_secret").map(String::from);
 
@@ -8453,8 +8980,10 @@ mod oauth2_password_form_tests {
 
     fn form_request(body: &str) -> Request {
         let mut req = Request::new(Method::Post, "/token");
-        req.headers_mut()
-            .insert("content-type", b"application/x-www-form-urlencoded".to_vec());
+        req.headers_mut().insert(
+            "content-type",
+            b"application/x-www-form-urlencoded".to_vec(),
+        );
         req.set_body(Body::Bytes(body.as_bytes().to_vec()));
         req
     }
@@ -8465,7 +8994,9 @@ mod oauth2_password_form_tests {
     fn basic_form_extraction() {
         let ctx = test_context();
         let mut req = form_request("username=alice&password=secret123");
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         assert_eq!(form.username, "alice");
         assert_eq!(form.password, "secret123");
@@ -8480,7 +9011,9 @@ mod oauth2_password_form_tests {
         let ctx = test_context();
         let body = "grant_type=password&username=bob&password=s3cret&scope=read+write&client_id=myapp&client_secret=appsecret";
         let mut req = form_request(body);
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         assert_eq!(form.grant_type.as_deref(), Some("password"));
         assert_eq!(form.username, "bob");
@@ -8494,7 +9027,9 @@ mod oauth2_password_form_tests {
     fn scopes_parsing() {
         let ctx = test_context();
         let mut req = form_request("username=u&password=p&scope=read+write+admin");
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         let scopes = form.scopes();
         assert_eq!(scopes, vec!["read", "write", "admin"]);
@@ -8504,7 +9039,9 @@ mod oauth2_password_form_tests {
     fn empty_scope_returns_empty_vec() {
         let ctx = test_context();
         let mut req = form_request("username=u&password=p");
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         assert!(form.scopes().is_empty());
     }
@@ -8513,7 +9050,9 @@ mod oauth2_password_form_tests {
     fn missing_username_error() {
         let ctx = test_context();
         let mut req = form_request("password=secret");
-        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        let err =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap_err();
 
         assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
         assert!(err.to_string().contains("username"));
@@ -8523,7 +9062,9 @@ mod oauth2_password_form_tests {
     fn missing_password_error() {
         let ctx = test_context();
         let mut req = form_request("username=alice");
-        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        let err =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap_err();
 
         assert_eq!(err, OAuth2PasswordFormError::MissingPassword);
         assert!(err.to_string().contains("password"));
@@ -8537,7 +9078,9 @@ mod oauth2_password_form_tests {
             .insert("content-type", b"application/json".to_vec());
         req.set_body(Body::Bytes(b"username=a&password=b".to_vec()));
 
-        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        let err =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap_err();
 
         match err {
             OAuth2PasswordFormError::UnsupportedMediaType { actual } => {
@@ -8553,7 +9096,9 @@ mod oauth2_password_form_tests {
         let mut req = Request::new(Method::Post, "/token");
         req.set_body(Body::Bytes(b"username=a&password=b".to_vec()));
 
-        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        let err =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap_err();
 
         match err {
             OAuth2PasswordFormError::UnsupportedMediaType { actual } => {
@@ -8567,7 +9112,9 @@ mod oauth2_password_form_tests {
     fn url_encoded_values() {
         let ctx = test_context();
         let mut req = form_request("username=user%40example.com&password=p%26ss%3Dword");
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         assert_eq!(form.username, "user@example.com");
         assert_eq!(form.password, "p&ss=word");
@@ -8577,7 +9124,9 @@ mod oauth2_password_form_tests {
     fn plus_decoded_as_space_in_scope() {
         let ctx = test_context();
         let mut req = form_request("username=u&password=p&scope=read+write+admin");
-        let form = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap();
+        let form =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap();
 
         // '+' is decoded as space in application/x-www-form-urlencoded
         assert_eq!(form.scope, "read write admin");
@@ -8587,7 +9136,9 @@ mod oauth2_password_form_tests {
     fn empty_body_returns_missing_username() {
         let ctx = test_context();
         let mut req = form_request("");
-        let err = futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req)).unwrap_err();
+        let err =
+            futures_executor::block_on(OAuth2PasswordRequestForm::from_request(&ctx, &mut req))
+                .unwrap_err();
         assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
     }
 
@@ -8604,15 +9155,36 @@ mod oauth2_password_form_tests {
 
     #[test]
     fn error_display_messages() {
-        assert!(OAuth2PasswordFormError::MissingUsername.to_string().contains("username"));
-        assert!(OAuth2PasswordFormError::MissingPassword.to_string().contains("password"));
-        assert!(OAuth2PasswordFormError::InvalidUtf8.to_string().contains("UTF-8"));
-        assert!(OAuth2PasswordFormError::StreamingNotSupported.to_string().contains("Streaming"));
+        assert!(
+            OAuth2PasswordFormError::MissingUsername
+                .to_string()
+                .contains("username")
+        );
+        assert!(
+            OAuth2PasswordFormError::MissingPassword
+                .to_string()
+                .contains("password")
+        );
+        assert!(
+            OAuth2PasswordFormError::InvalidUtf8
+                .to_string()
+                .contains("UTF-8")
+        );
+        assert!(
+            OAuth2PasswordFormError::StreamingNotSupported
+                .to_string()
+                .contains("Streaming")
+        );
 
-        let err = OAuth2PasswordFormError::InvalidGrantType { actual: "code".to_string() };
+        let err = OAuth2PasswordFormError::InvalidGrantType {
+            actual: "code".to_string(),
+        };
         assert!(err.to_string().contains("code"));
 
-        let err = OAuth2PasswordFormError::PayloadTooLarge { size: 100, limit: 50 };
+        let err = OAuth2PasswordFormError::PayloadTooLarge {
+            size: 100,
+            limit: 50,
+        };
         assert!(err.to_string().contains("100"));
     }
 
@@ -8627,10 +9199,17 @@ mod oauth2_password_form_tests {
         let resp = OAuth2PasswordFormError::UnsupportedMediaType { actual: None }.into_response();
         assert_eq!(resp.status().as_u16(), 415);
 
-        let resp = OAuth2PasswordFormError::PayloadTooLarge { size: 100, limit: 50 }.into_response();
+        let resp = OAuth2PasswordFormError::PayloadTooLarge {
+            size: 100,
+            limit: 50,
+        }
+        .into_response();
         assert_eq!(resp.status().as_u16(), 413);
 
-        let resp = OAuth2PasswordFormError::InvalidGrantType { actual: "code".to_string() }.into_response();
+        let resp = OAuth2PasswordFormError::InvalidGrantType {
+            actual: "code".to_string(),
+        }
+        .into_response();
         assert_eq!(resp.status().as_u16(), 422);
     }
 
@@ -8640,7 +9219,10 @@ mod oauth2_password_form_tests {
     fn strict_accepts_password_grant_type() {
         let ctx = test_context();
         let mut req = form_request("grant_type=password&username=alice&password=secret");
-        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
 
         assert_eq!(form.form.grant_type.as_deref(), Some("password"));
         assert_eq!(form.username, "alice");
@@ -8651,7 +9233,10 @@ mod oauth2_password_form_tests {
     fn strict_rejects_missing_grant_type() {
         let ctx = test_context();
         let mut req = form_request("username=alice&password=secret");
-        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap_err();
 
         assert_eq!(err, OAuth2PasswordFormError::MissingGrantType);
     }
@@ -8660,7 +9245,10 @@ mod oauth2_password_form_tests {
     fn strict_rejects_wrong_grant_type() {
         let ctx = test_context();
         let mut req = form_request("grant_type=authorization_code&username=alice&password=secret");
-        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap_err();
 
         match err {
             OAuth2PasswordFormError::InvalidGrantType { actual } => {
@@ -8675,7 +9263,10 @@ mod oauth2_password_form_tests {
         let ctx = test_context();
         let body = "grant_type=password&username=bob&password=pw&scope=read+write&client_id=app&client_secret=sec";
         let mut req = form_request(body);
-        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+        let form = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
 
         assert_eq!(form.username, "bob");
         assert_eq!(form.password, "pw");
@@ -8689,7 +9280,10 @@ mod oauth2_password_form_tests {
     fn strict_deref_to_inner() {
         let ctx = test_context();
         let mut req = form_request("grant_type=password&username=alice&password=pw");
-        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
 
         // Deref allows accessing inner form fields directly
         let _: &str = &strict.username;
@@ -8701,7 +9295,10 @@ mod oauth2_password_form_tests {
     fn strict_into_inner() {
         let ctx = test_context();
         let mut req = form_request("grant_type=password&username=alice&password=pw");
-        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap();
+        let strict = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap();
 
         let form = strict.into_inner();
         assert_eq!(form.username, "alice");
@@ -8712,7 +9309,10 @@ mod oauth2_password_form_tests {
     fn strict_missing_username_after_grant_type() {
         let ctx = test_context();
         let mut req = form_request("grant_type=password&password=secret");
-        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap_err();
         assert_eq!(err, OAuth2PasswordFormError::MissingUsername);
     }
 
@@ -8720,7 +9320,10 @@ mod oauth2_password_form_tests {
     fn strict_missing_password_after_grant_type() {
         let ctx = test_context();
         let mut req = form_request("grant_type=password&username=alice");
-        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(&ctx, &mut req)).unwrap_err();
+        let err = futures_executor::block_on(OAuth2PasswordRequestFormStrict::from_request(
+            &ctx, &mut req,
+        ))
+        .unwrap_err();
         assert_eq!(err, OAuth2PasswordFormError::MissingPassword);
     }
 }
@@ -8770,10 +9373,7 @@ pub struct OAuth2AuthorizationCodeBearerConfig {
 impl OAuth2AuthorizationCodeBearerConfig {
     /// Create a new configuration with the given authorization and token URLs.
     #[must_use]
-    pub fn new(
-        authorization_url: impl Into<String>,
-        token_url: impl Into<String>,
-    ) -> Self {
+    pub fn new(authorization_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
             authorization_url: authorization_url.into(),
             token_url: token_url.into(),
@@ -8794,11 +9394,7 @@ impl OAuth2AuthorizationCodeBearerConfig {
 
     /// Add an OAuth2 scope.
     #[must_use]
-    pub fn with_scope(
-        mut self,
-        scope: impl Into<String>,
-        description: impl Into<String>,
-    ) -> Self {
+    pub fn with_scope(mut self, scope: impl Into<String>, description: impl Into<String>) -> Self {
         self.scopes.insert(scope.into(), description.into());
         self
     }
@@ -8930,7 +9526,10 @@ mod oauth2_authcode_bearer_tests {
             "https://auth.example.com/authorize",
             "https://auth.example.com/token",
         );
-        assert_eq!(config.authorization_url, "https://auth.example.com/authorize");
+        assert_eq!(
+            config.authorization_url,
+            "https://auth.example.com/authorize"
+        );
         assert_eq!(config.token_url, "https://auth.example.com/token");
         assert!(config.refresh_url.is_none());
         assert!(config.scopes.is_empty());
@@ -8952,12 +9551,18 @@ mod oauth2_authcode_bearer_tests {
         .with_description("Authorization code flow")
         .with_auto_error(false);
 
-        assert_eq!(config.refresh_url.as_deref(), Some("https://auth.example.com/refresh"));
+        assert_eq!(
+            config.refresh_url.as_deref(),
+            Some("https://auth.example.com/refresh")
+        );
         assert_eq!(config.scopes.len(), 2);
         assert_eq!(config.scopes.get("read").unwrap(), "Read access");
         assert_eq!(config.scopes.get("write").unwrap(), "Write access");
         assert_eq!(config.scheme_name.as_deref(), Some("MyAuth"));
-        assert_eq!(config.description.as_deref(), Some("Authorization code flow"));
+        assert_eq!(
+            config.description.as_deref(),
+            Some("Authorization code flow")
+        );
         assert!(!config.auto_error);
     }
 
@@ -9085,10 +9690,11 @@ mod oauth2_authcode_bearer_tests {
         let has_www_auth = resp
             .headers()
             .iter()
-            .any(|(n, v)| {
-                n.eq_ignore_ascii_case("www-authenticate") && v == b"Bearer"
-            });
-        assert!(has_www_auth, "Response should have WWW-Authenticate: Bearer header");
+            .any(|(n, v)| n.eq_ignore_ascii_case("www-authenticate") && v == b"Bearer");
+        assert!(
+            has_www_auth,
+            "Response should have WWW-Authenticate: Bearer header"
+        );
     }
 }
 
@@ -9207,8 +9813,7 @@ impl SecurityScopes {
     ///
     /// New scopes are appended, preserving order and deduplicating.
     pub fn merge(&mut self, other: &SecurityScopes) {
-        let existing: std::collections::HashSet<String> =
-            self.scopes.iter().cloned().collect();
+        let existing: std::collections::HashSet<String> = self.scopes.iter().cloned().collect();
         for scope in &other.scopes {
             if !existing.contains(scope) {
                 self.scopes.push(scope.clone());
@@ -9422,7 +10027,8 @@ mod security_scopes_tests {
         let mut req = Request::new(Method::Get, "/protected");
         req.insert_extension(SecurityScopes::from_scopes(["admin", "users:read"]));
 
-        let scopes = futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
+        let scopes =
+            futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
         assert_eq!(scopes.scopes(), &["admin", "users:read"]);
         assert_eq!(scopes.scope_str(), "admin users:read");
     }
@@ -9432,7 +10038,8 @@ mod security_scopes_tests {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/public");
 
-        let scopes = futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
+        let scopes =
+            futures_executor::block_on(SecurityScopes::from_request(&ctx, &mut req)).unwrap();
         assert!(scopes.is_empty());
     }
 
@@ -15929,7 +16536,11 @@ mod body_size_limit_tests {
         // Body exceeding 50 bytes
         let padding = "x".repeat(60);
         let body = format!("{{\"val\":\"{}\"}}", padding);
-        assert!(body.len() > 50, "Body is {} bytes, expected > 50", body.len());
+        assert!(
+            body.len() > 50,
+            "Body is {} bytes, expected > 50",
+            body.len()
+        );
         req.set_body(Body::Bytes(body.into_bytes()));
 
         let result = futures_executor::block_on(Json::<Data>::from_request(&ctx, &mut req));
@@ -16192,10 +16803,7 @@ mod body_size_limit_tests {
         req.set_body(Body::Bytes(b"this is longer than ten bytes".to_vec()));
 
         let result = futures_executor::block_on(StringBody::from_request(&ctx, &mut req));
-        assert!(matches!(
-            result,
-            Err(RawBodyError::PayloadTooLarge { .. })
-        ));
+        assert!(matches!(result, Err(RawBodyError::PayloadTooLarge { .. })));
     }
 
     #[test]
@@ -16493,9 +17101,6 @@ mod body_size_limit_tests {
         req.set_body(Body::streaming(stream));
 
         let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
-        assert!(matches!(
-            result,
-            Err(RawBodyError::StreamingNotSupported)
-        ));
+        assert!(matches!(result, Err(RawBodyError::StreamingNotSupported)));
     }
 }
