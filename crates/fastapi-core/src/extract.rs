@@ -11949,6 +11949,138 @@ impl FromRequest for BasicAuth {
 }
 
 // ============================================================================
+// HTTP Digest Auth Extractor (Stub)
+// ============================================================================
+
+/// HTTP Digest authentication credentials extractor (stub).
+///
+/// Extracts the raw `Authorization: Digest ...` header value without
+/// implementing the full Digest challenge-response protocol (RFC 7616).
+/// This mirrors Python FastAPI's behavior of providing a stub for
+/// Digest auth.
+///
+/// The credentials string contains the raw Digest parameters
+/// (username, realm, nonce, uri, response, etc.) which the
+/// application must validate.
+#[derive(Debug, Clone)]
+pub struct DigestAuth {
+    /// The raw credentials string after "Digest ".
+    credentials: String,
+}
+
+impl DigestAuth {
+    /// Create a new DigestAuth with raw credentials.
+    #[must_use]
+    pub fn new(credentials: impl Into<String>) -> Self {
+        Self {
+            credentials: credentials.into(),
+        }
+    }
+
+    /// Get the raw credentials string.
+    #[must_use]
+    pub fn credentials(&self) -> &str {
+        &self.credentials
+    }
+
+    /// Extract a parameter value from the Digest credentials.
+    ///
+    /// Looks for `key="value"` or `key=value` in the credentials string.
+    pub fn param(&self, key: &str) -> Option<&str> {
+        let search = format!("{key}=");
+        let start = self.credentials.find(&search)?;
+        let after_eq = &self.credentials[start + search.len()..];
+        if after_eq.starts_with('"') {
+            // Quoted value
+            let inner = &after_eq[1..];
+            let end = inner.find('"')?;
+            Some(&inner[..end])
+        } else {
+            // Unquoted value
+            let end = after_eq.find(',').unwrap_or(after_eq.len());
+            Some(after_eq[..end].trim())
+        }
+    }
+}
+
+/// Error when Digest auth extraction fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestAuthError {
+    /// The Authorization header is missing.
+    MissingHeader,
+    /// The Authorization header doesn't use the Digest scheme.
+    InvalidScheme,
+    /// The header value is not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl DigestAuthError {
+    /// Get a human-readable description of this error.
+    #[must_use]
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::MissingHeader => "Not authenticated",
+            Self::InvalidScheme => "Invalid authentication credentials",
+            Self::InvalidUtf8 => "Invalid authentication credentials",
+        }
+    }
+}
+
+impl fmt::Display for DigestAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHeader => write!(f, "Missing Authorization header"),
+            Self::InvalidScheme => write!(f, "Authorization header must use Digest scheme"),
+            Self::InvalidUtf8 => write!(f, "Authorization header contains invalid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for DigestAuthError {}
+
+impl IntoResponse for DigestAuthError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        let body = serde_json::json!({
+            "detail": self.detail()
+        });
+
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", b"Digest".to_vec())
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+impl FromRequest for DigestAuth {
+    type Error = DigestAuthError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .ok_or(DigestAuthError::MissingHeader)?;
+
+        let auth_str =
+            std::str::from_utf8(auth_header).map_err(|_| DigestAuthError::InvalidUtf8)?;
+
+        const DIGEST_PREFIX: &str = "Digest ";
+        const DIGEST_PREFIX_LOWER: &str = "digest ";
+
+        let credentials = if auth_str.starts_with(DIGEST_PREFIX) {
+            &auth_str[DIGEST_PREFIX.len()..]
+        } else if auth_str.starts_with(DIGEST_PREFIX_LOWER) {
+            &auth_str[DIGEST_PREFIX_LOWER.len()..]
+        } else {
+            return Err(DigestAuthError::InvalidScheme);
+        };
+
+        Ok(DigestAuth::new(credentials.trim()))
+    }
+}
+
+// ============================================================================
 // Timing-Safe Comparison Utilities
 // ============================================================================
 
@@ -18628,5 +18760,68 @@ mod body_size_limit_tests {
 
         let result = futures_executor::block_on(Bytes::from_request(&ctx, &mut req));
         assert!(matches!(result, Err(RawBodyError::StreamingNotSupported)));
+    }
+
+    // ====================================================================
+    // Digest Auth Tests
+    // ====================================================================
+
+    #[test]
+    fn digest_auth_extraction() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut().insert(
+            "authorization",
+            b"Digest username=\"alice\", realm=\"test\", nonce=\"abc123\"".to_vec(),
+        );
+        let result = futures_executor::block_on(DigestAuth::from_request(&ctx, &mut req));
+        let auth = result.unwrap();
+        assert!(auth.credentials().contains("username=\"alice\""));
+    }
+
+    #[test]
+    fn digest_auth_param_extraction() {
+        let auth = DigestAuth::new("username=\"alice\", realm=\"test\", nonce=\"abc123\"");
+        assert_eq!(auth.param("username"), Some("alice"));
+        assert_eq!(auth.param("realm"), Some("test"));
+        assert_eq!(auth.param("nonce"), Some("abc123"));
+        assert_eq!(auth.param("nonexistent"), None);
+    }
+
+    #[test]
+    fn digest_auth_missing_header() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        let result = futures_executor::block_on(DigestAuth::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(DigestAuthError::MissingHeader)));
+    }
+
+    #[test]
+    fn digest_auth_wrong_scheme() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut().insert("authorization", b"Bearer token123".to_vec());
+        let result = futures_executor::block_on(DigestAuth::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(DigestAuthError::InvalidScheme)));
+    }
+
+    #[test]
+    fn digest_auth_error_response_401() {
+        let resp = DigestAuthError::MissingHeader.into_response();
+        assert_eq!(resp.status().as_u16(), 401);
+        let has_www_auth = resp
+            .headers()
+            .iter()
+            .any(|(n, v)| n == "www-authenticate" && v == b"Digest");
+        assert!(has_www_auth);
+    }
+
+    #[test]
+    fn digest_auth_case_insensitive() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Get, "/protected");
+        req.headers_mut().insert("authorization", b"digest username=\"bob\"".to_vec());
+        let result = futures_executor::block_on(DigestAuth::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
     }
 }

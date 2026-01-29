@@ -56,6 +56,7 @@ pub mod app;
 pub mod bench;
 mod context;
 pub mod coverage;
+pub mod fault;
 mod dependency;
 pub mod docs;
 pub mod error;
@@ -92,6 +93,7 @@ pub use error::{
 pub use extract::{
     Accept, AcceptEncodingHeader, AcceptEncodingItem, AcceptHeader, AcceptItem,
     AcceptLanguageHeader, AcceptLanguageItem, ApiKeyCookie, ApiKeyCookieConfig, ApiKeyCookieError,
+    DigestAuth, DigestAuthError,
     ApiKeyHeader, ApiKeyHeaderConfig, ApiKeyHeaderError, ApiKeyQuery, ApiKeyQueryConfig,
     ApiKeyQueryError, AppState, Authorization, BackgroundTasks, BackgroundTasksInner, BasicAuth,
     BasicAuthError, BearerToken, BearerTokenError, Bytes, ContentType, Cookie, CookieExtractError,
@@ -166,6 +168,9 @@ pub use testing::{
 pub use coverage::{
     BranchHits, CoverageConfig, CoverageReport, CoverageTracker, EndpointHits, OutputFormat,
 };
+
+// Re-export fault injection utilities
+pub use fault::{FaultConfig, FaultInjector, FaultRule, FaultType};
 
 // Re-export fixture factories
 pub use fixtures::{
