@@ -72,7 +72,14 @@ impl SchemaAttrs {
                 } else if meta.path.is_ident("example") {
                     if let Ok(value) = meta.value() {
                         if let Ok(Lit::Str(s)) = value.parse::<Lit>() {
-                            result.example = Some(s.value());
+                            let json_str = s.value();
+                            // Validate JSON at compile time - this will panic during
+                            // macro expansion if the JSON is invalid, producing a
+                            // compile-time error rather than a runtime panic
+                            if let Err(e) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                panic!("Invalid JSON in #[schema(example = \"...\")]: {e}");
+                            }
+                            result.example = Some(json_str);
                         }
                     }
                 }
@@ -496,7 +503,8 @@ pub fn derive_json_schema_impl(input: TokenStream) -> TokenStream {
         .map_or_else(|| quote! { None }, |d| quote! { Some(#d.to_string()) });
     let example_value = struct_attrs.example.as_ref().map_or_else(
         || quote! { None },
-        |e| quote! { Some(serde_json::from_str::<serde_json::Value>(#e).expect("invalid JSON in #[schema(example = ...)]")) },
+        // JSON was validated at compile time during attribute parsing
+        |e| quote! { Some(serde_json::from_str::<serde_json::Value>(#e).expect("JSON validated at compile time")) },
     );
 
     // Handle struct data
