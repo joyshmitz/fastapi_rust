@@ -12148,7 +12148,11 @@ impl MediaType {
             }
         }
 
-        Some(Self { typ, subtype, params })
+        Some(Self {
+            typ,
+            subtype,
+            params,
+        })
     }
 
     /// Create a new media type without parameters.
@@ -12254,14 +12258,16 @@ impl AcceptItem {
         };
 
         let media_type = MediaType::parse(&media_str)?;
-        Some(Self { media_type, quality })
+        Some(Self {
+            media_type,
+            quality,
+        })
     }
 }
 
 impl PartialEq for AcceptItem {
     fn eq(&self, other: &Self) -> bool {
-        self.media_type == other.media_type
-            && (self.quality - other.quality).abs() < f32::EPSILON
+        self.media_type == other.media_type && (self.quality - other.quality).abs() < f32::EPSILON
     }
 }
 
@@ -12305,15 +12311,15 @@ impl AcceptHeader {
     /// ```
     #[must_use]
     pub fn parse(s: &str) -> Self {
-        let mut items: Vec<AcceptItem> = s
-            .split(',')
-            .filter_map(AcceptItem::parse)
-            .collect();
+        let mut items: Vec<AcceptItem> = s.split(',').filter_map(AcceptItem::parse).collect();
 
         // Sort by quality descending, then by specificity
         items.sort_by(|a, b| {
             // Higher quality first
-            let q_cmp = b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal);
+            let q_cmp = b
+                .quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal);
             if q_cmp != std::cmp::Ordering::Equal {
                 return q_cmp;
             }
@@ -12348,9 +12354,9 @@ impl AcceptHeader {
             return false;
         };
 
-        self.items.iter().any(|item| {
-            item.quality > 0.0 && mt.matches(&item.media_type)
-        })
+        self.items
+            .iter()
+            .any(|item| item.quality > 0.0 && mt.matches(&item.media_type))
     }
 
     /// Check if a media type is the preferred type.
@@ -12520,13 +12526,13 @@ impl AcceptEncodingHeader {
     /// Parse an Accept-Encoding header value.
     #[must_use]
     pub fn parse(s: &str) -> Self {
-        let mut items: Vec<AcceptEncodingItem> = s
-            .split(',')
-            .filter_map(AcceptEncodingItem::parse)
-            .collect();
+        let mut items: Vec<AcceptEncodingItem> =
+            s.split(',').filter_map(AcceptEncodingItem::parse).collect();
 
         items.sort_by(|a, b| {
-            b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal)
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         Self { items }
@@ -12536,9 +12542,9 @@ impl AcceptEncodingHeader {
     #[must_use]
     pub fn accepts(&self, encoding: &str) -> bool {
         let encoding = encoding.to_ascii_lowercase();
-        self.items.iter().any(|item| {
-            item.quality > 0.0 && (item.encoding == encoding || item.encoding == "*")
-        })
+        self.items
+            .iter()
+            .any(|item| item.quality > 0.0 && (item.encoding == encoding || item.encoding == "*"))
     }
 
     /// Get the preferred encoding from a list of available encodings.
@@ -12637,13 +12643,13 @@ impl AcceptLanguageHeader {
     /// Parse an Accept-Language header value.
     #[must_use]
     pub fn parse(s: &str) -> Self {
-        let mut items: Vec<AcceptLanguageItem> = s
-            .split(',')
-            .filter_map(AcceptLanguageItem::parse)
-            .collect();
+        let mut items: Vec<AcceptLanguageItem> =
+            s.split(',').filter_map(AcceptLanguageItem::parse).collect();
 
         items.sort_by(|a, b| {
-            b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal)
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         Self { items }
@@ -12698,7 +12704,9 @@ impl AcceptLanguageHeader {
                 if matches {
                     match best {
                         None => best = Some((lang, item.quality, exact)),
-                        Some((_, q, e)) if item.quality > q || (item.quality == q && exact && !e) => {
+                        Some((_, q, e))
+                            if item.quality > q || (item.quality == q && exact && !e) =>
+                        {
                             best = Some((lang, item.quality, exact));
                         }
                         _ => {}
@@ -12739,7 +12747,10 @@ impl NotAcceptableError {
     /// Create a new NotAcceptableError.
     #[must_use]
     pub fn new(requested: Vec<String>, available: Vec<String>) -> Self {
-        Self { requested, available }
+        Self {
+            requested,
+            available,
+        }
     }
 }
 
@@ -12981,19 +12992,13 @@ mod content_negotiation_tests {
 
     #[test]
     fn vary_builder() {
-        let vary = VaryBuilder::new()
-            .accept()
-            .accept_encoding()
-            .build();
+        let vary = VaryBuilder::new().accept().accept_encoding().build();
         assert_eq!(vary, "Accept, Accept-Encoding");
     }
 
     #[test]
     fn vary_builder_no_duplicates() {
-        let vary = VaryBuilder::new()
-            .accept()
-            .accept()
-            .build();
+        let vary = VaryBuilder::new().accept().accept().build();
         assert_eq!(vary, "Accept");
     }
 
@@ -13004,7 +13009,10 @@ mod content_negotiation_tests {
             vec!["application/json".to_string(), "text/html".to_string()],
         );
         let response = err.into_response();
-        assert_eq!(response.status(), crate::response::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            response.status(),
+            crate::response::StatusCode::NOT_ACCEPTABLE
+        );
     }
 }
 

@@ -4928,7 +4928,10 @@ impl TraceRejectionMiddleware {
         );
         Response::with_status(crate::response::StatusCode::METHOD_NOT_ALLOWED)
             .header("Content-Type", b"application/json".to_vec())
-            .header("Allow", b"GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD".to_vec())
+            .header(
+                "Allow",
+                b"GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD".to_vec(),
+            )
             .body(crate::response::ResponseBody::Bytes(body.into_bytes()))
     }
 }
@@ -5000,7 +5003,7 @@ impl Default for HttpsRedirectConfig {
     fn default() -> Self {
         Self {
             redirect_enabled: true,
-            permanent_redirect: true, // 301
+            permanent_redirect: true,      // 301
             hsts_max_age_secs: 31_536_000, // 1 year
             hsts_include_subdomains: false,
             hsts_preload: false,
@@ -5672,7 +5675,10 @@ mod trace_rejection_tests {
         match result {
             ControlFlow::Break(response) => {
                 let allow_header = find_header(response.headers(), "Allow");
-                assert!(allow_header.is_some(), "Response should include Allow header");
+                assert!(
+                    allow_header.is_some(),
+                    "Response should include Allow header"
+                );
             }
             ControlFlow::Continue => panic!("TRACE request should have been rejected"),
         }
@@ -5799,7 +5805,8 @@ mod https_redirect_tests {
         let mw = HttpsRedirectMiddleware::new();
         let mut req = Request::new(Method::Get, "/");
         req.headers_mut().insert("Host", b"example.com".to_vec());
-        req.headers_mut().insert("X-Forwarded-Proto", b"https".to_vec());
+        req.headers_mut()
+            .insert("X-Forwarded-Proto", b"https".to_vec());
 
         let result = run_before(&mw, &mut req);
 
@@ -5886,13 +5893,17 @@ mod https_redirect_tests {
     fn hsts_header_on_https_response() {
         let mw = HttpsRedirectMiddleware::new();
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut().insert("X-Forwarded-Proto", b"https".to_vec());
+        req.headers_mut()
+            .insert("X-Forwarded-Proto", b"https".to_vec());
 
         let response = Response::with_status(StatusCode::OK);
         let result = run_after(&mw, &req, response);
 
         let hsts = find_header(result.headers(), "Strict-Transport-Security");
-        assert!(hsts.is_some(), "HSTS header should be present on HTTPS response");
+        assert!(
+            hsts.is_some(),
+            "HSTS header should be present on HTTPS response"
+        );
         let hsts_str = String::from_utf8_lossy(hsts.unwrap());
         assert!(hsts_str.contains("max-age=31536000"));
     }
@@ -5914,7 +5925,8 @@ mod https_redirect_tests {
     fn hsts_with_include_subdomains() {
         let mw = HttpsRedirectMiddleware::new().include_subdomains(true);
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut().insert("X-Forwarded-Proto", b"https".to_vec());
+        req.headers_mut()
+            .insert("X-Forwarded-Proto", b"https".to_vec());
 
         let response = Response::with_status(StatusCode::OK);
         let result = run_after(&mw, &req, response);
@@ -5928,7 +5940,8 @@ mod https_redirect_tests {
     fn hsts_with_preload() {
         let mw = HttpsRedirectMiddleware::new().preload(true);
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut().insert("X-Forwarded-Proto", b"https".to_vec());
+        req.headers_mut()
+            .insert("X-Forwarded-Proto", b"https".to_vec());
 
         let response = Response::with_status(StatusCode::OK);
         let result = run_after(&mw, &req, response);
@@ -5942,7 +5955,8 @@ mod https_redirect_tests {
     fn hsts_disabled_with_zero_max_age() {
         let mw = HttpsRedirectMiddleware::new().hsts_max_age_secs(0);
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut().insert("X-Forwarded-Proto", b"https".to_vec());
+        req.headers_mut()
+            .insert("X-Forwarded-Proto", b"https".to_vec());
 
         let response = Response::with_status(StatusCode::OK);
         let result = run_after(&mw, &req, response);
@@ -5972,7 +5986,8 @@ mod https_redirect_tests {
     fn host_with_port_stripped() {
         let mw = HttpsRedirectMiddleware::new();
         let mut req = Request::new(Method::Get, "/");
-        req.headers_mut().insert("Host", b"example.com:8080".to_vec());
+        req.headers_mut()
+            .insert("Host", b"example.com:8080".to_vec());
 
         let result = run_before(&mw, &mut req);
 
