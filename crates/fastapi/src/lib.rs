@@ -45,11 +45,32 @@
 //!
 //! # Crate Structure
 //!
-//! - [`fastapi_core`] — Core types (Request, Response, Error)
-//! - [`fastapi_http`] — Zero-copy HTTP/1.1 parser
-//! - [`fastapi_router`] — Trie-based router
-//! - [`fastapi_macros`] — Procedural macros (`#[get]`, `#[derive(Validate)]`)
-//! - [`fastapi_openapi`] — OpenAPI 3.1 types and generation
+//! | Crate | Purpose |
+//! |-------|---------|
+//! | `fastapi_core` | Core types (Request, Response, Error), extractors, middleware, DI |
+//! | `fastapi_http` | Zero-copy HTTP/1.1 parser, TCP server, chunked encoding |
+//! | `fastapi_router` | Trie-based router with O(log n) lookups |
+//! | `fastapi_macros` | Procedural macros (`#[get]`, `#[derive(Validate)]`, `#[derive(JsonSchema)]`) |
+//! | `fastapi_openapi` | OpenAPI 3.1 schema types and generation |
+//! | `fastapi_output` | Agent-aware rich console output (optional) |
+//!
+//! # Feature Flags
+//!
+//! | Feature | Default | Description |
+//! |---------|---------|-------------|
+//! | `output` | **yes** | Rich console output with agent detection (includes `fastapi-output/rich`) |
+//! | `output-plain` | no | Plain-text-only output (smaller binary, no ANSI codes) |
+//! | `full` | no | All output features including every theme and component |
+//!
+//! ## Sub-crate Feature Flags
+//!
+//! **`fastapi-core`:**
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `regex` | Regex support in testing assertions |
+//! | `compression` | Response compression middleware (gzip via flate2) |
+//! | `proptest` | Property-based testing support |
 
 #![forbid(unsafe_code)]
 // Design doc at PROPOSED_RUST_ARCHITECTURE.md (not embedded - too many conceptual code examples)
