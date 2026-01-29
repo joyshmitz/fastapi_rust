@@ -534,6 +534,7 @@ impl JwtFactory {
 
     /// Set the subject claim.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(mut self, sub: impl Into<String>) -> Self {
         self.sub = Some(sub.into());
         self
@@ -1015,7 +1016,7 @@ fn base64_encode(input: &str) -> String {
             _ => [chunk[0], chunk[1], chunk[2]],
         };
 
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
 
         result.push(ALPHABET[((n >> 18) & 63) as usize] as char);
         result.push(ALPHABET[((n >> 12) & 63) as usize] as char);

@@ -98,6 +98,7 @@ impl ChunkedEncoder {
     }
 
     /// Set trailers to be sent after the final chunk.
+    #[must_use]
     pub fn with_trailers(mut self, trailers: Trailers) -> Self {
         self.trailers = Some(trailers);
         self

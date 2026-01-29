@@ -988,7 +988,7 @@ mod tests {
 
         // p100 should return the max
         let p100 = h.percentile(100.0).unwrap();
-        assert_eq!(p100, Duration::from_micros(1000));
+        assert_eq!(p100, Duration::from_millis(1));
 
         // p99.9 should be close to 999
         let p999 = h.percentile(99.9).unwrap();
@@ -1086,7 +1086,7 @@ mod tests {
         let report = h.report().unwrap();
         assert_eq!(report.count, 1000);
         assert_eq!(report.min, Duration::from_micros(1));
-        assert_eq!(report.max, Duration::from_micros(1000));
+        assert_eq!(report.max, Duration::from_millis(1));
         assert!(report.p50 <= report.p90);
         assert!(report.p90 <= report.p95);
         assert!(report.p95 <= report.p99);

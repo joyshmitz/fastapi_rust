@@ -2398,7 +2398,9 @@ mod tests {
     // Test: ResolutionStack detects request -> function scope violation
     #[test]
     fn resolution_stack_detects_scope_violation() {
+        #[allow(dead_code)]
         struct RequestScoped;
+        #[allow(dead_code)]
         struct FunctionScoped;
 
         let stack = ResolutionStack::new();
@@ -2420,7 +2422,9 @@ mod tests {
     // Test: ResolutionStack allows request -> request (valid)
     #[test]
     fn resolution_stack_allows_request_to_request() {
+        #[allow(dead_code)]
         struct RequestA;
+        #[allow(dead_code)]
         struct RequestB;
 
         let stack = ResolutionStack::new();
@@ -2436,7 +2440,9 @@ mod tests {
     // Test: ResolutionStack allows function -> function (valid)
     #[test]
     fn resolution_stack_allows_function_to_function() {
+        #[allow(dead_code)]
         struct FunctionA;
+        #[allow(dead_code)]
         struct FunctionB;
 
         let stack = ResolutionStack::new();
@@ -2455,7 +2461,9 @@ mod tests {
     // Test: ResolutionStack allows function -> request (valid)
     #[test]
     fn resolution_stack_allows_function_to_request() {
+        #[allow(dead_code)]
         struct FunctionScoped;
+        #[allow(dead_code)]
         struct RequestScoped;
 
         let stack = ResolutionStack::new();
@@ -2471,8 +2479,11 @@ mod tests {
     // Test: Nested scope violation detection (A(request) -> B(request) -> C(function))
     #[test]
     fn resolution_stack_nested_scope_violation() {
+        #[allow(dead_code)]
         struct OuterRequest;
+        #[allow(dead_code)]
         struct MiddleRequest;
+        #[allow(dead_code)]
         struct InnerFunction;
 
         let stack = ResolutionStack::new();
@@ -2618,6 +2629,7 @@ mod tests {
     fn function_scope_cleanup_each_time() {
         // Create a function-scoped cleanup dependency
         #[derive(Clone)]
+        #[allow(dead_code)]
         struct FunctionScopedWithCleanup {
             id: u32,
         }

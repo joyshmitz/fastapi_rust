@@ -1516,9 +1516,8 @@ pub fn apply_conditional(
         .and_then(|(_, value)| std::str::from_utf8(value).ok())
         .map(String::from);
 
-    let response_etag = match response_etag {
-        Some(etag) => etag,
-        None => return response, // No ETag, can't do conditional
+    let Some(response_etag) = response_etag else {
+        return response; // No ETag, can't do conditional
     };
 
     // Check If-None-Match (for GET/HEAD - returns 304)
@@ -1686,6 +1685,7 @@ impl LinkHeader {
 
     /// Add a fully configured [`Link`] entry.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, link: Link) -> Self {
         self.links.push(link);
         self
@@ -1706,7 +1706,7 @@ impl LinkHeader {
         let last_page = if total == 0 {
             1
         } else {
-            (total + per_page - 1) / per_page
+            total.div_ceil(per_page)
         };
         let sep = if base_url.contains('?') { '&' } else { '?' };
 

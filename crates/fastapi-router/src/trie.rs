@@ -1170,14 +1170,18 @@ impl Router {
         let mut range_count = 0;
 
         for range in &mut range_iter {
-            if range_count < 16 {
-                ranges_buf[range_count] = range;
-            } else if range_count == 16 {
-                // Overflow to heap
-                ranges_vec = ranges_buf.to_vec();
-                ranges_vec.push(range);
-            } else {
-                ranges_vec.push(range);
+            match range_count.cmp(&16) {
+                std::cmp::Ordering::Less => {
+                    ranges_buf[range_count] = range;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Overflow to heap
+                    ranges_vec = ranges_buf.to_vec();
+                    ranges_vec.push(range);
+                }
+                std::cmp::Ordering::Greater => {
+                    ranges_vec.push(range);
+                }
             }
             range_count += 1;
         }

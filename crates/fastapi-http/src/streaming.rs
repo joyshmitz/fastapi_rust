@@ -872,7 +872,7 @@ mod tests {
         }
 
         assert_eq!(total_received, TARGET_SIZE, "Should receive all 10MB");
-        let expected_chunks = (TARGET_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE; // Ceiling division
+        let expected_chunks = TARGET_SIZE.div_ceil(CHUNK_SIZE);
         assert_eq!(
             chunk_count, expected_chunks,
             "Should have correct number of chunks"
@@ -932,7 +932,6 @@ mod tests {
                 Poll::Ready(None) => break,
                 Poll::Pending => {
                     // FileStream may return Pending; for sync test just continue
-                    continue;
                 }
             }
         }

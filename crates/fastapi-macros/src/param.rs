@@ -327,10 +327,12 @@ mod tests {
 
     #[test]
     fn test_param_attrs_alias_set() {
-        let mut attrs = ParamAttrs::default();
-        attrs.alias = Some("q".to_string());
-        attrs.validation_alias = Some("query_param".to_string());
-        attrs.serialization_alias = Some("search_query".to_string());
+        let attrs = ParamAttrs {
+            alias: Some("q".to_string()),
+            validation_alias: Some("query_param".to_string()),
+            serialization_alias: Some("search_query".to_string()),
+            ..Default::default()
+        };
 
         assert_eq!(attrs.alias.as_deref(), Some("q"));
         assert_eq!(attrs.validation_alias.as_deref(), Some("query_param"));
@@ -339,8 +341,10 @@ mod tests {
 
     #[test]
     fn test_to_param_meta_tokens_with_alias() {
-        let mut attrs = ParamAttrs::default();
-        attrs.alias = Some("x-custom-token".to_string());
+        let attrs = ParamAttrs {
+            alias: Some("x-custom-token".to_string()),
+            ..Default::default()
+        };
 
         let tokens = attrs.to_param_meta_tokens();
         let token_string = tokens.to_string();

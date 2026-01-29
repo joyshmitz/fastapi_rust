@@ -55,6 +55,7 @@ use crate::response::{Response, ResponseBody, StatusCode, mime_type_for_extensio
 
 /// Configuration for static file serving.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StaticFilesConfig {
     /// Root directory to serve files from.
     pub directory: PathBuf,
@@ -257,15 +258,13 @@ impl StaticFiles {
             .join(path_without_prefix.trim_start_matches('/'));
 
         // Canonicalize to resolve any remaining path tricks
-        let canonical_path = match self.resolve_path(&file_path) {
-            Some(p) => p,
-            None => return self.not_found_response(),
+        let Some(canonical_path) = self.resolve_path(&file_path) else {
+            return self.not_found_response();
         };
 
         // Ensure the resolved path is within our directory
-        let canonical_dir = match self.config.directory.canonicalize() {
-            Ok(d) => d,
-            Err(_) => return self.not_found_response(),
+        let Ok(canonical_dir) = self.config.directory.canonicalize() else {
+            return self.not_found_response();
         };
 
         if !canonical_path.starts_with(&canonical_dir) {
@@ -357,9 +356,8 @@ impl StaticFiles {
         }
 
         // Read file contents
-        let contents = match std::fs::read(file_path) {
-            Ok(c) => c,
-            Err(_) => return self.not_found_response(),
+        let Ok(contents) = std::fs::read(file_path) else {
+            return self.not_found_response();
         };
 
         // Get file metadata for caching headers
@@ -405,7 +403,7 @@ impl StaticFiles {
         let mut entries = Vec::new();
 
         // Add parent directory link if not at root
-        if request_path != "/" && request_path != &self.config.prefix {
+        if request_path != "/" && request_path != self.config.prefix {
             entries.push(DirectoryEntry {
                 name: "..".to_string(),
                 is_dir: true,
@@ -722,6 +720,7 @@ fn escape_html(s: &str) -> String {
 }
 
 /// Format file size for display.
+#[allow(clippy::cast_precision_loss)]
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;

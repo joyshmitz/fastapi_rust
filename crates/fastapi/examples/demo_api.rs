@@ -131,8 +131,10 @@ fn list_users(page: u64, per_page: u64) -> PaginatedResponse<User> {
     // Simulated data
     let all_users = sample_users();
     let total = all_users.len() as u64;
-    let total_pages = (total + per_page - 1) / per_page;
+    let total_pages = total.div_ceil(per_page);
+    #[allow(clippy::cast_possible_truncation)]
     let start = ((page - 1) * per_page) as usize;
+    #[allow(clippy::cast_possible_truncation)]
     let items: Vec<User> = all_users.into_iter().skip(start).take(per_page as usize).collect();
 
     PaginatedResponse {
@@ -149,8 +151,8 @@ fn get_user(id: u64) -> Result<ApiResponse<User>, (u16, String)> {
     sample_users()
         .into_iter()
         .find(|u| u.id == id)
-        .map(|u| ApiResponse::ok(u))
-        .ok_or((404, format!("User {} not found", id)))
+        .map(ApiResponse::ok)
+        .ok_or((404, format!("User {id} not found")))
 }
 
 /// Create a new user.
@@ -168,9 +170,9 @@ fn create_user(input: CreateUser) -> ApiResponse<User> {
 #[allow(dead_code)]
 fn delete_user(id: u64) -> Result<ApiResponse<()>, (u16, String)> {
     if sample_users().iter().any(|u| u.id == id) {
-        Ok(ApiResponse::with_message((), format!("User {} deleted", id)))
+        Ok(ApiResponse::with_message((), format!("User {id} deleted")))
     } else {
-        Err((404, format!("User {} not found", id)))
+        Err((404, format!("User {id} not found")))
     }
 }
 
@@ -242,14 +244,14 @@ fn print_demo_info() {
     println!("Get user 1:");
     match get_user(1) {
         Ok(resp) => println!("  {}", serde_json::to_string_pretty(&resp).unwrap()),
-        Err((code, msg)) => println!("  Error {}: {}", code, msg),
+        Err((code, msg)) => println!("  Error {code}: {msg}"),
     }
     println!();
 
     println!("Get user 999 (not found):");
     match get_user(999) {
         Ok(resp) => println!("  {}", serde_json::to_string_pretty(&resp).unwrap()),
-        Err((code, msg)) => println!("  Error {}: {}", code, msg),
+        Err((code, msg)) => println!("  Error {code}: {msg}"),
     }
     println!();
 

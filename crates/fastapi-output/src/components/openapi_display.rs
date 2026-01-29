@@ -373,6 +373,8 @@ impl OpenApiDisplay {
     }
 
     /// Group endpoints by their first tag.
+    #[allow(dead_code)]
+    #[allow(clippy::unused_self)]
     fn group_endpoints_by_tag<'a>(
         &self,
         endpoints: &'a [EndpointInfo],
@@ -602,6 +604,7 @@ impl OpenApiDisplay {
         lines.join("\n")
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_summary_rich(&self, summary: &OpenApiSummary) -> String {
         let muted = self.theme.muted.to_ansi_fg();
         let _accent = self.theme.accent.to_ansi_fg();

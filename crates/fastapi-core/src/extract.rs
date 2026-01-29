@@ -5731,8 +5731,8 @@ mod state_tests {
         assert_eq!(produced.len(), expected_count);
 
         // Each ID should be unique (no lost slots)
-        let mut sorted: Vec<_> = produced.iter().cloned().collect();
-        sorted.sort();
+        let mut sorted: Vec<_> = produced.iter().copied().collect();
+        sorted.sort_unstable();
         for (i, &id) in sorted.iter().enumerate() {
             assert_eq!(id, i, "Slot {i} missing or duplicated");
         }
@@ -5778,7 +5778,7 @@ mod state_tests {
                         let enabled = state.get::<bool>();
 
                         // Verify consistency
-                        if config.map(|s| s.as_str()) != Some(config_value) {
+                        if config.map(String::as_str) != Some(config_value) {
                             errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         if port != Some(&port_value) {
@@ -5838,7 +5838,7 @@ mod state_tests {
                         if state.get::<i32>() != Some(&42) {
                             errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
-                        if state.get::<String>().map(|s| s.len()) != Some(1000) {
+                        if state.get::<String>().is_some_and(|s| s.len() != 1000) {
                             errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         if state.get::<Vec<u8>>() != Some(&expected_large) {
@@ -5925,6 +5925,7 @@ mod state_tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_wrap)]
     fn concurrent_reads_with_arc_rwlock_pattern() {
         // Test Arc<RwLock<T>> patterns for mutable shared state (bd-tnw0)
         use parking_lot::RwLock;
@@ -13062,8 +13063,8 @@ impl AcceptHeader {
                 return q_cmp;
             }
             // More specific types first (fewer wildcards)
-            let a_wildcards = (a.media_type.typ == "*") as u8 + (a.media_type.subtype == "*") as u8;
-            let b_wildcards = (b.media_type.typ == "*") as u8 + (b.media_type.subtype == "*") as u8;
+            let a_wildcards = u8::from(a.media_type.typ == "*") + u8::from(a.media_type.subtype == "*");
+            let b_wildcards = u8::from(b.media_type.typ == "*") + u8::from(b.media_type.subtype == "*");
             a_wildcards.cmp(&b_wildcards)
         });
 
@@ -13168,12 +13169,9 @@ impl AcceptHeader {
 
         // Sort by quality descending, then by position in available list
         scored.sort_by(|a, b| {
-            let q_cmp = b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
-            if q_cmp != std::cmp::Ordering::Equal {
-                q_cmp
-            } else {
-                a.2.cmp(&b.2)
-            }
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.2.cmp(&b.2))
         });
 
         scored.first().map(|(mt, _, _)| *mt)
@@ -13429,11 +13427,10 @@ impl AcceptLanguageHeader {
 
                 let (matches, exact) = if item_lower == lang_lower {
                     (true, true)
-                } else if item_lower == "*" {
-                    (true, false)
-                } else if lang_lower.starts_with(&format!("{}-", item_lower)) {
-                    (true, false)
-                } else if item_lower.starts_with(&format!("{}-", lang_lower)) {
+                } else if item_lower == "*"
+                    || lang_lower.starts_with(&format!("{}-", item_lower))
+                    || item_lower.starts_with(&format!("{}-", lang_lower))
+                {
                     (true, false)
                 } else {
                     (false, false)
@@ -13443,7 +13440,7 @@ impl AcceptLanguageHeader {
                     match best {
                         None => best = Some((lang, item.quality, exact)),
                         Some((_, q, e))
-                            if item.quality > q || (item.quality == q && exact && !e) =>
+                            if item.quality > q || ((item.quality - q).abs() < f32::EPSILON && exact && !e) =>
                         {
                             best = Some((lang, item.quality, exact));
                         }
@@ -13684,6 +13681,7 @@ mod content_negotiation_tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn accept_header_empty_accepts_all() {
         let accept = AcceptHeader::parse("");
         assert!(accept.accepts("anything/here"));
@@ -14932,7 +14930,7 @@ mod api_key_query_tests {
     fn api_key_query_empty_query_string() {
         let ctx = test_context();
         let mut req = Request::new(Method::Get, "/api/webhook");
-        req.set_query(Some("".to_string()));
+        req.set_query(Some(String::new()));
 
         let result = futures_executor::block_on(ApiKeyQuery::from_request(&ctx, &mut req));
         assert!(result.is_err());

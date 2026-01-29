@@ -621,7 +621,7 @@ mod tests {
         const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
 
         // Create chunks that total 10MB
-        let num_chunks = (TARGET_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let num_chunks = TARGET_SIZE.div_ceil(CHUNK_SIZE);
         let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = (0..num_chunks)
             .map(|i| {
                 let start = i * CHUNK_SIZE;

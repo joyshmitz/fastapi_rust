@@ -278,7 +278,7 @@ pub trait PreBodyValidator: Send + Sync {
     fn validate(&self, request: &Request) -> Result<(), Response>;
 
     /// Optional name for debugging/logging.
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "PreBodyValidator"
     }
 }
@@ -355,7 +355,7 @@ where
         (self.validate_fn)(request)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         self.name
     }
 }

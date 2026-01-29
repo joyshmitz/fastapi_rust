@@ -5039,6 +5039,7 @@ impl Middleware for TraceRejectionMiddleware {
 
 /// Configuration for HTTPS redirect behavior.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct HttpsRedirectConfig {
     /// Enable HTTP to HTTPS redirects.
     pub redirect_enabled: bool,
@@ -5630,6 +5631,7 @@ impl ResponseInterceptor for TimingInterceptor {
 ///     .include_method(true);
 /// ```
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DebugInfoInterceptor {
     /// Include path in debug headers.
     include_path: bool,
@@ -6312,7 +6314,7 @@ impl ServerTimingBuilder {
     pub fn build(&self) -> String {
         self.entries
             .iter()
-            .map(|e| e.to_header_value())
+            .map(ServerTimingEntry::to_header_value)
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -6442,6 +6444,7 @@ impl Default for TimingMetrics {
 
 /// Configuration for the timing metrics middleware.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TimingMetricsConfig {
     /// Whether to add the Server-Timing header.
     pub add_server_timing_header: bool,
@@ -6766,7 +6769,8 @@ impl TimingHistogram {
         if self.count == 0 {
             0.0
         } else {
-            self.sum / self.count as f64
+            #[allow(clippy::cast_precision_loss)]
+            { self.sum / self.count as f64 }
         }
     }
 
@@ -6997,6 +7001,7 @@ mod timing_metrics_tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn timing_histogram_basic() {
         let mut histogram = TimingHistogram::http_latency();
         assert_eq!(histogram.count(), 0);
@@ -7030,6 +7035,7 @@ mod timing_metrics_tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn timing_histogram_reset() {
         let mut histogram = TimingHistogram::http_latency();
         histogram.observe(100.0);
@@ -10343,9 +10349,9 @@ mod tests {
         let missing_body = match missing_result {
             ControlFlow::Break(r) => match r.body_ref() {
                 ResponseBody::Bytes(b) => std::str::from_utf8(b).unwrap().to_string(),
-                _ => panic!("Expected Bytes"),
+                ResponseBody::Empty | ResponseBody::Stream(_) => panic!("Expected Bytes"),
             },
-            _ => panic!("Expected Break"),
+            ControlFlow::Continue => panic!("Expected Break"),
         };
 
         // Mismatch: both present but different
@@ -10360,9 +10366,9 @@ mod tests {
         let mismatch_body = match mismatch_result {
             ControlFlow::Break(r) => match r.body_ref() {
                 ResponseBody::Bytes(b) => std::str::from_utf8(b).unwrap().to_string(),
-                _ => panic!("Expected Bytes"),
+                ResponseBody::Empty | ResponseBody::Stream(_) => panic!("Expected Bytes"),
             },
-            _ => panic!("Expected Break"),
+            ControlFlow::Continue => panic!("Expected Break"),
         };
 
         // Error messages should differ
@@ -10657,7 +10663,7 @@ mod tests {
                         method
                     );
                 }
-                _ => panic!("Expected Break for {:?}", method),
+                ControlFlow::Continue => panic!("Expected Break for {:?}", method),
             }
         }
     }
@@ -11748,7 +11754,7 @@ mod request_inspection_tests {
 
     #[test]
     fn try_pretty_json_valid_array() {
-        let result = try_pretty_json(r#"[1,2,3]"#);
+        let result = try_pretty_json(r"[1,2,3]");
         assert!(result.is_some());
         let pretty = result.unwrap();
         assert!(pretty.contains('\n'));

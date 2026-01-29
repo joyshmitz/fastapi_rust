@@ -40,6 +40,7 @@ use syn::{
 
 /// Parsed validation rules for a field.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct FieldValidators {
     /// Minimum length for strings/collections.
     length_min: Option<usize>,

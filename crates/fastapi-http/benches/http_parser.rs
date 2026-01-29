@@ -39,7 +39,8 @@ fn post_with_json_body() -> Vec<u8> {
 fn request_with_many_headers(count: usize) -> Vec<u8> {
     let mut req = String::from("GET /resource HTTP/1.1\r\nHost: example.com\r\n");
     for i in 0..count {
-        req.push_str(&format!("X-Custom-Header-{}: value-{}\r\n", i, i));
+        use std::fmt::Write;
+        write!(req, "X-Custom-Header-{i}: value-{i}\r\n").unwrap();
     }
     req.push_str("\r\n");
     req.into_bytes()
@@ -47,7 +48,7 @@ fn request_with_many_headers(count: usize) -> Vec<u8> {
 
 fn large_query_string(param_count: usize) -> String {
     (0..param_count)
-        .map(|i| format!("param{}=value{}", i, i))
+        .map(|i| format!("param{i}=value{i}"))
         .collect::<Vec<_>>()
         .join("&")
 }

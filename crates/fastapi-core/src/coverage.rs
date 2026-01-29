@@ -256,9 +256,7 @@ impl CoverageTracker {
         // Find endpoints that were hit but not registered
         for ((method, path), hits) in &inner.endpoint_hits {
             let key = (method.as_str().to_string(), path.clone());
-            if !endpoints.contains_key(&key) {
-                endpoints.insert(key, hits.clone());
-            }
+            endpoints.entry(key).or_insert_with(|| hits.clone());
         }
 
         let branches = inner.branches.clone();
@@ -295,6 +293,7 @@ pub struct CoverageReport {
 impl CoverageReport {
     /// Calculate endpoint coverage percentage.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn endpoint_coverage(&self) -> f64 {
         if self.endpoints.is_empty() {
             return 1.0;
@@ -311,6 +310,7 @@ impl CoverageReport {
 
     /// Calculate branch coverage percentage.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn branch_coverage(&self) -> f64 {
         if self.branches.is_empty() {
             return 1.0;
@@ -448,6 +448,7 @@ impl CoverageReport {
 
     /// Generate HTML representation.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_html(&self) -> String {
         let coverage_pct = self.endpoint_coverage() * 100.0;
         let coverage_class = if coverage_pct >= 80.0 {
@@ -555,11 +556,11 @@ impl CoverageReport {
         }
 
         html.push_str(
-            r#"            </tbody>
+            r"            </tbody>
         </table>
     </div>
 </body>
-</html>"#,
+</html>",
         );
 
         html
@@ -831,6 +832,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_reset() {
         let tracker = CoverageTracker::new();
         tracker.register_endpoint(Method::Get, "/test");

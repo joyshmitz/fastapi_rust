@@ -180,7 +180,7 @@ impl Default for PasswordHasher {
 /// PBKDF2 using HMAC-SHA256 per RFC 2898.
 fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(dk_len);
-    let blocks_needed = (dk_len + 31) / 32;
+    let blocks_needed = dk_len.div_ceil(32);
 
     for block_index in 1..=blocks_needed as u32 {
         let mut u = hmac_sha256(password, &[salt, &block_index.to_be_bytes()].concat());
@@ -222,6 +222,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 /// SHA-256 (pure Rust, no deps).
+#[allow(clippy::many_single_char_names)]
 fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -356,7 +357,7 @@ fn fallback_salt(len: usize) -> Vec<u8> {
 
     // Generate enough entropy by hashing diverse inputs through SHA-256
     let mut entropy = Vec::with_capacity(len + 64);
-    for i in 0u64..(len as u64 / 32 + 1) {
+    for i in 0u64..=len as u64 / 32 {
         let mut hasher = DefaultHasher::new();
         time_seed.hash(&mut hasher);
         i.hash(&mut hasher);
@@ -386,11 +387,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Simple base64 encode (standard alphabet, no padding).
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() * 4 + 2) / 3);
+    let mut result = String::with_capacity((data.len() * 4).div_ceil(3));
     for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 { u32::from(chunk[1]) } else { 0 };
+        let b2 = if chunk.len() > 2 { u32::from(chunk[2]) } else { 0 };
         let n = (b0 << 16) | (b1 << 8) | b2;
         result.push(CHARS[((n >> 18) & 63) as usize] as char);
         result.push(CHARS[((n >> 12) & 63) as usize] as char);
@@ -405,12 +406,13 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Simple base64 decode (standard alphabet, no padding).
+#[allow(clippy::unnecessary_wraps)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn char_val(c: u8) -> Option<u32> {
         match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a' + 26)),
+            b'0'..=b'9' => Some(u32::from(c - b'0' + 52)),
             b'+' => Some(62),
             b'/' => Some(63),
             _ => None,

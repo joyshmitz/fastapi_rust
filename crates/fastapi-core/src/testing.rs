@@ -2894,7 +2894,6 @@ mod tests {
             logger.log_message(LogLevel::Info, "step 2", 2);
             logger.log_message(LogLevel::Error, "something went wrong", 3);
             logger.log_message(LogLevel::Info, "step 3", 4);
-            ()
         });
 
         let context = capture.failure_context(3);
@@ -5602,7 +5601,7 @@ impl ResponseSnapshot {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 

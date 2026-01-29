@@ -1333,7 +1333,7 @@ fn test_phone_invalid_letters() {
 #[test]
 fn test_phone_invalid_empty() {
     let v = PhoneTest {
-        phone: "".to_string(),
+        phone: String::new(),
     };
     assert!(v.validate().is_err());
 }

@@ -437,6 +437,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn request_id_isolation_unique_per_context() {
         // Test that each RequestContext gets the request_id it was created with (bd-3st7)
         let cx1 = Cx::for_testing();
@@ -458,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn dependency_cache_isolation_per_request() {
         // Test that each RequestContext has its own dependency cache (bd-3st7)
         let cx1 = Cx::for_testing();
@@ -479,6 +481,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn cleanup_stack_isolation_per_request() {
         // Test that each RequestContext has its own cleanup stack (bd-3st7)
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -537,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn cx_cancellation_isolation_per_request() {
         // Test that cancelling one request's Cx doesn't affect others (bd-3st7)
         let cx1 = Cx::for_testing();
@@ -568,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn body_limit_isolation_per_request() {
         // Test that body limits are per-request (bd-3st7)
         let cx1 = Cx::for_testing();
@@ -631,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn resolution_stack_isolation_per_request() {
         // Test that resolution stacks are per-request for cycle detection (bd-3st7)
         use crate::dependency::DependencyScope;

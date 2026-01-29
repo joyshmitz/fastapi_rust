@@ -100,9 +100,8 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(req: &mut Request) -> Result<
         ));
     }
 
-    let body = match req.take_body() {
-        Body::Bytes(b) => b,
-        _ => return Err(json_error(StatusCode::BAD_REQUEST, "Missing request body")),
+    let Body::Bytes(body) = req.take_body() else {
+        return Err(json_error(StatusCode::BAD_REQUEST, "Missing request body"));
     };
     serde_json::from_slice(&body)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {e}")))
@@ -249,6 +248,7 @@ fn delete_user(_ctx: &RequestContext, req: &mut Request) -> std::future::Ready<R
 // Main
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // Initialize the global store
     *STORE.lock().unwrap() = Some(UserDb {

@@ -107,6 +107,7 @@ impl FaultInjector {
     /// Returns the first matching fault, or `None` if no fault fires.
     /// Uses deterministic hashing so the same request ID always produces
     /// the same result.
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn check(&self, request_id: u64) -> Option<&FaultType> {
         if !self.config.enabled {
             return None;
@@ -131,11 +132,11 @@ impl FaultInjector {
         // FNV-1a inspired mixing
         let mut h: u64 = 0xcbf29ce484222325;
         for byte in request_id.to_le_bytes() {
-            h ^= byte as u64;
+            h ^= u64::from(byte);
             h = h.wrapping_mul(0x100000001b3);
         }
         for byte in rule_index.to_le_bytes() {
-            h ^= byte as u64;
+            h ^= u64::from(byte);
             h = h.wrapping_mul(0x100000001b3);
         }
         h
@@ -147,6 +148,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn fault_config_builder() {
         let config = FaultConfig::new()
             .add(FaultType::Delay { ms: 100 }, 0.5)
@@ -217,6 +219,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn fault_config_rate_clamped() {
         let config = FaultConfig::new().add(FaultType::Timeout, 2.0);
         assert_eq!(config.rules[0].rate, 1.0);

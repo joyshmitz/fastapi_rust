@@ -588,6 +588,7 @@ mod schema_example_tests {
 
     #[derive(JsonSchema)]
     #[schema(example = r#"{"name": "Alice", "age": 30}"#)]
+    #[allow(dead_code)]
     struct UserWithExample {
         name: String,
         age: u32,
@@ -602,6 +603,7 @@ mod schema_example_tests {
     }
 
     #[derive(JsonSchema)]
+    #[allow(dead_code)]
     struct NoExampleStruct {
         id: i64,
     }

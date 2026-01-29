@@ -61,7 +61,7 @@ impl ApiVersion {
                 if let Some(num_str) = segment.strip_prefix('v').or_else(|| segment.strip_prefix('V'))
                 {
                     // Take only digits before any '+' suffix
-                    let digits: String = num_str.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let digits: String = num_str.chars().take_while(char::is_ascii_digit).collect();
                     if let Ok(n) = digits.parse::<u32>() {
                         return Some(ApiVersion(n));
                     }

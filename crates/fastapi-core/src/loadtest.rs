@@ -100,6 +100,7 @@ pub struct LoadTestReport {
 impl LoadTestReport {
     /// Success rate as a fraction [0.0, 1.0].
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn success_rate(&self) -> f64 {
         if self.total == 0 {
             return 0.0;
@@ -115,6 +116,7 @@ impl LoadTestReport {
 
     /// Requests per second throughput.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn rps(&self) -> f64 {
         if self.elapsed.is_zero() {
             return 0.0;
@@ -128,6 +130,7 @@ impl LoadTestReport {
         if self.latencies.is_empty() {
             return None;
         }
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let idx = ((p * self.latencies.len() as f64) as usize).min(self.latencies.len() - 1);
         Some(self.latencies[idx])
     }
@@ -302,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn empty_report() {
         let config = LoadTestConfig::new().total_requests(0).concurrency(1);
         let report = LoadTest::run(&config, |_| Ok(()));
