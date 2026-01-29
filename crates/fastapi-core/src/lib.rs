@@ -63,9 +63,11 @@ pub mod error;
 mod extract;
 pub mod fixtures;
 pub mod health;
+pub mod loadtest;
 pub mod logging;
 pub mod middleware;
 pub mod ndjson;
+pub mod password;
 mod request;
 mod response;
 pub mod routing;
@@ -177,6 +179,12 @@ pub use fixtures::{
     AuthFactory, CommonFixtures, JsonArrayFactory, JsonFactory, JsonObjectFactory, JwtFactory,
     RequestFactory, ResponseFactory, UserFactory,
 };
+
+// Re-export load testing utilities
+pub use loadtest::{LoadTest, LoadTestConfig, LoadTestReport};
+
+// Re-export password hashing utilities
+pub use password::{Algorithm, HashConfig, PasswordHasher};
 
 // Re-export logging utilities
 pub use logging::{AutoSpan, LogConfig, LogEntry, LogLevel, Span};
