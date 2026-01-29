@@ -726,6 +726,9 @@ impl UrlRegistry {
             path.push_str(&self.root_path);
         }
 
+        // Track whether we have any segments
+        let has_segments = !pattern.segments.is_empty();
+
         for segment in &pattern.segments {
             path.push('/');
             match segment {
@@ -759,8 +762,9 @@ impl UrlRegistry {
             }
         }
 
-        // Handle empty path (root route)
-        if path.is_empty() {
+        // Handle empty path (root route) - must have at least "/"
+        // If no segments but has root_path, still need trailing "/"
+        if path.is_empty() || (!has_segments && !self.root_path.is_empty()) {
             path.push('/');
         }
 

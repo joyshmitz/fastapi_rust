@@ -67,6 +67,7 @@ mod response;
 pub mod routing;
 pub mod shutdown;
 pub mod sse;
+pub mod static_files;
 pub mod testing;
 
 pub use context::{
@@ -122,6 +123,7 @@ pub use response::{
     ValidatedResponse, exclude_fields, include_fields, mime_type_for_extension,
 };
 pub use sse::{SseConfig, SseEvent, SseResponse, SseStream, sse_response};
+pub use static_files::{StaticFiles, StaticFilesConfig};
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
