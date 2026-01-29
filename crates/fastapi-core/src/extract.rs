@@ -5448,8 +5448,8 @@ mod state_tests {
     #[test]
     fn atomic_counter_fetch_add_concurrent() {
         // Test concurrent fetch_add operations don't lose increments (bd-2u8l)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         const NUM_THREADS: usize = 100;
@@ -5488,8 +5488,8 @@ mod state_tests {
     #[test]
     fn atomic_compare_and_swap_concurrent() {
         // Test compare-and-swap (CAS) patterns under concurrency (bd-2u8l)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         const NUM_THREADS: usize = 50;
@@ -5546,8 +5546,8 @@ mod state_tests {
     #[test]
     fn atomic_state_concurrent_reads() {
         // Test concurrent reads don't corrupt state (bd-2u8l)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         const NUM_READERS: usize = 100;
@@ -5581,8 +5581,8 @@ mod state_tests {
     #[test]
     fn atomic_rate_limiter_pattern() {
         // Test a rate-limiter pattern using atomics (bd-2u8l)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         const MAX_REQUESTS: usize = 100;
@@ -5673,8 +5673,8 @@ mod state_tests {
     #[test]
     fn atomic_concurrent_queue_pattern() {
         // Test a lock-free queue pattern using atomics (bd-2u8l)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         const NUM_PRODUCERS: usize = 10;

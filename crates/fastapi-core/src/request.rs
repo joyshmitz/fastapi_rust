@@ -653,9 +653,19 @@ mod tests {
         }
 
         assert_eq!(total_received, TARGET_SIZE, "Should receive all 10MB");
-        assert_eq!(chunk_count, num_chunks, "Should have correct number of chunks");
-        assert!(body_stream.is_complete(), "Stream should be marked complete");
-        assert_eq!(body_stream.bytes_received(), TARGET_SIZE, "bytes_received should match");
+        assert_eq!(
+            chunk_count, num_chunks,
+            "Should have correct number of chunks"
+        );
+        assert!(
+            body_stream.is_complete(),
+            "Stream should be marked complete"
+        );
+        assert_eq!(
+            body_stream.bytes_received(),
+            TARGET_SIZE,
+            "bytes_received should match"
+        );
     }
 
     #[test]
@@ -667,9 +677,8 @@ mod tests {
         const MAX_MEMORY: usize = 1024 * 1024; // 1MB max
 
         let num_chunks = TARGET_SIZE / CHUNK_SIZE;
-        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = (0..num_chunks)
-            .map(|_| Ok(vec![0u8; CHUNK_SIZE]))
-            .collect();
+        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> =
+            (0..num_chunks).map(|_| Ok(vec![0u8; CHUNK_SIZE])).collect();
 
         let stream = asupersync::stream::iter(chunks);
         let mut body_stream = RequestBodyStream::new(stream);
@@ -734,10 +743,8 @@ mod tests {
     #[test]
     fn stream_error_timeout() {
         // Test RequestBodyStreamError::Timeout (bd-isux)
-        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = vec![
-            Ok(vec![1, 2]),
-            Err(RequestBodyStreamError::Timeout),
-        ];
+        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> =
+            vec![Ok(vec![1, 2]), Err(RequestBodyStreamError::Timeout)];
 
         let stream = asupersync::stream::iter(chunks);
         let mut body_stream = RequestBodyStream::new(stream);
@@ -825,10 +832,8 @@ mod tests {
         // Test expected_size is correctly tracked (bd-isux)
         const EXPECTED: usize = 1024;
 
-        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = vec![
-            Ok(vec![0u8; 512]),
-            Ok(vec![0u8; 512]),
-        ];
+        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> =
+            vec![Ok(vec![0u8; 512]), Ok(vec![0u8; 512])];
 
         let stream = asupersync::stream::iter(chunks);
         let body_stream = RequestBodyStream::with_expected_size(stream, EXPECTED);
@@ -841,11 +846,8 @@ mod tests {
     #[test]
     fn stream_collect_accumulates_all_chunks() {
         // Test collect() method gathers all data (bd-isux)
-        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = vec![
-            Ok(vec![1, 2, 3]),
-            Ok(vec![4, 5]),
-            Ok(vec![6, 7, 8, 9]),
-        ];
+        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> =
+            vec![Ok(vec![1, 2, 3]), Ok(vec![4, 5]), Ok(vec![6, 7, 8, 9])];
 
         let stream = asupersync::stream::iter(chunks);
         let body_stream = RequestBodyStream::new(stream);
@@ -906,10 +908,8 @@ mod tests {
     #[test]
     fn body_into_bytes_async_handles_stream() {
         // Test Body::into_bytes_async() for streaming bodies (bd-isux)
-        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> = vec![
-            Ok(vec![1, 2]),
-            Ok(vec![3, 4]),
-        ];
+        let chunks: Vec<Result<Vec<u8>, RequestBodyStreamError>> =
+            vec![Ok(vec![1, 2]), Ok(vec![3, 4])];
         let stream = asupersync::stream::iter(chunks);
         let body = Body::streaming(stream);
 

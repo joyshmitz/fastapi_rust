@@ -592,38 +592,39 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
 
     // Generate response type verification (compile-time check that return matches declared)
     // This uses a marker trait to verify the handler's return type can produce the declared schema
-    let response_type_checks: Vec<proc_macro2::TokenStream> = if let Some(ref return_ty) = get_return_type(fn_output) {
-        attrs
-            .responses
-            .iter()
-            .filter(|r| r.status == 200) // Only check 200 responses against return type
-            .map(|resp| {
-                let check_fn_name = syn::Ident::new(
-                    &format!("__assert_response_type_{fn_name}"),
-                    Span::call_site(),
-                );
-                let resp_ty = &resp.type_path;
-                quote! {
-                    #[doc(hidden)]
-                    #[allow(dead_code)]
-                    const _: () = {
-                        // Verify the handler can produce the declared response type.
-                        // This checks that ReturnType: ResponseProduces<DeclaredType>
-                        fn #check_fn_name<R, T>()
-                        where
-                            R: fastapi_core::ResponseProduces<T>,
-                        {}
+    let response_type_checks: Vec<proc_macro2::TokenStream> =
+        if let Some(ref return_ty) = get_return_type(fn_output) {
+            attrs
+                .responses
+                .iter()
+                .filter(|r| r.status == 200) // Only check 200 responses against return type
+                .map(|resp| {
+                    let check_fn_name = syn::Ident::new(
+                        &format!("__assert_response_type_{fn_name}"),
+                        Span::call_site(),
+                    );
+                    let resp_ty = &resp.type_path;
+                    quote! {
+                        #[doc(hidden)]
+                        #[allow(dead_code)]
+                        const _: () = {
+                            // Verify the handler can produce the declared response type.
+                            // This checks that ReturnType: ResponseProduces<DeclaredType>
+                            fn #check_fn_name<R, T>()
+                            where
+                                R: fastapi_core::ResponseProduces<T>,
+                            {}
 
-                        fn __trigger_check() {
-                            #check_fn_name::<#return_ty, #resp_ty>();
-                        }
-                    };
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+                            fn __trigger_check() {
+                                #check_fn_name::<#return_ty, #resp_ty>();
+                            }
+                        };
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     // Generate response metadata builder calls
     let response_calls: Vec<proc_macro2::TokenStream> = attrs

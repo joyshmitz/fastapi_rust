@@ -45,7 +45,7 @@
 //! ```
 
 use crate::connection::should_keep_alive;
-use crate::expect::{ExpectHandler, ExpectResult, CONTINUE_RESPONSE};
+use crate::expect::{CONTINUE_RESPONSE, ExpectHandler, ExpectResult};
 use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -653,9 +653,8 @@ where
             ExpectResult::UnknownExpectation(value) => {
                 // Unknown expectation - return 417 Expectation Failed
                 ctx.trace(&format!("Rejecting unknown Expect value: {}", value));
-                let response = ExpectHandler::expectation_failed(format!(
-                    "Unsupported Expect value: {value}"
-                ));
+                let response =
+                    ExpectHandler::expectation_failed(format!("Unsupported Expect value: {value}"));
                 let response_write = response_writer.write(response);
                 write_response(&mut stream, response_write).await?;
                 return Ok(());

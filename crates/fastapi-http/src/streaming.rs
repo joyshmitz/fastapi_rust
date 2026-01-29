@@ -857,7 +857,11 @@ mod tests {
                 Poll::Ready(Some(chunk)) => {
                     // Verify chunk size (last chunk may be smaller)
                     if total_received + CHUNK_SIZE <= TARGET_SIZE {
-                        assert_eq!(chunk.len(), CHUNK_SIZE, "Non-final chunks should be {CHUNK_SIZE} bytes");
+                        assert_eq!(
+                            chunk.len(),
+                            CHUNK_SIZE,
+                            "Non-final chunks should be {CHUNK_SIZE} bytes"
+                        );
                     }
                     total_received += chunk.len();
                     chunk_count += 1;
@@ -869,7 +873,10 @@ mod tests {
 
         assert_eq!(total_received, TARGET_SIZE, "Should receive all 10MB");
         let expected_chunks = (TARGET_SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE; // Ceiling division
-        assert_eq!(chunk_count, expected_chunks, "Should have correct number of chunks");
+        assert_eq!(
+            chunk_count, expected_chunks,
+            "Should have correct number of chunks"
+        );
     }
 
     #[test]
@@ -889,7 +896,10 @@ mod tests {
 
         // First poll should detect cancellation and return None
         assert_eq!(Pin::new(&mut stream).poll_next(&mut ctx), Poll::Ready(None));
-        assert!(stream.is_cancelled(), "Stream should be marked as cancelled");
+        assert!(
+            stream.is_cancelled(),
+            "Stream should be marked as cancelled"
+        );
     }
 
     #[test]
@@ -941,7 +951,11 @@ mod tests {
         let data: Vec<u8> = vec![0u8; SIZE];
         let stream = ChunkedBytes::new(data, 1024);
 
-        assert_eq!(stream.total_size(), SIZE, "Total size should be known upfront");
+        assert_eq!(
+            stream.total_size(),
+            SIZE,
+            "Total size should be known upfront"
+        );
     }
 
     #[test]
@@ -959,7 +973,11 @@ mod tests {
         let stream = FileStream::open(&test_file, cx, config).unwrap();
 
         // At the start, remaining() equals file size
-        assert_eq!(stream.remaining(), FILE_SIZE as u64, "File size should be known via remaining()");
+        assert_eq!(
+            stream.remaining(),
+            FILE_SIZE as u64,
+            "File size should be known via remaining()"
+        );
 
         // Cleanup
         let _ = std::fs::remove_file(test_file);

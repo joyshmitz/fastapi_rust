@@ -5,12 +5,18 @@
 
 use fastapi_output::components::banner::{Banner, ServerInfo};
 use fastapi_output::components::dependency_tree::{DependencyNode, DependencyTreeDisplay};
-use fastapi_output::components::errors::{ErrorFormatter, HttpErrorInfo, LocItem, ValidationErrorDetail};
+use fastapi_output::components::errors::{
+    ErrorFormatter, HttpErrorInfo, LocItem, ValidationErrorDetail,
+};
 use fastapi_output::components::logging::{HttpMethod, LogEntry, RequestLogger, ResponseTiming};
 use fastapi_output::components::middleware_stack::{MiddlewareInfo, MiddlewareStackDisplay};
 use fastapi_output::components::routes::{RouteDisplay, RouteEntry};
-use fastapi_output::components::shutdown_progress::{ShutdownPhase, ShutdownProgress, ShutdownProgressDisplay};
-use fastapi_output::components::test_results::{TestCaseResult, TestModuleResult, TestReport, TestReportDisplay, TestStatus};
+use fastapi_output::components::shutdown_progress::{
+    ShutdownPhase, ShutdownProgress, ShutdownProgressDisplay,
+};
+use fastapi_output::components::test_results::{
+    TestCaseResult, TestModuleResult, TestReport, TestReportDisplay, TestStatus,
+};
 use fastapi_output::mode::OutputMode;
 use fastapi_output::testing::strip_ansi_codes;
 use insta::assert_snapshot;
@@ -38,13 +44,15 @@ fn snapshot_banner_plain() {
 fn snapshot_banner_rich_content() {
     eprintln!("[SNAPSHOT] Testing: Banner (rich mode, stripped)");
     let banner = Banner::new(OutputMode::Rich);
-    let info = ServerInfo::new("1.0.0", "localhost", 8000)
-        .docs_path("/docs");
+    let info = ServerInfo::new("1.0.0", "localhost", 8000).docs_path("/docs");
 
     let output = banner.render(&info);
     // Strip ANSI for readable snapshot
     let normalized = strip_ansi_codes(&output);
-    eprintln!("[SNAPSHOT] Output length: {} chars (stripped)", normalized.len());
+    eprintln!(
+        "[SNAPSHOT] Output length: {} chars (stripped)",
+        normalized.len()
+    );
     assert_snapshot!("banner_rich_content", normalized);
 }
 
@@ -289,10 +297,8 @@ fn snapshot_middleware_stack() {
 #[test]
 fn snapshot_dependency_tree() {
     eprintln!("[SNAPSHOT] Testing: Dependency tree");
-    let db_node = DependencyNode::new("DatabasePool")
-        .scope("singleton");
-    let cache_node = DependencyNode::new("RedisCache")
-        .scope("singleton");
+    let db_node = DependencyNode::new("DatabasePool").scope("singleton");
+    let cache_node = DependencyNode::new("RedisCache").scope("singleton");
     let service_node = DependencyNode::new("UserService")
         .scope("request")
         .child(db_node)
@@ -313,8 +319,7 @@ fn snapshot_dependency_tree() {
 #[test]
 fn snapshot_shutdown_progress() {
     eprintln!("[SNAPSHOT] Testing: Shutdown progress");
-    let progress = ShutdownProgress::new(ShutdownPhase::GracePeriod)
-        .in_flight(5);
+    let progress = ShutdownProgress::new(ShutdownPhase::GracePeriod).in_flight(5);
     let display = ShutdownProgressDisplay::new(OutputMode::Plain);
 
     let output = display.render(&progress);
@@ -324,8 +329,7 @@ fn snapshot_shutdown_progress() {
 #[test]
 fn snapshot_shutdown_complete() {
     eprintln!("[SNAPSHOT] Testing: Shutdown complete");
-    let progress = ShutdownProgress::new(ShutdownPhase::Complete)
-        .in_flight(0);
+    let progress = ShutdownProgress::new(ShutdownPhase::Complete).in_flight(0);
     let display = ShutdownProgressDisplay::new(OutputMode::Plain);
 
     let output = display.render(&progress);
@@ -339,13 +343,12 @@ fn snapshot_shutdown_complete() {
 #[test]
 fn snapshot_test_results_passing() {
     eprintln!("[SNAPSHOT] Testing: Test results (all passing)");
-    let report = TestReport::new(vec![])
-        .module(
-            TestModuleResult::new("api::users", vec![])
-                .case(TestCaseResult::new("test_create_user", TestStatus::Pass))
-                .case(TestCaseResult::new("test_get_user", TestStatus::Pass))
-                .case(TestCaseResult::new("test_list_users", TestStatus::Pass)),
-        );
+    let report = TestReport::new(vec![]).module(
+        TestModuleResult::new("api::users", vec![])
+            .case(TestCaseResult::new("test_create_user", TestStatus::Pass))
+            .case(TestCaseResult::new("test_get_user", TestStatus::Pass))
+            .case(TestCaseResult::new("test_list_users", TestStatus::Pass)),
+    );
     let display = TestReportDisplay::new(OutputMode::Plain);
 
     let output = display.render(&report);
@@ -355,16 +358,15 @@ fn snapshot_test_results_passing() {
 #[test]
 fn snapshot_test_results_mixed() {
     eprintln!("[SNAPSHOT] Testing: Test results (mixed)");
-    let report = TestReport::new(vec![])
-        .module(
-            TestModuleResult::new("api::users", vec![])
-                .case(TestCaseResult::new("test_create_user", TestStatus::Pass))
-                .case(
-                    TestCaseResult::new("test_validation", TestStatus::Fail)
-                        .details("assertion failed: expected 200, got 422"),
-                )
-                .case(TestCaseResult::new("test_auth", TestStatus::Skip)),
-        );
+    let report = TestReport::new(vec![]).module(
+        TestModuleResult::new("api::users", vec![])
+            .case(TestCaseResult::new("test_create_user", TestStatus::Pass))
+            .case(
+                TestCaseResult::new("test_validation", TestStatus::Fail)
+                    .details("assertion failed: expected 200, got 422"),
+            )
+            .case(TestCaseResult::new("test_auth", TestStatus::Skip)),
+    );
     let display = TestReportDisplay::new(OutputMode::Plain);
 
     let output = display.render(&report);

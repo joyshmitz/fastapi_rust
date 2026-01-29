@@ -65,6 +65,14 @@ struct FieldValidators {
     nested: bool,
     /// Multiple of (divisibility).
     multiple_of: Option<String>,
+    /// Phone number format validation.
+    phone: bool,
+    /// String must contain this substring.
+    contains: Option<String>,
+    /// String must start with this prefix.
+    starts_with: Option<String>,
+    /// String must end with this suffix.
+    ends_with: Option<String>,
 }
 
 impl FieldValidators {
@@ -81,6 +89,10 @@ impl FieldValidators {
             && self.custom.is_none()
             && !self.nested
             && self.multiple_of.is_none()
+            && !self.phone
+            && self.contains.is_none()
+            && self.starts_with.is_none()
+            && self.ends_with.is_none()
     }
 }
 
@@ -119,6 +131,8 @@ fn parse_validate_list(meta_list: &MetaList, validators: &mut FieldValidators) {
                         validators.url = true;
                     } else if path.is_ident("nested") {
                         validators.nested = true;
+                    } else if path.is_ident("phone") {
+                        validators.phone = true;
                     }
                 }
                 // Handle key = value like `regex = "pattern"`, `custom = fn_name`
@@ -168,6 +182,30 @@ fn parse_name_value(nv: &MetaNameValue, validators: &mut FieldValidators) {
         }
         Some("multiple_of") => {
             validators.multiple_of = Some(expr_to_string(&nv.value));
+        }
+        Some("contains") => {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &nv.value
+            {
+                validators.contains = Some(s.value());
+            }
+        }
+        Some("starts_with") => {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &nv.value
+            {
+                validators.starts_with = Some(s.value());
+            }
+        }
+        Some("ends_with") => {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &nv.value
+            {
+                validators.ends_with = Some(s.value());
+            }
         }
         _ => {}
     }
@@ -418,6 +456,89 @@ fn generate_field_validation(field: &Field, validators: &FieldValidators) -> Tok
                         .with_msg("value is not a valid URL")
                     );
                 }
+            }
+        });
+    }
+
+    // Phone validation
+    if validators.phone {
+        validations.push(quote! {
+            {
+                let phone = &self.#field_name;
+                // Basic phone validation: optional leading +, then digits/spaces/hyphens/parens
+                // At least 7 digits total
+                let digits: Vec<char> = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+                let has_valid_chars = phone.chars().all(|c| {
+                    c.is_ascii_digit() || c == '+' || c == '-' || c == ' '
+                        || c == '(' || c == ')' || c == '.'
+                });
+                let is_valid = has_valid_chars && digits.len() >= 7 && digits.len() <= 15;
+                if !is_valid {
+                    errors.push(
+                        fastapi_core::ValidationError::new(
+                            fastapi_core::error::error_types::VALUE_ERROR,
+                            vec![
+                                fastapi_core::error::LocItem::field("body"),
+                                fastapi_core::error::LocItem::field(#field_name_str),
+                            ],
+                        )
+                        .with_msg("value is not a valid phone number")
+                    );
+                }
+            }
+        });
+    }
+
+    // Contains validation
+    if let Some(ref substring) = validators.contains {
+        validations.push(quote! {
+            if !self.#field_name.contains(#substring) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::VALUE_ERROR,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("value must contain {:?}", #substring))
+                );
+            }
+        });
+    }
+
+    // Starts_with validation
+    if let Some(ref prefix) = validators.starts_with {
+        validations.push(quote! {
+            if !self.#field_name.starts_with(#prefix) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::VALUE_ERROR,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("value must start with {:?}", #prefix))
+                );
+            }
+        });
+    }
+
+    // Ends_with validation
+    if let Some(ref suffix) = validators.ends_with {
+        validations.push(quote! {
+            if !self.#field_name.ends_with(#suffix) {
+                errors.push(
+                    fastapi_core::ValidationError::new(
+                        fastapi_core::error::error_types::VALUE_ERROR,
+                        vec![
+                            fastapi_core::error::LocItem::field("body"),
+                            fastapi_core::error::LocItem::field(#field_name_str),
+                        ],
+                    )
+                    .with_msg(format!("value must end with {:?}", #suffix))
+                );
             }
         });
     }

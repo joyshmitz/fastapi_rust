@@ -1279,3 +1279,132 @@ fn test_slug_both_length_and_pattern_fail() {
     let errors = result.unwrap_err();
     assert_eq!(errors.len(), 2, "Should have 2 errors");
 }
+
+// ============================================================================
+// Phone validation tests
+// ============================================================================
+
+#[derive(fastapi_macros::Validate)]
+struct PhoneTest {
+    #[validate(phone)]
+    phone: String,
+}
+
+#[test]
+fn test_phone_valid_us() {
+    let v = PhoneTest {
+        phone: "+1 (555) 123-4567".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_phone_valid_international() {
+    let v = PhoneTest {
+        phone: "+44 20 7946 0958".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_phone_valid_digits_only() {
+    let v = PhoneTest {
+        phone: "5551234567".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_phone_invalid_too_short() {
+    let v = PhoneTest {
+        phone: "12345".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_letters() {
+    let v = PhoneTest {
+        phone: "555-CALL-ME".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_empty() {
+    let v = PhoneTest {
+        phone: "".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+// ============================================================================
+// Contains / starts_with / ends_with validation tests
+// ============================================================================
+
+#[derive(fastapi_macros::Validate)]
+struct ContainsTest {
+    #[validate(contains = "@")]
+    value: String,
+}
+
+#[derive(fastapi_macros::Validate)]
+struct StartsWithTest {
+    #[validate(starts_with = "https://")]
+    url: String,
+}
+
+#[derive(fastapi_macros::Validate)]
+struct EndsWithTest {
+    #[validate(ends_with = ".com")]
+    domain: String,
+}
+
+#[test]
+fn test_contains_valid() {
+    let v = ContainsTest {
+        value: "user@example.com".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_contains_invalid() {
+    let v = ContainsTest {
+        value: "no-at-sign".to_string(),
+    };
+    let err = v.validate().unwrap_err();
+    assert_eq!(err.len(), 1);
+}
+
+#[test]
+fn test_starts_with_valid() {
+    let v = StartsWithTest {
+        url: "https://example.com".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_starts_with_invalid() {
+    let v = StartsWithTest {
+        url: "http://example.com".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_ends_with_valid() {
+    let v = EndsWithTest {
+        domain: "example.com".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_ends_with_invalid() {
+    let v = EndsWithTest {
+        domain: "example.org".to_string(),
+    };
+    assert!(v.validate().is_err());
+}

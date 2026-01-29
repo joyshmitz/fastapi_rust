@@ -393,9 +393,7 @@ impl ParamMeta {
     /// Returns `validation_alias` if set, otherwise `alias` if set, otherwise `None`.
     #[must_use]
     pub fn effective_validation_name(&self) -> Option<&str> {
-        self.validation_alias
-            .as_deref()
-            .or(self.alias.as_deref())
+        self.validation_alias.as_deref().or(self.alias.as_deref())
     }
 
     /// Get the effective name for OpenAPI/serialization.
@@ -833,9 +831,7 @@ mod param_meta_tests {
 
     #[test]
     fn effective_validation_name_uses_validation_alias_first() {
-        let meta = ParamMeta::new()
-            .alias("a")
-            .validation_alias("v");
+        let meta = ParamMeta::new().alias("a").validation_alias("v");
         assert_eq!(meta.effective_validation_name(), Some("v"));
     }
 
@@ -853,9 +849,7 @@ mod param_meta_tests {
 
     #[test]
     fn effective_serialization_name_uses_serialization_alias_first() {
-        let meta = ParamMeta::new()
-            .alias("a")
-            .serialization_alias("s");
+        let meta = ParamMeta::new().alias("a").serialization_alias("s");
         assert_eq!(meta.effective_serialization_name(), Some("s"));
     }
 
@@ -881,9 +875,7 @@ mod param_meta_tests {
 
     #[test]
     fn to_parameter_uses_serialization_alias_for_name() {
-        let meta = ParamMeta::new()
-            .alias("a")
-            .serialization_alias("search");
+        let meta = ParamMeta::new().alias("a").serialization_alias("search");
         let param = meta.to_parameter("query", ParameterLocation::Query, false, None);
         // Should use serialization_alias "search" (overrides alias)
         assert_eq!(param.name, "search");

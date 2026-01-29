@@ -371,14 +371,16 @@ mod tests {
 
     fn request_with_expect(value: &str) -> Request {
         let mut req = Request::new(Method::Post, "/upload");
-        req.headers_mut().insert("expect".to_string(), value.as_bytes().to_vec());
+        req.headers_mut()
+            .insert("expect".to_string(), value.as_bytes().to_vec());
         req
     }
 
     fn request_with_headers(headers: &[(&str, &str)]) -> Request {
         let mut req = Request::new(Method::Post, "/upload");
         for (name, value) in headers {
-            req.headers_mut().insert(name.to_string(), value.as_bytes().to_vec());
+            req.headers_mut()
+                .insert(name.to_string(), value.as_bytes().to_vec());
         }
         req
     }
@@ -386,22 +388,34 @@ mod tests {
     #[test]
     fn check_expect_none() {
         let req = Request::new(Method::Get, "/");
-        assert!(matches!(ExpectHandler::check_expect(&req), ExpectResult::NoExpectation));
+        assert!(matches!(
+            ExpectHandler::check_expect(&req),
+            ExpectResult::NoExpectation
+        ));
     }
 
     #[test]
     fn check_expect_100_continue() {
         let req = request_with_expect("100-continue");
-        assert!(matches!(ExpectHandler::check_expect(&req), ExpectResult::ExpectsContinue));
+        assert!(matches!(
+            ExpectHandler::check_expect(&req),
+            ExpectResult::ExpectsContinue
+        ));
     }
 
     #[test]
     fn check_expect_100_continue_case_insensitive() {
         let req = request_with_expect("100-Continue");
-        assert!(matches!(ExpectHandler::check_expect(&req), ExpectResult::ExpectsContinue));
+        assert!(matches!(
+            ExpectHandler::check_expect(&req),
+            ExpectResult::ExpectsContinue
+        ));
 
         let req = request_with_expect("100-CONTINUE");
-        assert!(matches!(ExpectHandler::check_expect(&req), ExpectResult::ExpectsContinue));
+        assert!(matches!(
+            ExpectHandler::check_expect(&req),
+            ExpectResult::ExpectsContinue
+        ));
     }
 
     #[test]
@@ -498,7 +512,7 @@ mod tests {
             .with_max_content_length(100)
             .with_required_content_type("application/json");
         let req = request_with_headers(&[
-            ("content-length", "1000"), // Exceeds limit
+            ("content-length", "1000"),     // Exceeds limit
             ("content-type", "text/plain"), // Wrong type
         ]);
         let result = handler.validate_all(&req);

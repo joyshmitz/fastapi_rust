@@ -516,12 +516,24 @@ mod tests {
         futures_executor::block_on(ctx1.cleanup_stack().run_cleanups());
 
         // Only ctx1's cleanup should have run
-        assert_eq!(cleanup_counter1.load(Ordering::SeqCst), 1, "ctx1 cleanup should have run");
-        assert_eq!(cleanup_counter2.load(Ordering::SeqCst), 0, "ctx2 cleanup should NOT have run");
+        assert_eq!(
+            cleanup_counter1.load(Ordering::SeqCst),
+            1,
+            "ctx1 cleanup should have run"
+        );
+        assert_eq!(
+            cleanup_counter2.load(Ordering::SeqCst),
+            0,
+            "ctx2 cleanup should NOT have run"
+        );
 
         // Now run ctx2's cleanups
         futures_executor::block_on(ctx2.cleanup_stack().run_cleanups());
-        assert_eq!(cleanup_counter2.load(Ordering::SeqCst), 1, "ctx2 cleanup should have run");
+        assert_eq!(
+            cleanup_counter2.load(Ordering::SeqCst),
+            1,
+            "ctx2 cleanup should have run"
+        );
     }
 
     #[test]
@@ -544,9 +556,15 @@ mod tests {
         ctx2.cx().set_cancel_requested(true);
 
         // Only ctx2 should be cancelled
-        assert!(ctx1.checkpoint().is_ok(), "ctx1 should still not be cancelled");
+        assert!(
+            ctx1.checkpoint().is_ok(),
+            "ctx1 should still not be cancelled"
+        );
         assert!(ctx2.checkpoint().is_err(), "ctx2 should be cancelled");
-        assert!(ctx3.checkpoint().is_ok(), "ctx3 should still not be cancelled");
+        assert!(
+            ctx3.checkpoint().is_ok(),
+            "ctx3 should still not be cancelled"
+        );
     }
 
     #[test]
@@ -624,7 +642,8 @@ mod tests {
         let ctx2 = RequestContext::new(cx2, 2);
 
         // Push i32 onto ctx1's resolution stack
-        ctx1.resolution_stack().push::<i32>("i32", DependencyScope::Request);
+        ctx1.resolution_stack()
+            .push::<i32>("i32", DependencyScope::Request);
 
         // ctx1 should detect the cycle when pushing i32 again
         let cycle1 = ctx1.resolution_stack().check_cycle::<i32>("i32");
@@ -632,10 +651,14 @@ mod tests {
 
         // ctx2's resolution stack should be independent - no cycle
         let cycle2 = ctx2.resolution_stack().check_cycle::<i32>("i32");
-        assert!(cycle2.is_none(), "ctx2 should NOT see ctx1's resolution stack");
+        assert!(
+            cycle2.is_none(),
+            "ctx2 should NOT see ctx1's resolution stack"
+        );
 
         // ctx2 can push i32 independently
-        ctx2.resolution_stack().push::<i32>("i32", DependencyScope::Request);
+        ctx2.resolution_stack()
+            .push::<i32>("i32", DependencyScope::Request);
         assert_eq!(ctx2.resolution_stack().depth(), 1);
 
         // Both stacks are independent
