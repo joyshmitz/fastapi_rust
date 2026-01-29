@@ -319,6 +319,8 @@ pub struct OpenApiDisplayConfig {
     pub group_by_tags: bool,
     /// Maximum endpoints to show (0 = unlimited).
     pub max_endpoints: usize,
+    /// Maximum depth for nested schema rendering (default: 5).
+    pub max_schema_depth: usize,
 }
 
 impl Default for OpenApiDisplayConfig {
@@ -329,6 +331,7 @@ impl Default for OpenApiDisplayConfig {
             show_deprecated: true,
             group_by_tags: false,
             max_endpoints: 0,
+            max_schema_depth: 5,
         }
     }
 }
@@ -756,10 +759,15 @@ impl OpenApiDisplay {
         &self,
         schema: &SchemaType,
         title: Option<&str>,
-        indent: usize,
+        depth: usize,
     ) -> String {
         let mut lines = Vec::new();
-        let prefix = " ".repeat(indent);
+        let prefix = " ".repeat(depth * 2);
+
+        // Check max depth
+        if depth > self.config.max_schema_depth {
+            return format!("{prefix}... (max depth exceeded)");
+        }
 
         if let Some(t) = title {
             lines.push(format!("{prefix}{t}:"));
@@ -782,12 +790,20 @@ impl OpenApiDisplay {
                         "{prefix}  \"{}\": {type_desc}{required_marker}",
                         prop.name
                     ));
+
+                    // Recursively render nested objects/arrays
+                    match &prop.schema {
+                        SchemaType::Object { .. } | SchemaType::Array { .. } => {
+                            lines.push(self.render_schema_plain(&prop.schema, None, depth + 2));
+                        }
+                        _ => {}
+                    }
                 }
                 lines.push(format!("{prefix}}}"));
             }
             SchemaType::Array { items } => {
                 lines.push(format!("{prefix}["));
-                lines.push(self.render_schema_plain(items, None, indent + 2));
+                lines.push(self.render_schema_plain(items, None, depth + 1));
                 lines.push(format!("{prefix}]"));
             }
             SchemaType::String { enum_values, .. } if !enum_values.is_empty() => {
@@ -805,14 +821,19 @@ impl OpenApiDisplay {
         &self,
         schema: &SchemaType,
         title: Option<&str>,
-        indent: usize,
+        depth: usize,
     ) -> String {
         let muted = self.theme.muted.to_ansi_fg();
         let accent = self.theme.accent.to_ansi_fg();
         let info = self.theme.info.to_ansi_fg();
 
         let mut lines = Vec::new();
-        let prefix = " ".repeat(indent);
+        let prefix = " ".repeat(depth * 2);
+
+        // Check max depth
+        if depth > self.config.max_schema_depth {
+            return format!("{prefix}{muted}... (max depth){ANSI_RESET}");
+        }
 
         if let Some(t) = title {
             lines.push(format!("{prefix}{accent}{t}:{ANSI_RESET}"));
@@ -840,7 +861,7 @@ impl OpenApiDisplay {
             }
             SchemaType::Array { items } => {
                 lines.push(format!("{prefix}{muted}[{ANSI_RESET}"));
-                lines.push(self.render_schema_minimal(items, None, indent + 2));
+                lines.push(self.render_schema_minimal(items, None, depth + 1));
                 lines.push(format!("{prefix}{muted}]{ANSI_RESET}"));
             }
             _ => {
@@ -1214,5 +1235,102 @@ mod tests {
         let other_group = groups.iter().find(|(tag, _)| tag == "Other");
         assert!(other_group.is_some());
         assert_eq!(other_group.unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn test_schema_depth_limiting() {
+        // Create a deeply nested schema
+        let deep_schema = SchemaType::Object {
+            properties: vec![PropertyInfo::new(
+                "level1",
+                SchemaType::Object {
+                    properties: vec![PropertyInfo::new(
+                        "level2",
+                        SchemaType::Object {
+                            properties: vec![PropertyInfo::new(
+                                "level3",
+                                SchemaType::Object {
+                                    properties: vec![PropertyInfo::new(
+                                        "level4",
+                                        SchemaType::Object {
+                                            properties: vec![PropertyInfo::new(
+                                                "level5",
+                                                SchemaType::Object {
+                                                    properties: vec![PropertyInfo::new(
+                                                        "level6",
+                                                        SchemaType::String {
+                                                            format: None,
+                                                            enum_values: vec![],
+                                                        },
+                                                    )],
+                                                    required: vec![],
+                                                },
+                                            )],
+                                            required: vec![],
+                                        },
+                                    )],
+                                    required: vec![],
+                                },
+                            )],
+                            required: vec![],
+                        },
+                    )],
+                    required: vec![],
+                },
+            )],
+            required: vec![],
+        };
+
+        // With low max depth
+        let config = OpenApiDisplayConfig {
+            max_schema_depth: 2,
+            ..Default::default()
+        };
+        let display = OpenApiDisplay::with_config(OutputMode::Plain, config);
+        let output = display.render_schema(&deep_schema, Some("DeepSchema"));
+
+        assert!(
+            output.contains("max depth"),
+            "Should show max depth message for deep nesting"
+        );
+    }
+
+    #[test]
+    fn test_nested_schema_rendering() {
+        let schema = SchemaType::Object {
+            properties: vec![
+                PropertyInfo::new(
+                    "id",
+                    SchemaType::Integer {
+                        format: Some("int64".to_string()),
+                        minimum: None,
+                        maximum: None,
+                    },
+                ),
+                PropertyInfo::new(
+                    "items",
+                    SchemaType::Array {
+                        items: Box::new(SchemaType::Object {
+                            properties: vec![PropertyInfo::new(
+                                "name",
+                                SchemaType::String {
+                                    format: None,
+                                    enum_values: vec![],
+                                },
+                            )],
+                            required: vec!["name".to_string()],
+                        }),
+                    },
+                ),
+            ],
+            required: vec!["id".to_string()],
+        };
+
+        let display = OpenApiDisplay::new(OutputMode::Plain);
+        let output = display.render_schema(&schema, Some("Order"));
+
+        assert!(output.contains("id"), "Should contain id field");
+        assert!(output.contains("items"), "Should contain items array");
+        assert!(output.contains("array"), "Should show array type");
     }
 }
