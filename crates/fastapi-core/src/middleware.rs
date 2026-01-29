@@ -4110,8 +4110,10 @@ impl Middleware for ETagMiddleware {
 
                         if matches {
                             // Return 304 Not Modified with ETag header
-                            return Response::with_status(crate::response::StatusCode::NOT_MODIFIED)
-                                .header("etag", etag_value.as_bytes().to_vec());
+                            return Response::with_status(
+                                crate::response::StatusCode::NOT_MODIFIED,
+                            )
+                            .header("etag", etag_value.as_bytes().to_vec());
                         }
                     }
                 }
@@ -4456,10 +4458,7 @@ impl Default for CacheControlConfig {
             vary: Vec::new(),
             set_expires: false,
             preserve_existing: true,
-            methods: vec![
-                crate::request::Method::Get,
-                crate::request::Method::Head,
-            ],
+            methods: vec![crate::request::Method::Get, crate::request::Method::Head],
             path_patterns: Vec::new(),
             cacheable_statuses: (200..300).collect(),
         }
@@ -4669,7 +4668,8 @@ impl CacheControlMiddleware {
                 if let Ok(seconds) = directive[8..].parse::<u64>() {
                     // Calculate expiration time
                     let now = std::time::SystemTime::now();
-                    if let Some(expires) = now.checked_add(std::time::Duration::from_secs(seconds)) {
+                    if let Some(expires) = now.checked_add(std::time::Duration::from_secs(seconds))
+                    {
                         return Some(format_http_date(expires));
                     }
                 }
@@ -4955,7 +4955,10 @@ mod cache_control_tests {
         let cc_header = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"));
-        assert!(cc_header.is_some(), "Cache-Control header should be present");
+        assert!(
+            cc_header.is_some(),
+            "Cache-Control header should be present"
+        );
         let (_, value) = cc_header.unwrap();
         let value_str = String::from_utf8_lossy(value);
         assert!(value_str.contains("public"));
@@ -5024,8 +5027,8 @@ mod cache_control_tests {
             CacheControlConfig::from_preset(CachePreset::PublicOneHour).preserve_existing(true),
         );
         let req = Request::new(Method::Get, "/api/test");
-        let resp = Response::with_status(StatusCode::OK)
-            .header("Cache-Control", b"max-age=60".to_vec());
+        let resp =
+            Response::with_status(StatusCode::OK).header("Cache-Control", b"max-age=60".to_vec());
 
         let result = run_after(&mw, &req, resp);
         let headers = result.headers();

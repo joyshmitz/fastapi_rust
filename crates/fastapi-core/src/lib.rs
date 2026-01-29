@@ -117,8 +117,8 @@ pub use request::{
 };
 pub use response::{
     Binary, BinaryWithType, BodyStream, FileResponse, Html, IntoResponse, NoContent, Redirect,
-    Response, ResponseBody, ResponseModel, ResponseModelConfig, ResponseProduces, StatusCode,
-    Text, ValidatedResponse, exclude_fields, include_fields, mime_type_for_extension,
+    Response, ResponseBody, ResponseModel, ResponseModelConfig, ResponseProduces, StatusCode, Text,
+    ValidatedResponse, exclude_fields, include_fields, mime_type_for_extension,
 };
 
 // Re-export key asupersync types for convenience

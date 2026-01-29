@@ -172,15 +172,15 @@ pub fn swagger_ui_html(config: &DocsConfig, openapi_url: &str) -> String {
         |url| format!(r#"<link rel="icon" href="{}" />"#, html_escape(url)),
     );
 
-    let ui_parameters = config.swagger_ui_parameters.as_ref().map_or_else(
-        || "{}".to_string(),
-        String::clone,
-    );
+    let ui_parameters = config
+        .swagger_ui_parameters
+        .as_ref()
+        .map_or_else(|| "{}".to_string(), String::clone);
 
-    let init_oauth = config.swagger_ui_init_oauth.as_ref().map_or_else(
-        String::new,
-        |o| format!("ui.initOAuth({});", o),
-    );
+    let init_oauth = config
+        .swagger_ui_init_oauth
+        .as_ref()
+        .map_or_else(String::new, |o| format!("ui.initOAuth({});", o));
 
     format!(
         r#"<!DOCTYPE html>
@@ -237,10 +237,9 @@ pub fn redoc_html(config: &DocsConfig, openapi_url: &str) -> String {
     let title = html_escape(&config.title);
     let redoc_cdn = &config.redoc_cdn_url;
 
-    let favicon = config.favicon_url.as_ref().map_or_else(
-        String::new,
-        |url| format!(r#"<link rel="icon" href="{}" />"#, html_escape(url)),
-    );
+    let favicon = config.favicon_url.as_ref().map_or_else(String::new, |url| {
+        format!(r#"<link rel="icon" href="{}" />"#, html_escape(url))
+    });
 
     format!(
         r#"<!DOCTYPE html>
@@ -379,7 +378,9 @@ pub fn redoc_response(config: &DocsConfig, openapi_url: &str) -> Response {
 pub fn oauth2_redirect_response() -> Response {
     Response::ok()
         .header("content-type", b"text/html; charset=utf-8".to_vec())
-        .body(ResponseBody::Bytes(oauth2_redirect_html().as_bytes().to_vec()))
+        .body(ResponseBody::Bytes(
+            oauth2_redirect_html().as_bytes().to_vec(),
+        ))
 }
 
 /// Simple HTML escaping for attribute values.
@@ -458,8 +459,7 @@ mod tests {
 
     #[test]
     fn test_swagger_ui_with_custom_params() {
-        let config = DocsConfig::new()
-            .swagger_ui_parameters(r#"{"filter": true}"#);
+        let config = DocsConfig::new().swagger_ui_parameters(r#"{"filter": true}"#);
         let html = swagger_ui_html(&config, "/openapi.json");
 
         assert!(html.contains(r#"{"filter": true}"#));
@@ -467,8 +467,7 @@ mod tests {
 
     #[test]
     fn test_swagger_ui_with_oauth() {
-        let config = DocsConfig::new()
-            .swagger_ui_init_oauth(r#"{"clientId": "my-app"}"#);
+        let config = DocsConfig::new().swagger_ui_init_oauth(r#"{"clientId": "my-app"}"#);
         let html = swagger_ui_html(&config, "/openapi.json");
 
         assert!(html.contains(r#"ui.initOAuth({"clientId": "my-app"});"#));

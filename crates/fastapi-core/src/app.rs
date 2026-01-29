@@ -2799,10 +2799,7 @@ mod tests {
     #[test]
     fn head_request_preserves_content_type() {
         // Handler that sets Content-Type
-        fn json_handler(
-            _ctx: &RequestContext,
-            _req: &mut Request,
-        ) -> std::future::Ready<Response> {
+        fn json_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Ready<Response> {
             std::future::ready(
                 Response::ok()
                     .header("content-type", b"application/json".to_vec())

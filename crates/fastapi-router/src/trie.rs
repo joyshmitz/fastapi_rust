@@ -402,7 +402,11 @@ pub struct RouteResponse {
 impl RouteResponse {
     /// Create a new response declaration.
     #[must_use]
-    pub fn new(status: u16, schema_name: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        status: u16,
+        schema_name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             status,
             schema_name: schema_name.into(),
@@ -858,7 +862,8 @@ impl Route {
         schema_name: impl Into<String>,
         description: impl Into<String>,
     ) -> Self {
-        self.responses.push(RouteResponse::new(status, schema_name, description));
+        self.responses
+            .push(RouteResponse::new(status, schema_name, description));
         self
     }
 
@@ -3307,10 +3312,10 @@ mod tests {
         // Various percent-encoded characters
         let test_cases = vec![
             ("/search/hello%20world", ("query", "hello%20world")),
-            ("/search/foo%26bar", ("query", "foo%26bar")),         // &
-            ("/search/a%3Db", ("query", "a%3Db")),                 // =
-            ("/search/%23hash", ("query", "%23hash")),             // #
-            ("/search/100%25", ("query", "100%25")),               // %
+            ("/search/foo%26bar", ("query", "foo%26bar")), // &
+            ("/search/a%3Db", ("query", "a%3Db")),         // =
+            ("/search/%23hash", ("query", "%23hash")),     // #
+            ("/search/100%25", ("query", "100%25")),       // %
         ];
 
         for (path, expected) in test_cases {
@@ -3441,13 +3446,7 @@ mod tests {
         router.add(route(Method::Get, "/a/b/c")).unwrap();
 
         // Various empty segment patterns that should normalize to /a/b/c
-        let paths = vec![
-            "/a//b/c",
-            "/a/b//c",
-            "//a/b/c",
-            "/a/b/c//",
-            "//a//b//c//",
-        ];
+        let paths = vec!["/a//b/c", "/a/b//c", "//a/b/c", "/a/b/c//", "//a//b//c//"];
 
         for path in paths {
             let m = router.match_path(path, Method::Get);
@@ -3466,9 +3465,8 @@ mod tests {
         // After filtering empty segments: /a/1/b/2
         // But /a/1/b/2 doesn't match /a/{x}/b/{y} because structure differs
         // This test documents actual behavior
-        if m.is_some() {
-            let m = m.unwrap();
-            assert!(m.params.len() >= 1);
+        if let Some(m) = m {
+            assert!(!m.params.is_empty());
         }
     }
 
@@ -3506,7 +3504,13 @@ mod tests {
         let mut router = Router::new();
 
         // Create a 50-level deep path
-        let path = format!("/{}", (0..50).map(|i| format!("l{}", i)).collect::<Vec<_>>().join("/"));
+        let path = format!(
+            "/{}",
+            (0..50)
+                .map(|i| format!("l{}", i))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
         router.add(route(Method::Get, &path)).unwrap();
 
         // Should match exactly
@@ -3520,7 +3524,13 @@ mod tests {
         let mut router = Router::new();
 
         // Create a 100-level deep path
-        let path = format!("/{}", (0..100).map(|i| format!("d{}", i)).collect::<Vec<_>>().join("/"));
+        let path = format!(
+            "/{}",
+            (0..100)
+                .map(|i| format!("d{}", i))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
         router.add(route(Method::Get, &path)).unwrap();
 
         let m = router.match_path(&path, Method::Get);
@@ -3750,7 +3760,9 @@ mod tests {
     fn unicode_mixed_scripts() {
         let mut router = Router::new();
         // Mixed: Latin + CJK + Cyrillic
-        router.add(route(Method::Get, "/mix/hello世界Привет")).unwrap();
+        router
+            .add(route(Method::Get, "/mix/hello世界Привет"))
+            .unwrap();
 
         let m = router.match_path("/mix/hello世界Привет", Method::Get);
         assert!(m.is_some());

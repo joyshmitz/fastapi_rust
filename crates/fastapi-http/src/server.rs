@@ -553,29 +553,33 @@ impl From<ParseError> for ServerError {
     }
 }
 
-/// Handles a single connection (standalone function for concurrent spawning).
+/// Processes a connection with the given handler.
 ///
-/// This function can be called from a spawned task without requiring a reference
-/// to the TcpServer instance. Used for concurrent connection handling.
-async fn handle_connection_inner<H, Fut>(
-    initial_request_id: u64,
+/// This is the unified connection handling logic used by all server modes.
+async fn process_connection<H, Fut>(
+    cx: &Cx,
+    request_counter: &AtomicU64,
     mut stream: TcpStream,
     _peer_addr: SocketAddr,
     config: &ServerConfig,
-    handler: &H,
+    handler: H,
 ) -> Result<(), ServerError>
 where
-    H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync,
-    Fut: Future<Output = Response> + Send,
+    H: Fn(RequestContext, &mut Request) -> Fut,
+    Fut: Future<Output = Response>,
 {
     let mut parser = StatefulParser::new().with_limits(config.parse_limits.clone());
     let mut read_buffer = vec![0u8; config.read_buffer_size];
     let mut response_writer = ResponseWriter::new();
     let mut requests_on_connection: usize = 0;
     let max_requests = config.max_requests_per_connection;
-    let mut request_counter = initial_request_id;
 
     loop {
+        // Check for cancellation
+        if cx.is_cancel_requested() {
+            return Ok(());
+        }
+
         // Try to parse a complete request from buffered data first
         let parse_result = parser.feed(&[])?;
 
@@ -592,6 +596,10 @@ where
                         Ok(0) => return Ok(()),
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            cx.trace(&format!(
+                                "Keep-alive timeout ({:?}) - closing idle connection",
+                                keep_alive_timeout
+                            ));
                             return Err(ServerError::KeepAliveTimeout);
                         }
                         Err(e) => return Err(ServerError::Io(e)),
@@ -612,10 +620,10 @@ where
         requests_on_connection += 1;
 
         // Generate unique request ID for this request with timeout budget
-        request_counter += 1;
+        let request_id = request_counter.fetch_add(1, Ordering::Relaxed);
         let request_budget = Budget::new().with_deadline(config.request_timeout);
         let request_cx = Cx::for_testing_with_budget(request_budget);
-        let ctx = RequestContext::new(request_cx, request_counter);
+        let ctx = RequestContext::new(request_cx, request_id);
 
         // Validate Host header
         if let Err(err) = validate_host_header(&request, config) {
@@ -673,7 +681,7 @@ where
 #[derive(Debug)]
 pub struct TcpServer {
     config: ServerConfig,
-    request_counter: AtomicU64,
+    request_counter: Arc<AtomicU64>,
     /// Current number of active connections (wrapped in Arc for concurrent feature).
     connection_counter: Arc<AtomicU64>,
     /// Whether the server is draining (shutting down gracefully).
@@ -690,7 +698,7 @@ impl TcpServer {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
-            request_counter: AtomicU64::new(0),
+            request_counter: Arc::new(AtomicU64::new(0)),
             connection_counter: Arc::new(AtomicU64::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
             connection_handles: Mutex::new(Vec::new()),
@@ -1318,12 +1326,19 @@ impl TcpServer {
         Fut: Future<Output = Response> + Send + 'static,
     {
         let config = self.config.clone();
-        let request_id = self.next_request_id();
+        let request_counter = Arc::clone(&self.request_counter);
         let connection_counter = Arc::clone(&self.connection_counter);
 
-        scope.spawn_registered(state, cx, move |_task_cx| async move {
-            let result =
-                handle_connection_inner(request_id, stream, peer_addr, &config, &*handler).await;
+        scope.spawn_registered(state, cx, move |task_cx| async move {
+            let result = process_connection(
+                &task_cx,
+                &request_counter,
+                stream,
+                peer_addr,
+                &config,
+                |ctx, req| handler(ctx, req),
+            )
+            .await;
 
             // Release connection slot (always, regardless of success/failure)
             connection_counter.fetch_sub(1, Ordering::Relaxed);
@@ -1381,110 +1396,19 @@ impl TcpServer {
     async fn handle_connection_handler(
         &self,
         ctx: &RequestContext,
-        mut stream: TcpStream,
-        _peer_addr: SocketAddr,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
         handler: &dyn fastapi_core::Handler,
     ) -> Result<(), ServerError> {
-        let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
-        let mut read_buffer = vec![0u8; self.config.read_buffer_size];
-        let mut response_writer = ResponseWriter::new();
-        let mut requests_on_connection: usize = 0;
-        let max_requests = self.config.max_requests_per_connection;
-
-        loop {
-            if ctx.cx().is_cancel_requested() {
-                return Ok(());
-            }
-
-            let parse_result = parser.feed(&[])?;
-
-            let mut request = match parse_result {
-                ParseStatus::Complete { request, .. } => request,
-                ParseStatus::Incomplete => {
-                    let keep_alive_timeout = self.config.keep_alive_timeout;
-
-                    let bytes_read = if keep_alive_timeout.is_zero() {
-                        read_into_buffer(&mut stream, &mut read_buffer).await?
-                    } else {
-                        match read_with_timeout(&mut stream, &mut read_buffer, keep_alive_timeout)
-                            .await
-                        {
-                            Ok(0) => return Ok(()),
-                            Ok(n) => n,
-                            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                                ctx.trace(&format!(
-                                    "Keep-alive timeout ({:?}) - closing idle connection",
-                                    keep_alive_timeout
-                                ));
-                                return Err(ServerError::KeepAliveTimeout);
-                            }
-                            Err(e) => return Err(ServerError::Io(e)),
-                        }
-                    };
-
-                    if bytes_read == 0 {
-                        return Ok(());
-                    }
-
-                    match parser.feed(&read_buffer[..bytes_read])? {
-                        ParseStatus::Complete { request, .. } => request,
-                        ParseStatus::Incomplete => continue,
-                    }
-                }
-            };
-
-            requests_on_connection += 1;
-
-            let request_id = self.next_request_id();
-            let request_budget = Budget::new().with_deadline(self.config.request_timeout);
-            let request_cx = Cx::for_testing_with_budget(request_budget);
-            let ctx = RequestContext::new(request_cx, request_id);
-
-            if let Err(err) = validate_host_header(&request, &self.config) {
-                ctx.trace(&format!("Rejecting request: {}", err.detail));
-                let response = err.response().header("connection", b"close".to_vec());
-                let response_write = response_writer.write(response);
-                write_response(&mut stream, response_write).await?;
-                return Ok(());
-            }
-
-            let client_wants_keep_alive = should_keep_alive(&request);
-            let at_max_requests = max_requests > 0 && requests_on_connection >= max_requests;
-            let server_will_keep_alive = client_wants_keep_alive && !at_max_requests;
-
-            let request_start = Instant::now();
-            let timeout_duration = Duration::from_nanos(self.config.request_timeout.as_nanos());
-
-            // Call the Handler trait's call method
-            let response = handler.call(&ctx, &mut request).await;
-
-            let mut response = if request_start.elapsed() > timeout_duration {
-                Response::with_status(StatusCode::GATEWAY_TIMEOUT).body(
-                    fastapi_core::ResponseBody::Bytes(
-                        b"Gateway Timeout: request processing exceeded time limit".to_vec(),
-                    ),
-                )
-            } else {
-                response
-            };
-
-            response = if server_will_keep_alive {
-                response.header("connection", b"keep-alive".to_vec())
-            } else {
-                response.header("connection", b"close".to_vec())
-            };
-
-            let response_write = response_writer.write(response);
-            write_response(&mut stream, response_write).await?;
-
-            if let Some(tasks) = App::take_background_tasks(&mut request) {
-                tasks.execute_all().await;
-            }
-
-            if !server_will_keep_alive {
-                return Ok(());
-            }
-        }
+        process_connection(
+            ctx.cx(),
+            &self.request_counter,
+            stream,
+            peer_addr,
+            &self.config,
+            |ctx, req| handler.call(&ctx, req),
+        )
+        .await
     }
 
     /// The main accept loop.
@@ -1621,15 +1545,22 @@ impl TcpServer {
     {
         // Clone values needed for the spawned task
         let config = self.config.clone();
-        let request_id = self.next_request_id();
+        let request_counter = Arc::clone(&self.request_counter);
         let connection_counter = Arc::clone(&self.connection_counter);
 
         // Spawn the connection handler
         // Note: Using tokio::spawn as a transitional solution.
         // When asupersync's Scope::spawn is accessible from Cx, migrate to that.
         tokio::spawn(async move {
-            let result =
-                handle_connection_inner(request_id, stream, peer_addr, &config, &*handler).await;
+            let result = process_connection(
+                &server_cx,
+                &request_counter,
+                stream,
+                peer_addr,
+                &config,
+                |ctx, req| handler(ctx, req),
+            )
+            .await;
 
             // Release connection slot (always, regardless of success/failure)
             connection_counter.fetch_sub(1, Ordering::Relaxed);
@@ -1648,151 +1579,23 @@ impl TcpServer {
     async fn handle_connection<H, Fut>(
         &self,
         ctx: &RequestContext,
-        mut stream: TcpStream,
-        _peer_addr: SocketAddr,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
         handler: &H,
     ) -> Result<(), ServerError>
     where
         H: Fn(RequestContext, &mut Request) -> Fut + Send + Sync,
         Fut: Future<Output = Response> + Send,
     {
-        let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
-        let mut read_buffer = vec![0u8; self.config.read_buffer_size];
-        let mut response_writer = ResponseWriter::new();
-        let mut requests_on_connection: usize = 0;
-        let max_requests = self.config.max_requests_per_connection;
-
-        loop {
-            // Check for cancellation
-            if ctx.cx().is_cancel_requested() {
-                return Ok(());
-            }
-
-            // Try to parse a complete request from buffered data first
-            let parse_result = parser.feed(&[])?;
-
-            let mut request = match parse_result {
-                ParseStatus::Complete { request, .. } => request,
-                ParseStatus::Incomplete => {
-                    // Need more data - read from stream with keep-alive timeout
-                    let keep_alive_timeout = self.config.keep_alive_timeout;
-                    let read_start = Instant::now();
-
-                    // Read with timeout - if no data arrives within keep_alive_timeout,
-                    // close the connection gracefully
-                    let bytes_read = if keep_alive_timeout.is_zero() {
-                        // No timeout configured - block indefinitely
-                        read_into_buffer(&mut stream, &mut read_buffer).await?
-                    } else {
-                        // Use timeout-aware read
-                        match read_with_timeout(&mut stream, &mut read_buffer, keep_alive_timeout)
-                            .await
-                        {
-                            Ok(0) => {
-                                // Connection closed by client
-                                return Ok(());
-                            }
-                            Ok(n) => n,
-                            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                                // Keep-alive timeout expired - close gracefully
-                                ctx.trace(&format!(
-                                    "Keep-alive timeout ({:?}) - closing idle connection",
-                                    keep_alive_timeout
-                                ));
-                                return Err(ServerError::KeepAliveTimeout);
-                            }
-                            Err(e) => return Err(ServerError::Io(e)),
-                        }
-                    };
-
-                    if bytes_read == 0 {
-                        // Connection closed by client
-                        return Ok(());
-                    }
-
-                    ctx.trace(&format!(
-                        "Read {} bytes after {:?}",
-                        bytes_read,
-                        read_start.elapsed()
-                    ));
-
-                    // Feed new data to parser
-                    match parser.feed(&read_buffer[..bytes_read])? {
-                        ParseStatus::Complete { request, .. } => request,
-                        ParseStatus::Incomplete => {
-                            // Still incomplete, continue reading
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            // Increment request counter
-            requests_on_connection += 1;
-
-            // Generate unique request ID for this request with timeout budget
-            let request_id = self.next_request_id();
-            let request_budget = Budget::new().with_deadline(self.config.request_timeout);
-            let request_cx = Cx::for_testing_with_budget(request_budget);
-            let ctx = RequestContext::new(request_cx, request_id);
-
-            // Validate Host header (required for HTTP/1.1 and virtual hosting).
-            if let Err(err) = validate_host_header(&request, &self.config) {
-                ctx.trace(&format!("Rejecting request: {}", err.detail));
-                let response = err.response().header("connection", b"close".to_vec());
-                let response_write = response_writer.write(response);
-                write_response(&mut stream, response_write).await?;
-                return Ok(());
-            }
-
-            // Check if this is a keep-alive connection
-            let client_wants_keep_alive = should_keep_alive(&request);
-
-            // Determine if we should keep the connection alive:
-            // - Client must request keep-alive (or HTTP/1.1 default)
-            // - We must not have exceeded max requests per connection
-            let at_max_requests = max_requests > 0 && requests_on_connection >= max_requests;
-            let server_will_keep_alive = client_wants_keep_alive && !at_max_requests;
-
-            // Record start time for timeout detection
-            let request_start = Instant::now();
-            let timeout_duration = Duration::from_nanos(self.config.request_timeout.as_nanos());
-
-            // Call the handler
-            let response = handler(ctx, &mut request).await;
-
-            // Check if request exceeded timeout and return 504 Gateway Timeout
-            let mut response = if request_start.elapsed() > timeout_duration {
-                Response::with_status(StatusCode::GATEWAY_TIMEOUT).body(
-                    fastapi_core::ResponseBody::Bytes(
-                        b"Gateway Timeout: request processing exceeded time limit".to_vec(),
-                    ),
-                )
-            } else {
-                response
-            };
-
-            // Add Connection header to response
-            response = if server_will_keep_alive {
-                response.header("connection", b"keep-alive".to_vec())
-            } else {
-                response.header("connection", b"close".to_vec())
-            };
-
-            // Write the response
-            let response_write = response_writer.write(response);
-            write_response(&mut stream, response_write).await?;
-
-            // Execute background tasks
-            if let Some(tasks) = App::take_background_tasks(&mut request) {
-                tasks.execute_all().await;
-            }
-
-            // If not keep-alive, close the connection
-            if !server_will_keep_alive {
-                return Ok(());
-            }
-        }
+        process_connection(
+            ctx.cx(),
+            &self.request_counter,
+            stream,
+            peer_addr,
+            &self.config,
+            |ctx, req| handler(ctx, req),
+        )
+        .await
     }
 }
 

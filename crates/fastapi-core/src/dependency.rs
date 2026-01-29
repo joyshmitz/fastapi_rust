@@ -297,7 +297,10 @@ where
         }
 
         // Check for scope violation: request-scoped cannot depend on function-scoped
-        if let Some(scope_err) = ctx.resolution_stack().check_scope_violation(type_name, scope) {
+        if let Some(scope_err) = ctx
+            .resolution_stack()
+            .check_scope_violation(type_name, scope)
+        {
             panic!("{}", scope_err);
         }
 
@@ -512,8 +515,10 @@ impl ResolutionStack {
         // Check if this type is already being resolved
         if let Some(pos) = guard.iter().position(|(id, _, _)| *id == type_id) {
             // Build the cycle path from the position where we first saw this type
-            let mut cycle: Vec<String> =
-                guard[pos..].iter().map(|(_, name, _)| name.clone()).collect();
+            let mut cycle: Vec<String> = guard[pos..]
+                .iter()
+                .map(|(_, name, _)| name.clone())
+                .collect();
             // Add the current type to complete the cycle
             cycle.push(type_name.to_owned());
             return Some(cycle);
@@ -710,7 +715,10 @@ where
         }
 
         // Check for scope violation: request-scoped cannot depend on function-scoped
-        if let Some(scope_err) = ctx.resolution_stack().check_scope_violation(type_name, scope) {
+        if let Some(scope_err) = ctx
+            .resolution_stack()
+            .check_scope_violation(type_name, scope)
+        {
             panic!("{}", scope_err);
         }
 
@@ -2295,10 +2303,7 @@ mod tests {
     // Test: DependencyScopeError formatting
     #[test]
     fn scope_error_formatting() {
-        let err = DependencyScopeError::new(
-            "CachedUser".to_string(),
-            "DbConnection".to_string(),
-        );
+        let err = DependencyScopeError::new("CachedUser".to_string(), "DbConnection".to_string());
         let msg = err.to_string();
         assert!(msg.contains("Dependency scope violation"));
         assert!(msg.contains("request-scoped 'CachedUser'"));
@@ -2349,10 +2354,7 @@ mod tests {
 
         // Another request-scoped is OK
         let violation = stack.check_scope_violation("RequestB", DependencyScope::Request);
-        assert!(
-            violation.is_none(),
-            "Request -> Request should be allowed"
-        );
+        assert!(violation.is_none(), "Request -> Request should be allowed");
     }
 
     // Test: ResolutionStack allows function -> function (valid)
@@ -2387,10 +2389,7 @@ mod tests {
 
         // Request-scoped inner is OK (cached inner is fine for fresh outer)
         let violation = stack.check_scope_violation("RequestScoped", DependencyScope::Request);
-        assert!(
-            violation.is_none(),
-            "Function -> Request should be allowed"
-        );
+        assert!(violation.is_none(), "Function -> Request should be allowed");
     }
 
     // Test: Nested scope violation detection (A(request) -> B(request) -> C(function))
@@ -2408,10 +2407,7 @@ mod tests {
 
         // Inner function-scoped should fail because there's a request-scoped in the chain
         let violation = stack.check_scope_violation("InnerFunction", DependencyScope::Function);
-        assert!(
-            violation.is_some(),
-            "Should detect nested scope violation"
-        );
+        assert!(violation.is_some(), "Should detect nested scope violation");
         let err = violation.unwrap();
         // Should report the closest request-scoped (MiddleRequest)
         assert_eq!(err.request_scoped_type, "MiddleRequest");
@@ -2427,8 +2423,14 @@ mod tests {
         let violation_fn = stack.check_scope_violation("SomeDep", DependencyScope::Function);
         let violation_req = stack.check_scope_violation("SomeDep", DependencyScope::Request);
 
-        assert!(violation_fn.is_none(), "Empty stack should allow function scope");
-        assert!(violation_req.is_none(), "Empty stack should allow request scope");
+        assert!(
+            violation_fn.is_none(),
+            "Empty stack should allow function scope"
+        );
+        assert!(
+            violation_req.is_none(),
+            "Empty stack should allow request scope"
+        );
     }
 
     // Test: Scope violation in runtime dependency resolution (integration test)
