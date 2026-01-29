@@ -433,6 +433,7 @@ dependencies = [
  "flate2",
  "futures-executor",
  "parking_lot",
+ "proptest",
  "regex",
  "serde",
  "serde_json",

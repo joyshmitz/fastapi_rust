@@ -62,6 +62,7 @@ mod extract;
 pub mod health;
 pub mod logging;
 pub mod middleware;
+pub mod ndjson;
 mod request;
 mod response;
 pub mod routing;
@@ -69,6 +70,9 @@ pub mod shutdown;
 pub mod sse;
 pub mod static_files;
 pub mod testing;
+
+#[cfg(feature = "proptest")]
+pub mod proptest;
 
 pub use context::{
     BodyLimitConfig, CancelledError, DEFAULT_MAX_BODY_SIZE, IntoOutcome, RequestContext,
@@ -116,6 +120,10 @@ pub use middleware::{
 };
 #[cfg(feature = "compression")]
 pub use middleware::{CompressionConfig, CompressionMiddleware};
+pub use ndjson::{
+    NDJSON_CONTENT_TYPE, NDJSON_CONTENT_TYPE_ALT, NdjsonConfig, NdjsonResponse, NdjsonStream,
+    ndjson_iter, ndjson_response,
+};
 pub use request::{
     Body, Headers, HttpVersion, Method, Request, RequestBodyStream, RequestBodyStreamError,
 };
