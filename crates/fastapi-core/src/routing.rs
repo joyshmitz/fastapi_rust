@@ -533,6 +533,345 @@ pub fn format_allow_header(methods: &[Method]) -> String {
         .join(", ")
 }
 
+// =============================================================================
+// URL GENERATION AND REVERSE ROUTING
+// =============================================================================
+//
+// Generate URLs from route names and parameters.
+//
+// # Features
+// - Look up routes by name
+// - Substitute path parameters
+// - Include query parameters
+// - Respect root_path for proxied apps
+
+use std::collections::HashMap;
+
+/// Error that can occur during URL generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlError {
+    /// The route name was not found in the registry.
+    RouteNotFound { name: String },
+    /// A required path parameter was missing.
+    MissingParam { name: String, param: String },
+    /// A path parameter value was invalid for its converter type.
+    InvalidParam { name: String, param: String, value: String },
+}
+
+impl std::fmt::Display for UrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RouteNotFound { name } => {
+                write!(f, "route '{}' not found", name)
+            }
+            Self::MissingParam { name, param } => {
+                write!(f, "route '{}' requires parameter '{}'", name, param)
+            }
+            Self::InvalidParam { name, param, value } => {
+                write!(
+                    f,
+                    "route '{}' parameter '{}': invalid value '{}'",
+                    name, param, value
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UrlError {}
+
+/// Registry for named routes, enabling URL generation.
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::routing::UrlRegistry;
+///
+/// let mut registry = UrlRegistry::new();
+/// registry.register("get_user", "/users/{id}");
+/// registry.register("get_post", "/posts/{post_id:int}");
+///
+/// // Generate URL with path parameter
+/// let url = registry.url_for("get_user", &[("id", "42")], &[]).unwrap();
+/// assert_eq!(url, "/users/42");
+///
+/// // Generate URL with query parameters
+/// let url = registry.url_for("get_user", &[("id", "42")], &[("fields", "name,email")]).unwrap();
+/// assert_eq!(url, "/users/42?fields=name%2Cemail");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct UrlRegistry {
+    /// Map from route name to route pattern.
+    routes: HashMap<String, RoutePattern>,
+    /// Root path prefix for reverse proxy support.
+    root_path: String,
+}
+
+impl UrlRegistry {
+    /// Create a new empty URL registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            routes: HashMap::new(),
+            root_path: String::new(),
+        }
+    }
+
+    /// Create a URL registry with a root path prefix.
+    ///
+    /// The root path is prepended to all generated URLs, useful for apps
+    /// running behind a reverse proxy at a sub-path.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let registry = UrlRegistry::with_root_path("/api/v1");
+    /// registry.register("get_user", "/users/{id}");
+    /// let url = registry.url_for("get_user", &[("id", "42")], &[]).unwrap();
+    /// assert_eq!(url, "/api/v1/users/42");
+    /// ```
+    #[must_use]
+    pub fn with_root_path(root_path: impl Into<String>) -> Self {
+        let mut path = root_path.into();
+        // Normalize: ensure no trailing slash
+        while path.ends_with('/') {
+            path.pop();
+        }
+        Self {
+            routes: HashMap::new(),
+            root_path: path,
+        }
+    }
+
+    /// Set the root path prefix.
+    pub fn set_root_path(&mut self, root_path: impl Into<String>) {
+        let mut path = root_path.into();
+        while path.ends_with('/') {
+            path.pop();
+        }
+        self.root_path = path;
+    }
+
+    /// Get the current root path.
+    #[must_use]
+    pub fn root_path(&self) -> &str {
+        &self.root_path
+    }
+
+    /// Register a named route.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The route name (used to look up the route)
+    /// * `pattern` - The route pattern (e.g., "/users/{id}")
+    pub fn register(&mut self, name: impl Into<String>, pattern: &str) {
+        let name = name.into();
+        let parsed = RoutePattern::parse(pattern);
+        self.routes.insert(name, parsed);
+    }
+
+    /// Check if a route with the given name exists.
+    #[must_use]
+    pub fn has_route(&self, name: &str) -> bool {
+        self.routes.contains_key(name)
+    }
+
+    /// Get the pattern for a named route.
+    #[must_use]
+    pub fn get_pattern(&self, name: &str) -> Option<&str> {
+        self.routes.get(name).map(|p| p.pattern.as_str())
+    }
+
+    /// Generate a URL for a named route.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The route name
+    /// * `params` - Path parameters as (name, value) pairs
+    /// * `query` - Query parameters as (name, value) pairs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The route name is not found
+    /// - A required path parameter is missing
+    /// - A path parameter value doesn't match its converter type
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let url = registry.url_for(
+    ///     "get_user",
+    ///     &[("id", "42")],
+    ///     &[("fields", "name"), ("include", "posts")]
+    /// ).unwrap();
+    /// // Returns: "/users/42?fields=name&include=posts"
+    /// ```
+    pub fn url_for(
+        &self,
+        name: &str,
+        params: &[(&str, &str)],
+        query: &[(&str, &str)],
+    ) -> Result<String, UrlError> {
+        let pattern = self.routes.get(name).ok_or_else(|| UrlError::RouteNotFound {
+            name: name.to_string(),
+        })?;
+
+        // Build parameter map for fast lookup
+        let param_map: HashMap<&str, &str> = params.iter().copied().collect();
+
+        // Build the path by substituting parameters
+        let mut path = String::new();
+        if !self.root_path.is_empty() {
+            path.push_str(&self.root_path);
+        }
+
+        for segment in &pattern.segments {
+            path.push('/');
+            match segment {
+                PathSegment::Static(s) => {
+                    path.push_str(s);
+                }
+                PathSegment::Param(info) => {
+                    let value = *param_map.get(info.name.as_str()).ok_or_else(|| {
+                        UrlError::MissingParam {
+                            name: name.to_string(),
+                            param: info.name.clone(),
+                        }
+                    })?;
+
+                    // Validate the value against the converter
+                    if !info.converter.matches(value) {
+                        return Err(UrlError::InvalidParam {
+                            name: name.to_string(),
+                            param: info.name.clone(),
+                            value: value.to_string(),
+                        });
+                    }
+
+                    // URL-encode the value (except for path converter which allows slashes)
+                    if info.converter == Converter::Path {
+                        path.push_str(value);
+                    } else {
+                        path.push_str(&url_encode_path_segment(value));
+                    }
+                }
+            }
+        }
+
+        // Handle empty path (root route)
+        if path.is_empty() {
+            path.push('/');
+        }
+
+        // Add query parameters if any
+        if !query.is_empty() {
+            path.push('?');
+            for (i, (key, value)) in query.iter().enumerate() {
+                if i > 0 {
+                    path.push('&');
+                }
+                path.push_str(&url_encode(key));
+                path.push('=');
+                path.push_str(&url_encode(value));
+            }
+        }
+
+        Ok(path)
+    }
+
+    /// Get the number of registered routes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Check if the registry is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Get an iterator over route names.
+    pub fn route_names(&self) -> impl Iterator<Item = &str> {
+        self.routes.keys().map(String::as_str)
+    }
+}
+
+/// URL-encode a string for use in a query parameter.
+///
+/// Encodes all non-unreserved characters according to RFC 3986.
+#[must_use]
+pub fn url_encode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            // Unreserved characters (RFC 3986)
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            // Everything else gets percent-encoded
+            _ => {
+                result.push('%');
+                result.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                result.push(char::from_digit((byte & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    result
+}
+
+/// URL-encode a path segment.
+///
+/// Similar to `url_encode` but also allows forward slashes for path converter values.
+#[must_use]
+pub fn url_encode_path_segment(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            // Unreserved characters (RFC 3986)
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                result.push(byte as char);
+            }
+            // Everything else gets percent-encoded
+            _ => {
+                result.push('%');
+                result.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                result.push(char::from_digit((byte & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    result
+}
+
+/// URL-decode a percent-encoded string.
+///
+/// # Errors
+///
+/// Returns `None` if the string contains invalid percent-encoding.
+#[must_use]
+pub fn url_decode(s: &str) -> Option<String> {
+    let mut result = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hi = bytes.next()?;
+            let lo = bytes.next()?;
+            let hi = char::from(hi).to_digit(16)?;
+            let lo = char::from(lo).to_digit(16)?;
+            result.push((hi * 16 + lo) as u8);
+        } else if byte == b'+' {
+            // Handle + as space (form encoding)
+            result.push(b' ');
+        } else {
+            result.push(byte);
+        }
+    }
+
+    String::from_utf8(result).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +1106,267 @@ mod tests {
         assert!(method_order(Method::Head) < method_order(Method::Post));
         assert!(method_order(Method::Options) < method_order(Method::Trace));
         assert!(method_order(Method::Delete) < method_order(Method::Options));
+    }
+
+    // =========================================================================
+    // URL GENERATION TESTS
+    // =========================================================================
+
+    #[test]
+    fn url_registry_new() {
+        let registry = UrlRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.root_path(), "");
+    }
+
+    #[test]
+    fn url_registry_with_root_path() {
+        let registry = UrlRegistry::with_root_path("/api/v1");
+        assert_eq!(registry.root_path(), "/api/v1");
+    }
+
+    #[test]
+    fn url_registry_with_root_path_normalizes_trailing_slash() {
+        let registry = UrlRegistry::with_root_path("/api/v1/");
+        assert_eq!(registry.root_path(), "/api/v1");
+
+        let registry2 = UrlRegistry::with_root_path("/api///");
+        assert_eq!(registry2.root_path(), "/api");
+    }
+
+    #[test]
+    fn url_registry_register_and_lookup() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_user", "/users/{id}");
+
+        assert!(registry.has_route("get_user"));
+        assert!(!registry.has_route("nonexistent"));
+        assert_eq!(registry.get_pattern("get_user"), Some("/users/{id}"));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn url_for_static_route() {
+        let mut registry = UrlRegistry::new();
+        registry.register("home", "/");
+        registry.register("about", "/about");
+
+        let url = registry.url_for("home", &[], &[]).unwrap();
+        assert_eq!(url, "/");
+
+        let url = registry.url_for("about", &[], &[]).unwrap();
+        assert_eq!(url, "/about");
+    }
+
+    #[test]
+    fn url_for_with_path_param() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_user", "/users/{id}");
+
+        let url = registry.url_for("get_user", &[("id", "42")], &[]).unwrap();
+        assert_eq!(url, "/users/42");
+    }
+
+    #[test]
+    fn url_for_with_multiple_params() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_post", "/users/{user_id}/posts/{post_id}");
+
+        let url = registry
+            .url_for("get_post", &[("user_id", "42"), ("post_id", "99")], &[])
+            .unwrap();
+        assert_eq!(url, "/users/42/posts/99");
+    }
+
+    #[test]
+    fn url_for_with_typed_param() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_item", "/items/{id:int}");
+
+        // Valid integer
+        let url = registry.url_for("get_item", &[("id", "123")], &[]).unwrap();
+        assert_eq!(url, "/items/123");
+
+        // Invalid integer
+        let result = registry.url_for("get_item", &[("id", "abc")], &[]);
+        assert!(matches!(result, Err(UrlError::InvalidParam { .. })));
+    }
+
+    #[test]
+    fn url_for_with_uuid_param() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_object", "/objects/{id:uuid}");
+
+        let url = registry
+            .url_for(
+                "get_object",
+                &[("id", "550e8400-e29b-41d4-a716-446655440000")],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(url, "/objects/550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn url_for_with_query_params() {
+        let mut registry = UrlRegistry::new();
+        registry.register("search", "/search");
+
+        let url = registry
+            .url_for("search", &[], &[("q", "hello"), ("page", "1")])
+            .unwrap();
+        assert_eq!(url, "/search?q=hello&page=1");
+    }
+
+    #[test]
+    fn url_for_encodes_query_params() {
+        let mut registry = UrlRegistry::new();
+        registry.register("search", "/search");
+
+        let url = registry
+            .url_for("search", &[], &[("q", "hello world"), ("filter", "a&b=c")])
+            .unwrap();
+        assert_eq!(url, "/search?q=hello%20world&filter=a%26b%3Dc");
+    }
+
+    #[test]
+    fn url_for_encodes_path_params() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_file", "/files/{name}");
+
+        let url = registry
+            .url_for("get_file", &[("name", "my file.txt")], &[])
+            .unwrap();
+        assert_eq!(url, "/files/my%20file.txt");
+    }
+
+    #[test]
+    fn url_for_with_root_path() {
+        let mut registry = UrlRegistry::with_root_path("/api/v1");
+        registry.register("get_user", "/users/{id}");
+
+        let url = registry.url_for("get_user", &[("id", "42")], &[]).unwrap();
+        assert_eq!(url, "/api/v1/users/42");
+    }
+
+    #[test]
+    fn url_for_route_not_found() {
+        let registry = UrlRegistry::new();
+        let result = registry.url_for("nonexistent", &[], &[]);
+        assert!(matches!(result, Err(UrlError::RouteNotFound { name }) if name == "nonexistent"));
+    }
+
+    #[test]
+    fn url_for_missing_param() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_user", "/users/{id}");
+
+        let result = registry.url_for("get_user", &[], &[]);
+        assert!(matches!(
+            result,
+            Err(UrlError::MissingParam { name, param }) if name == "get_user" && param == "id"
+        ));
+    }
+
+    #[test]
+    fn url_for_with_path_converter() {
+        let mut registry = UrlRegistry::new();
+        registry.register("get_file", "/files/{path:path}");
+
+        let url = registry
+            .url_for("get_file", &[("path", "docs/images/logo.png")], &[])
+            .unwrap();
+        // Path converter preserves slashes
+        assert_eq!(url, "/files/docs/images/logo.png");
+    }
+
+    #[test]
+    fn url_encode_basic() {
+        assert_eq!(url_encode("hello"), "hello");
+        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(url_encode("100%"), "100%25");
+    }
+
+    #[test]
+    fn url_encode_unicode() {
+        assert_eq!(url_encode("日本"), "%E6%97%A5%E6%9C%AC");
+        assert_eq!(url_encode("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn url_decode_basic() {
+        assert_eq!(url_decode("hello"), Some("hello".to_string()));
+        assert_eq!(url_decode("hello%20world"), Some("hello world".to_string()));
+        assert_eq!(url_decode("a%26b%3Dc"), Some("a&b=c".to_string()));
+    }
+
+    #[test]
+    fn url_decode_plus_as_space() {
+        assert_eq!(url_decode("hello+world"), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn url_decode_invalid() {
+        // Incomplete percent encoding
+        assert_eq!(url_decode("hello%2"), None);
+        assert_eq!(url_decode("hello%"), None);
+        // Invalid hex
+        assert_eq!(url_decode("hello%GG"), None);
+    }
+
+    #[test]
+    fn url_error_display() {
+        let err = UrlError::RouteNotFound {
+            name: "test".to_string(),
+        };
+        assert_eq!(format!("{}", err), "route 'test' not found");
+
+        let err = UrlError::MissingParam {
+            name: "get_user".to_string(),
+            param: "id".to_string(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "route 'get_user' requires parameter 'id'"
+        );
+
+        let err = UrlError::InvalidParam {
+            name: "get_item".to_string(),
+            param: "id".to_string(),
+            value: "abc".to_string(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "route 'get_item' parameter 'id': invalid value 'abc'"
+        );
+    }
+
+    #[test]
+    fn url_registry_route_names_iterator() {
+        let mut registry = UrlRegistry::new();
+        registry.register("a", "/a");
+        registry.register("b", "/b");
+        registry.register("c", "/c");
+
+        let names: Vec<_> = registry.route_names().collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert!(names.contains(&"c"));
+    }
+
+    #[test]
+    fn url_registry_set_root_path() {
+        let mut registry = UrlRegistry::new();
+        registry.register("home", "/");
+
+        let url1 = registry.url_for("home", &[], &[]).unwrap();
+        assert_eq!(url1, "/");
+
+        registry.set_root_path("/api");
+        let url2 = registry.url_for("home", &[], &[]).unwrap();
+        assert_eq!(url2, "/api/");
     }
 }

@@ -66,6 +66,7 @@ mod request;
 mod response;
 pub mod routing;
 pub mod shutdown;
+pub mod sse;
 pub mod testing;
 
 pub use context::{
@@ -120,6 +121,7 @@ pub use response::{
     Response, ResponseBody, ResponseModel, ResponseModelConfig, ResponseProduces, StatusCode, Text,
     ValidatedResponse, exclude_fields, include_fields, mime_type_for_extension,
 };
+pub use sse::{SseConfig, SseEvent, SseResponse, SseStream, sse_response};
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
