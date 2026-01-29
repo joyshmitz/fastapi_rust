@@ -2491,14 +2491,14 @@ fn strip_body_for_head(response: Response) -> Response {
 
     // Determine if we should add Content-Length
     // Only add if not present and body has known length (Bytes, not Stream)
-    let content_length_to_add: Option<usize> = if !has_content_length {
+    let content_length_to_add: Option<usize> = if has_content_length {
+        None
+    } else {
         match &body {
             ResponseBody::Bytes(b) => Some(b.len()),
             ResponseBody::Empty => Some(0),
             ResponseBody::Stream(_) => None, // Unknown length, can't add
         }
-    } else {
-        None
     };
 
     // Build new response with empty body but preserved headers

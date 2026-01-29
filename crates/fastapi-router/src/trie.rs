@@ -3569,7 +3569,8 @@ mod tests {
         let mut router = Router::new();
 
         // 30 static levels then wildcard
-        let prefix: String = (0..30).map(|i| format!("/x{}", i)).collect();
+        let segments: Vec<_> = (0..30).map(|i| format!("x{}", i)).collect();
+        let prefix = format!("/{}", segments.join("/"));
         let path = format!("{}/{{*rest}}", prefix);
         router.add(route(Method::Get, &path)).unwrap();
 

@@ -4859,6 +4859,221 @@ impl Middleware for CacheControlMiddleware {
 // End Cache Control Middleware
 // ===========================================================================
 
+#[cfg(test)]
+mod cache_control_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::{ResponseBody, StatusCode};
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(asupersync::Cx::for_testing(), 1)
+    }
+
+    fn run_after(mw: &CacheControlMiddleware, req: &Request, resp: Response) -> Response {
+        let ctx = test_context();
+        let fut = mw.after(&ctx, req, resp);
+        futures_executor::block_on(fut)
+    }
+
+    #[test]
+    fn cache_directive_as_str_works() {
+        assert_eq!(CacheDirective::Public.as_str(), "public");
+        assert_eq!(CacheDirective::Private.as_str(), "private");
+        assert_eq!(CacheDirective::NoStore.as_str(), "no-store");
+        assert_eq!(CacheDirective::NoCache.as_str(), "no-cache");
+        assert_eq!(CacheDirective::MustRevalidate.as_str(), "must-revalidate");
+        assert_eq!(CacheDirective::Immutable.as_str(), "immutable");
+    }
+
+    #[test]
+    fn cache_control_builder_basic() {
+        let cc = CacheControlBuilder::new()
+            .public()
+            .max_age_secs(3600)
+            .build();
+        assert!(cc.contains("public"));
+        assert!(cc.contains("max-age=3600"));
+    }
+
+    #[test]
+    fn cache_control_builder_complex() {
+        let cc = CacheControlBuilder::new()
+            .public()
+            .max_age_secs(60)
+            .s_maxage_secs(3600)
+            .stale_while_revalidate_secs(86400)
+            .build();
+        assert!(cc.contains("public"));
+        assert!(cc.contains("max-age=60"));
+        assert!(cc.contains("s-maxage=3600"));
+        assert!(cc.contains("stale-while-revalidate=86400"));
+    }
+
+    #[test]
+    fn cache_control_builder_no_cache() {
+        let cc = CacheControlBuilder::new()
+            .no_store()
+            .no_cache()
+            .must_revalidate()
+            .build();
+        assert!(cc.contains("no-store"));
+        assert!(cc.contains("no-cache"));
+        assert!(cc.contains("must-revalidate"));
+    }
+
+    #[test]
+    fn cache_preset_no_cache() {
+        let value = CachePreset::NoCache.to_header_value();
+        assert!(value.contains("no-store"));
+        assert!(value.contains("no-cache"));
+        assert!(value.contains("must-revalidate"));
+    }
+
+    #[test]
+    fn cache_preset_immutable() {
+        let value = CachePreset::Immutable.to_header_value();
+        assert!(value.contains("public"));
+        assert!(value.contains("max-age=31536000"));
+        assert!(value.contains("immutable"));
+    }
+
+    #[test]
+    fn cache_preset_static_assets() {
+        let value = CachePreset::StaticAssets.to_header_value();
+        assert!(value.contains("public"));
+        assert!(value.contains("max-age=86400"));
+    }
+
+    #[test]
+    fn middleware_adds_cache_control_header() {
+        let mw = CacheControlMiddleware::with_preset(CachePreset::PublicOneHour);
+        let req = Request::new(Method::Get, "/api/test");
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_after(&mw, &req, resp);
+        let headers = result.headers();
+        let cc_header = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"));
+        assert!(cc_header.is_some(), "Cache-Control header should be present");
+        let (_, value) = cc_header.unwrap();
+        let value_str = String::from_utf8_lossy(value);
+        assert!(value_str.contains("public"));
+        assert!(value_str.contains("max-age=3600"));
+    }
+
+    #[test]
+    fn middleware_skips_post_requests() {
+        let mw = CacheControlMiddleware::with_preset(CachePreset::PublicOneHour);
+        let req = Request::new(Method::Post, "/api/test");
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_after(&mw, &req, resp);
+        let headers = result.headers();
+        let cc_header = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"));
+        assert!(
+            cc_header.is_none(),
+            "Cache-Control should not be added for POST"
+        );
+    }
+
+    #[test]
+    fn middleware_skips_error_responses() {
+        let mw = CacheControlMiddleware::with_preset(CachePreset::PublicOneHour);
+        let req = Request::new(Method::Get, "/api/test");
+        let resp = Response::with_status(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let result = run_after(&mw, &req, resp);
+        let headers = result.headers();
+        let cc_header = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"));
+        assert!(
+            cc_header.is_none(),
+            "Cache-Control should not be added for error responses"
+        );
+    }
+
+    #[test]
+    fn middleware_with_vary_header() {
+        let mw = CacheControlMiddleware::with_config(
+            CacheControlConfig::from_preset(CachePreset::PublicOneHour)
+                .vary("Accept-Encoding")
+                .vary("Accept-Language"),
+        );
+        let req = Request::new(Method::Get, "/api/test");
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_after(&mw, &req, resp);
+        let headers = result.headers();
+        let vary_header = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("vary"));
+        assert!(vary_header.is_some(), "Vary header should be present");
+        let (_, value) = vary_header.unwrap();
+        let value_str = String::from_utf8_lossy(value);
+        assert!(value_str.contains("Accept-Encoding"));
+        assert!(value_str.contains("Accept-Language"));
+    }
+
+    #[test]
+    fn middleware_preserves_existing_cache_control() {
+        let mw = CacheControlMiddleware::with_config(
+            CacheControlConfig::from_preset(CachePreset::PublicOneHour).preserve_existing(true),
+        );
+        let req = Request::new(Method::Get, "/api/test");
+        let resp = Response::with_status(StatusCode::OK)
+            .header("Cache-Control", b"max-age=60".to_vec());
+
+        let result = run_after(&mw, &req, resp);
+        let headers = result.headers();
+        let cc_headers: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+            .collect();
+        // Should only have the original header, not add a new one
+        assert_eq!(cc_headers.len(), 1);
+        let (_, value) = cc_headers[0];
+        let value_str = String::from_utf8_lossy(value);
+        assert_eq!(value_str, "max-age=60");
+    }
+
+    #[test]
+    fn path_pattern_matching_exact() {
+        assert!(path_matches_pattern("/api/users", "/api/users"));
+        assert!(!path_matches_pattern("/api/users", "/api/items"));
+    }
+
+    #[test]
+    fn path_pattern_matching_wildcard() {
+        assert!(path_matches_pattern("/api/users/123", "/api/users/*"));
+        assert!(path_matches_pattern("/static/css/style.css", "/static/*"));
+        assert!(path_matches_pattern("/anything", "*"));
+    }
+
+    #[test]
+    fn date_formatting_works() {
+        // Test that format_http_date doesn't panic and produces valid format
+        let now = std::time::SystemTime::now();
+        let formatted = format_http_date(now);
+        // Should contain GMT
+        assert!(formatted.ends_with(" GMT"));
+        // Should have day name
+        let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        assert!(days.iter().any(|d| formatted.starts_with(d)));
+    }
+
+    #[test]
+    fn leap_year_detection() {
+        assert!(!is_leap_year(1900)); // Divisible by 100 but not 400
+        assert!(is_leap_year(2000)); // Divisible by 400
+        assert!(is_leap_year(2024)); // Divisible by 4 but not 100
+        assert!(!is_leap_year(2023)); // Not divisible by 4
+    }
+}
+
 // ===========================================================================
 // End ETag Middleware
 // ===========================================================================
