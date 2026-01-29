@@ -55,6 +55,7 @@ pub mod api_router;
 pub mod app;
 pub mod bench;
 mod context;
+pub mod coverage;
 mod dependency;
 pub mod docs;
 pub mod error;
@@ -152,6 +153,11 @@ pub use testing::{
 // Note: The macros assert_status!, assert_header!, assert_body_contains!,
 // assert_json!, and assert_body_matches! are automatically exported at the crate root
 // due to #[macro_export]. Users can import them with `use fastapi_core::assert_status;`
+
+// Re-export coverage utilities
+pub use coverage::{
+    BranchHits, CoverageConfig, CoverageReport, CoverageTracker, EndpointHits, OutputFormat,
+};
 
 // Re-export logging utilities
 pub use logging::{AutoSpan, LogConfig, LogEntry, LogLevel, Span};

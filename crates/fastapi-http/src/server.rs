@@ -45,6 +45,7 @@
 //! ```
 
 use crate::connection::should_keep_alive;
+use crate::expect::{ExpectHandler, ExpectResult, CONTINUE_RESPONSE};
 use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -632,6 +633,33 @@ where
             let response_write = response_writer.write(response);
             write_response(&mut stream, response_write).await?;
             return Ok(());
+        }
+
+        // Handle Expect: 100-continue
+        // RFC 7231 Section 5.1.1: If the server receives a request with Expect: 100-continue,
+        // it should either send 100 Continue (to proceed) or a final status code (to reject).
+        match ExpectHandler::check_expect(&request) {
+            ExpectResult::NoExpectation => {
+                // No Expect header - proceed normally
+            }
+            ExpectResult::ExpectsContinue => {
+                // Expect: 100-continue present
+                // Send 100 Continue to tell client to proceed with body
+                // Note: In a full implementation, pre-body validation hooks would run here
+                // to validate auth, content-type, content-length before accepting the body.
+                ctx.trace("Sending 100 Continue for Expect: 100-continue");
+                write_raw_response(&mut stream, CONTINUE_RESPONSE).await?;
+            }
+            ExpectResult::UnknownExpectation(value) => {
+                // Unknown expectation - return 417 Expectation Failed
+                ctx.trace(&format!("Rejecting unknown Expect value: {}", value));
+                let response = ExpectHandler::expectation_failed(format!(
+                    "Unsupported Expect value: {value}"
+                ));
+                let response_write = response_writer.write(response);
+                write_response(&mut stream, response_write).await?;
+                return Ok(());
+            }
         }
 
         let client_wants_keep_alive = should_keep_alive(&request);
@@ -1667,6 +1695,16 @@ async fn read_with_timeout(
             "keep-alive timeout expired",
         )),
     }
+}
+
+/// Writes raw bytes to a TCP stream (e.g., for 100 Continue response).
+///
+/// This writes the bytes directly without any HTTP formatting.
+async fn write_raw_response(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    use std::future::poll_fn;
+    write_all(stream, bytes).await?;
+    poll_fn(|cx| Pin::new(&mut *stream).poll_flush(cx)).await?;
+    Ok(())
 }
 
 /// Writes a response to a TCP stream.

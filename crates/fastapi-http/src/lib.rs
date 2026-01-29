@@ -59,6 +59,7 @@
 
 pub mod body;
 pub mod connection;
+pub mod expect;
 pub mod multipart;
 mod parser;
 mod query;
@@ -76,6 +77,10 @@ pub use body::{
 pub use connection::{
     ConnectionInfo, STANDARD_HOP_BY_HOP_HEADERS, is_standard_hop_by_hop_header,
     parse_connection_header, should_keep_alive, strip_hop_by_hop_headers,
+};
+pub use expect::{
+    CONTINUE_RESPONSE, EXPECT_100_CONTINUE, ExpectHandler, ExpectResult, FnValidator,
+    PreBodyValidator, PreBodyValidators,
 };
 pub use parser::{
     BodyLength, Header, HeadersIter, HeadersParser, ParseError, ParseLimits, ParseStatus, Parser,
