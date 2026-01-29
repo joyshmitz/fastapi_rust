@@ -84,7 +84,17 @@ impl FromRequest for RequestContext {
 /// Default maximum JSON body size (1MB).
 pub const DEFAULT_JSON_LIMIT: usize = 1024 * 1024;
 
-/// Configuration for JSON extraction.
+/// Configuration for JSON request body extraction.
+///
+/// Controls the maximum body size and accepted content types for
+/// the [`Json`] extractor.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `limit` | 1 MB (`DEFAULT_JSON_LIMIT`) |
+/// | `content_type` | `None` (accepts any `application/json` variant) |
 #[derive(Debug, Clone)]
 pub struct JsonConfig {
     /// Maximum body size in bytes.
@@ -1217,6 +1227,17 @@ pub const DEFAULT_MULTIPART_TOTAL_SIZE: usize = 50 * 1024 * 1024;
 pub const DEFAULT_MULTIPART_MAX_FIELDS: usize = 100;
 
 /// Configuration for multipart form extraction.
+///
+/// Controls size limits for file uploads and the maximum number of
+/// form fields. These limits prevent denial-of-service via oversized uploads.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `max_file_size` | 10 MB |
+/// | `max_total_size` | 50 MB |
+/// | `max_fields` | 100 |
 #[derive(Debug, Clone)]
 pub struct MultipartConfig {
     max_file_size: usize,

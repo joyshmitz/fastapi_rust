@@ -845,7 +845,34 @@ impl std::fmt::Debug for ExceptionHandlers {
     }
 }
 
-/// Application configuration.
+/// Application configuration for the FastAPI Rust framework.
+///
+/// Controls application-level settings including naming, debug mode,
+/// body size limits, timeouts, and routing behavior.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `name` | `"FastAPI"` |
+/// | `version` | `"0.1.0"` |
+/// | `debug` | `false` |
+/// | `max_body_size` | 1 MB (1,048,576 bytes) |
+/// | `request_timeout_ms` | 30,000 ms |
+/// | `root_path` | `""` |
+/// | `trailing_slash_mode` | `Strict` |
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::AppConfig;
+///
+/// let config = AppConfig::default()
+///     .with_name("my-api")
+///     .with_version("2.0.0")
+///     .with_debug(true)
+///     .with_max_body_size(10 * 1024 * 1024); // 10 MB
+/// ```
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     /// Application name (used in logging and OpenAPI).

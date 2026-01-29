@@ -675,7 +675,32 @@ impl OriginPattern {
     }
 }
 
-/// CORS configuration.
+/// Cross-Origin Resource Sharing (CORS) configuration.
+///
+/// Controls which origins, methods, and headers are allowed for
+/// cross-origin requests. By default, no origins are allowed.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `allow_any_origin` | `false` |
+/// | `allow_credentials` | `false` |
+/// | `allowed_methods` | GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD |
+/// | `allowed_headers` | none |
+/// | `expose_headers` | none |
+/// | `max_age` | none |
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::CorsConfig;
+///
+/// let cors = CorsConfig::default()
+///     .allow_any_origin(true)
+///     .allow_credentials(true)
+///     .expose_headers(vec!["X-Request-Id".into()]);
+/// ```
 #[derive(Debug, Clone)]
 pub struct CorsConfig {
     allow_any_origin: bool,
@@ -3050,6 +3075,38 @@ impl Default for InMemoryRateLimitStore {
 }
 
 /// Configuration for the rate limiting middleware.
+///
+/// Controls request rate limits using token bucket or sliding window algorithms.
+/// When the limit is exceeded, a 429 Too Many Requests response is returned.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `max_requests` | 100 |
+/// | `window` | 60s |
+/// | `algorithm` | `TokenBucket` |
+/// | `include_headers` | `true` |
+/// | `retry_message` | "Rate limit exceeded. Please retry later." |
+///
+/// # Response Headers (when `include_headers` is `true`)
+///
+/// - `X-RateLimit-Limit`: Maximum requests per window
+/// - `X-RateLimit-Remaining`: Remaining requests in current window
+/// - `X-RateLimit-Reset`: Seconds until window resets
+/// - `Retry-After`: Seconds to wait (only on 429 responses)
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::{RateLimitBuilder, RateLimitAlgorithm};
+///
+/// let rate_limit = RateLimitBuilder::new()
+///     .max_requests(1000)
+///     .window_secs(3600) // 1000 req/hour
+///     .algorithm(RateLimitAlgorithm::SlidingWindow)
+///     .build();
+/// ```
 #[derive(Clone)]
 pub struct RateLimitConfig {
     /// Maximum number of requests allowed per window.

@@ -103,7 +103,33 @@ pub const DEFAULT_MAX_REQUESTS_PER_CONNECTION: usize = 100;
 /// Default drain timeout in seconds (time to wait for in-flight requests on shutdown).
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 
-/// Server configuration.
+/// Server configuration for the HTTP/1.1 server.
+///
+/// Controls bind address, timeouts, connection limits, and HTTP parsing behavior.
+/// All timeouts use sensible defaults suitable for production use.
+///
+/// # Defaults
+///
+/// | Setting | Default |
+/// |---------|---------|
+/// | `request_timeout` | 30s |
+/// | `max_connections` | 0 (unlimited) |
+/// | `read_buffer_size` | 8192 bytes |
+/// | `tcp_nodelay` | `true` |
+/// | `keep_alive_timeout` | 75s |
+/// | `max_requests_per_connection` | 100 |
+/// | `drain_timeout` | 30s |
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_http::{ServerConfig, serve_with_config};
+///
+/// let config = ServerConfig::new("0.0.0.0:8000")
+///     .with_request_timeout_secs(60)
+///     .with_max_connections(1000)
+///     .with_keep_alive_timeout_secs(120);
+/// ```
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind to.
