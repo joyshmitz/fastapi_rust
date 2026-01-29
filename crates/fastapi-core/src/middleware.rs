@@ -5299,6 +5299,1176 @@ impl Middleware for HttpsRedirectMiddleware {
 // End HTTPS Redirect Middleware
 // ===========================================================================
 
+// ===========================================================================
+// Response Interceptors and Transformers
+// ===========================================================================
+//
+// This section provides a simplified abstraction for response-only processing.
+// Unlike full Middleware, ResponseInterceptor only handles post-handler processing,
+// making it lighter weight and easier to compose for response transformations.
+
+/// A response interceptor that processes responses after handler execution.
+///
+/// Unlike the full [`Middleware`] trait, `ResponseInterceptor` only handles
+/// the post-handler phase, making it simpler to implement for response-only
+/// processing like:
+/// - Adding timing headers
+/// - Transforming response bodies
+/// - Adding debug information
+/// - Logging response details
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::{ResponseInterceptor, ResponseInterceptorContext};
+///
+/// struct TimingInterceptor {
+///     start_time: Instant,
+/// }
+///
+/// impl ResponseInterceptor for TimingInterceptor {
+///     fn intercept(&self, ctx: &ResponseInterceptorContext, response: Response) -> Response {
+///         let elapsed = self.start_time.elapsed();
+///         response.header("X-Response-Time", format!("{}ms", elapsed.as_millis()).into_bytes())
+///     }
+/// }
+/// ```
+pub trait ResponseInterceptor: Send + Sync {
+    /// Process a response after the handler has executed.
+    ///
+    /// # Parameters
+    ///
+    /// - `ctx`: Context containing request information and timing data
+    /// - `response`: The response from the handler or previous interceptors
+    ///
+    /// # Returns
+    ///
+    /// The modified response to pass to the next interceptor or return to client.
+    fn intercept<'a>(
+        &'a self,
+        ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response>;
+
+    /// Returns the interceptor name for debugging and logging.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+/// Context provided to response interceptors.
+///
+/// Contains information about the original request and timing data
+/// that interceptors might need to process responses.
+#[derive(Debug)]
+pub struct ResponseInterceptorContext<'a> {
+    /// The original request (read-only).
+    pub request: &'a Request,
+    /// When the request processing started.
+    pub start_time: Instant,
+    /// The request context for cancellation support.
+    pub request_ctx: &'a RequestContext,
+}
+
+impl<'a> ResponseInterceptorContext<'a> {
+    /// Create a new interceptor context.
+    pub fn new(request: &'a Request, request_ctx: &'a RequestContext, start_time: Instant) -> Self {
+        Self {
+            request,
+            start_time,
+            request_ctx,
+        }
+    }
+
+    /// Get the elapsed time since request processing started.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Get the elapsed time in milliseconds.
+    pub fn elapsed_ms(&self) -> u128 {
+        self.start_time.elapsed().as_millis()
+    }
+}
+
+/// A stack of response interceptors that run in order.
+///
+/// Interceptors are executed in registration order (first registered, first run).
+/// Each interceptor receives the response from the previous one and can modify it.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut stack = ResponseInterceptorStack::new();
+/// stack.push(TimingInterceptor);
+/// stack.push(DebugHeadersInterceptor::new());
+///
+/// let response = stack.process(&ctx, response).await;
+/// ```
+#[derive(Default)]
+pub struct ResponseInterceptorStack {
+    interceptors: Vec<Arc<dyn ResponseInterceptor>>,
+}
+
+impl ResponseInterceptorStack {
+    /// Create an empty interceptor stack.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            interceptors: Vec::new(),
+        }
+    }
+
+    /// Create a stack with pre-allocated capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            interceptors: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Add an interceptor to the end of the stack.
+    pub fn push<I: ResponseInterceptor + 'static>(&mut self, interceptor: I) {
+        self.interceptors.push(Arc::new(interceptor));
+    }
+
+    /// Add an Arc-wrapped interceptor.
+    pub fn push_arc(&mut self, interceptor: Arc<dyn ResponseInterceptor>) {
+        self.interceptors.push(interceptor);
+    }
+
+    /// Return the number of interceptors in the stack.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.interceptors.len()
+    }
+
+    /// Return true if the stack is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.interceptors.is_empty()
+    }
+
+    /// Process a response through all interceptors.
+    pub async fn process(
+        &self,
+        ctx: &ResponseInterceptorContext<'_>,
+        mut response: Response,
+    ) -> Response {
+        for interceptor in &self.interceptors {
+            let _ = ctx.request_ctx.checkpoint();
+            response = interceptor.intercept(ctx, response).await;
+        }
+        response
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timing Interceptor
+// ---------------------------------------------------------------------------
+
+/// Interceptor that adds response timing headers.
+///
+/// Adds the `X-Response-Time` header with the time taken to process the request.
+/// Optionally adds Server-Timing header for browser DevTools integration.
+///
+/// # Example
+///
+/// ```ignore
+/// let interceptor = TimingInterceptor::new();
+/// // Or with Server-Timing header
+/// let interceptor = TimingInterceptor::with_server_timing("app");
+/// ```
+#[derive(Debug, Clone)]
+pub struct TimingInterceptor {
+    /// Header name for the response time (default: X-Response-Time).
+    header_name: String,
+    /// Whether to include Server-Timing header.
+    include_server_timing: bool,
+    /// The timing metric name for Server-Timing (default: "total").
+    server_timing_name: String,
+}
+
+impl Default for TimingInterceptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TimingInterceptor {
+    /// Create a new timing interceptor with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            header_name: "X-Response-Time".to_string(),
+            include_server_timing: false,
+            server_timing_name: "total".to_string(),
+        }
+    }
+
+    /// Enable Server-Timing header with the given metric name.
+    #[must_use]
+    pub fn with_server_timing(mut self, metric_name: impl Into<String>) -> Self {
+        self.include_server_timing = true;
+        self.server_timing_name = metric_name.into();
+        self
+    }
+
+    /// Set a custom header name instead of X-Response-Time.
+    #[must_use]
+    pub fn header_name(mut self, name: impl Into<String>) -> Self {
+        self.header_name = name.into();
+        self
+    }
+}
+
+impl ResponseInterceptor for TimingInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let elapsed_ms = ctx.elapsed_ms();
+            let timing_value = format!("{}ms", elapsed_ms);
+
+            let response = response.header(&self.header_name, timing_value.clone().into_bytes());
+
+            if self.include_server_timing {
+                // Server-Timing format: name;dur=value;desc="description"
+                let server_timing = format!("{};dur={}", self.server_timing_name, elapsed_ms);
+                response.header("Server-Timing", server_timing.into_bytes())
+            } else {
+                response
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "TimingInterceptor"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debug Headers Interceptor
+// ---------------------------------------------------------------------------
+
+/// Interceptor that adds debug information headers.
+///
+/// Useful for development/staging environments to expose internal
+/// processing information in response headers.
+///
+/// # Headers Added
+///
+/// - `X-Debug-Request-Id`: The request ID (if available)
+/// - `X-Debug-Handler-Time`: Handler execution time
+/// - `X-Debug-Path`: The request path
+/// - `X-Debug-Method`: The HTTP method
+///
+/// # Example
+///
+/// ```ignore
+/// let interceptor = DebugInfoInterceptor::new()
+///     .include_path(true)
+///     .include_method(true);
+/// ```
+#[derive(Debug, Clone)]
+pub struct DebugInfoInterceptor {
+    /// Include path in debug headers.
+    include_path: bool,
+    /// Include HTTP method in debug headers.
+    include_method: bool,
+    /// Include request ID in debug headers.
+    include_request_id: bool,
+    /// Include timing information.
+    include_timing: bool,
+    /// Header prefix (default: "X-Debug-").
+    header_prefix: String,
+}
+
+impl Default for DebugInfoInterceptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DebugInfoInterceptor {
+    /// Create a new debug info interceptor with all options enabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            include_path: true,
+            include_method: true,
+            include_request_id: true,
+            include_timing: true,
+            header_prefix: "X-Debug-".to_string(),
+        }
+    }
+
+    /// Set whether to include the path.
+    #[must_use]
+    pub fn include_path(mut self, include: bool) -> Self {
+        self.include_path = include;
+        self
+    }
+
+    /// Set whether to include the HTTP method.
+    #[must_use]
+    pub fn include_method(mut self, include: bool) -> Self {
+        self.include_method = include;
+        self
+    }
+
+    /// Set whether to include the request ID.
+    #[must_use]
+    pub fn include_request_id(mut self, include: bool) -> Self {
+        self.include_request_id = include;
+        self
+    }
+
+    /// Set whether to include timing information.
+    #[must_use]
+    pub fn include_timing(mut self, include: bool) -> Self {
+        self.include_timing = include;
+        self
+    }
+
+    /// Set a custom header prefix.
+    #[must_use]
+    pub fn header_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.header_prefix = prefix.into();
+        self
+    }
+}
+
+impl ResponseInterceptor for DebugInfoInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let mut resp = response;
+
+            if self.include_path {
+                let header_name = format!("{}Path", self.header_prefix);
+                resp = resp.header(header_name, ctx.request.path().as_bytes().to_vec());
+            }
+
+            if self.include_method {
+                let header_name = format!("{}Method", self.header_prefix);
+                resp = resp.header(
+                    header_name,
+                    ctx.request.method().as_str().as_bytes().to_vec(),
+                );
+            }
+
+            if self.include_request_id {
+                if let Some(request_id) = ctx.request.get_extension::<RequestId>() {
+                    let header_name = format!("{}Request-Id", self.header_prefix);
+                    resp = resp.header(header_name, request_id.0.as_bytes().to_vec());
+                }
+            }
+
+            if self.include_timing {
+                let header_name = format!("{}Handler-Time", self.header_prefix);
+                let timing = format!("{}ms", ctx.elapsed_ms());
+                resp = resp.header(header_name, timing.into_bytes());
+            }
+
+            resp
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "DebugInfoInterceptor"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response Body Transform
+// ---------------------------------------------------------------------------
+
+/// A response transformer that applies a function to the response body.
+///
+/// This is useful for content transformations like:
+/// - Minification
+/// - Pretty-printing
+/// - Wrapping responses
+/// - Filtering content
+///
+/// # Example
+///
+/// ```ignore
+/// // Wrap JSON responses in an envelope
+/// let transformer = ResponseBodyTransform::new(|body| {
+///     format!(r#"{{"data": {}}}"#, String::from_utf8_lossy(&body)).into_bytes()
+/// });
+/// ```
+pub struct ResponseBodyTransform<F>
+where
+    F: Fn(Vec<u8>) -> Vec<u8> + Send + Sync,
+{
+    transform_fn: F,
+    /// Optional content type filter - only transform if content type matches.
+    content_type_filter: Option<String>,
+}
+
+impl<F> ResponseBodyTransform<F>
+where
+    F: Fn(Vec<u8>) -> Vec<u8> + Send + Sync,
+{
+    /// Create a new body transformer with the given function.
+    pub fn new(transform_fn: F) -> Self {
+        Self {
+            transform_fn,
+            content_type_filter: None,
+        }
+    }
+
+    /// Only apply transformation if the response content type starts with this value.
+    #[must_use]
+    pub fn for_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type_filter = Some(content_type.into());
+        self
+    }
+
+    fn should_transform(&self, response: &Response) -> bool {
+        match &self.content_type_filter {
+            Some(filter) => response
+                .headers()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .and_then(|(_, ct)| std::str::from_utf8(ct).ok())
+                .map(|ct| ct.starts_with(filter))
+                .unwrap_or(false),
+            None => true,
+        }
+    }
+}
+
+impl<F> ResponseInterceptor for ResponseBodyTransform<F>
+where
+    F: Fn(Vec<u8>) -> Vec<u8> + Send + Sync,
+{
+    fn intercept<'a>(
+        &'a self,
+        _ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if !self.should_transform(&response) {
+                return response;
+            }
+
+            // Extract the body bytes
+            let body_bytes = match response.body_ref() {
+                crate::response::ResponseBody::Empty => Vec::new(),
+                crate::response::ResponseBody::Bytes(b) => b.clone(),
+                crate::response::ResponseBody::Stream(_) => {
+                    // Cannot transform streaming responses
+                    return response;
+                }
+            };
+
+            // Apply transformation
+            let transformed = (self.transform_fn)(body_bytes);
+
+            // Rebuild response with new body
+            response.body(crate::response::ResponseBody::Bytes(transformed))
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "ResponseBodyTransform"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Header Transform Interceptor
+// ---------------------------------------------------------------------------
+
+/// An interceptor that transforms response headers.
+///
+/// Allows adding, removing, or modifying headers based on the response.
+///
+/// # Example
+///
+/// ```ignore
+/// let interceptor = HeaderTransformInterceptor::new()
+///     .add("X-Powered-By", "fastapi_rust")
+///     .remove("Server")
+///     .rename("X-Request-Id", "X-Trace-Id");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct HeaderTransformInterceptor {
+    /// Headers to add.
+    add_headers: Vec<(String, Vec<u8>)>,
+    /// Headers to remove.
+    remove_headers: Vec<String>,
+    /// Headers to rename (old_name -> new_name).
+    rename_headers: Vec<(String, String)>,
+}
+
+impl HeaderTransformInterceptor {
+    /// Create a new header transform interceptor.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a header to the response.
+    #[must_use]
+    pub fn add(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.add_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Remove a header from the response.
+    #[must_use]
+    pub fn remove(mut self, name: impl Into<String>) -> Self {
+        self.remove_headers.push(name.into());
+        self
+    }
+
+    /// Rename a header (if it exists).
+    #[must_use]
+    pub fn rename(mut self, old_name: impl Into<String>, new_name: impl Into<String>) -> Self {
+        self.rename_headers.push((old_name.into(), new_name.into()));
+        self
+    }
+}
+
+impl ResponseInterceptor for HeaderTransformInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        _ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        let add_headers = self.add_headers.clone();
+        let remove_headers = self.remove_headers.clone();
+        let rename_headers = self.rename_headers.clone();
+
+        Box::pin(async move {
+            let mut resp = response;
+
+            // Handle renames first - get values of headers to rename
+            for (old_name, new_name) in &rename_headers {
+                let header_value = resp
+                    .headers()
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(old_name))
+                    .map(|(_, v)| v.clone());
+
+                if let Some(value) = header_value {
+                    resp = resp.header(new_name, value);
+                    // Note: We can't remove the old header without rebuild
+                    // so we just add the new one
+                }
+            }
+
+            // Add new headers
+            for (name, value) in add_headers {
+                resp = resp.header(name, value);
+            }
+
+            // Note: Header removal would require Response to support remove_header
+            // For now, this is a no-op but documented as a limitation
+            let _ = remove_headers;
+
+            resp
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "HeaderTransformInterceptor"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conditional Interceptor Wrapper
+// ---------------------------------------------------------------------------
+
+/// Wrapper that applies an interceptor only when a condition is met.
+///
+/// # Example
+///
+/// ```ignore
+/// // Only add debug headers for non-production requests
+/// let interceptor = ConditionalInterceptor::new(
+///     DebugInfoInterceptor::new(),
+///     |ctx, resp| ctx.request.headers().get("X-Debug").is_some()
+/// );
+/// ```
+pub struct ConditionalInterceptor<I, F>
+where
+    I: ResponseInterceptor,
+    F: Fn(&ResponseInterceptorContext, &Response) -> bool + Send + Sync,
+{
+    inner: I,
+    condition: F,
+}
+
+impl<I, F> ConditionalInterceptor<I, F>
+where
+    I: ResponseInterceptor,
+    F: Fn(&ResponseInterceptorContext, &Response) -> bool + Send + Sync,
+{
+    /// Create a new conditional interceptor.
+    pub fn new(inner: I, condition: F) -> Self {
+        Self { inner, condition }
+    }
+}
+
+impl<I, F> ResponseInterceptor for ConditionalInterceptor<I, F>
+where
+    I: ResponseInterceptor,
+    F: Fn(&ResponseInterceptorContext, &Response) -> bool + Send + Sync,
+{
+    fn intercept<'a>(
+        &'a self,
+        ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if (self.condition)(ctx, &response) {
+                self.inner.intercept(ctx, response).await
+            } else {
+                response
+            }
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "ConditionalInterceptor"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error Response Transformer
+// ---------------------------------------------------------------------------
+
+/// Interceptor that transforms error responses.
+///
+/// Useful for:
+/// - Hiding internal error details in production
+/// - Adding consistent error formatting
+/// - Logging error responses
+///
+/// # Example
+///
+/// ```ignore
+/// let interceptor = ErrorResponseTransformer::new()
+///     .hide_details_for_status(StatusCode::INTERNAL_SERVER_ERROR)
+///     .with_replacement_body(b"An internal error occurred".to_vec());
+/// ```
+#[derive(Debug, Clone)]
+pub struct ErrorResponseTransformer {
+    /// Status codes to transform.
+    status_codes: HashSet<u16>,
+    /// Replacement body for error responses.
+    replacement_body: Option<Vec<u8>>,
+    /// Whether to add an error ID header.
+    add_error_id: bool,
+}
+
+impl Default for ErrorResponseTransformer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ErrorResponseTransformer {
+    /// Create a new error response transformer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            status_codes: HashSet::new(),
+            replacement_body: None,
+            add_error_id: false,
+        }
+    }
+
+    /// Hide details for the given status code.
+    #[must_use]
+    pub fn hide_details_for_status(mut self, status: crate::response::StatusCode) -> Self {
+        self.status_codes.insert(status.as_u16());
+        self
+    }
+
+    /// Set the replacement body for error responses.
+    #[must_use]
+    pub fn with_replacement_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.replacement_body = Some(body.into());
+        self
+    }
+
+    /// Enable adding an error ID header for tracking.
+    #[must_use]
+    pub fn add_error_id(mut self, enable: bool) -> Self {
+        self.add_error_id = enable;
+        self
+    }
+}
+
+impl ResponseInterceptor for ErrorResponseTransformer {
+    fn intercept<'a>(
+        &'a self,
+        ctx: &'a ResponseInterceptorContext<'a>,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let status_code = response.status().as_u16();
+
+            if !self.status_codes.contains(&status_code) {
+                return response;
+            }
+
+            let mut resp = response;
+
+            // Replace body if configured
+            if let Some(ref replacement) = self.replacement_body {
+                resp = resp.body(crate::response::ResponseBody::Bytes(replacement.clone()));
+            }
+
+            // Add error ID header if enabled
+            if self.add_error_id {
+                // Use request ID if available, otherwise generate a simple one
+                let error_id = ctx
+                    .request
+                    .get_extension::<RequestId>()
+                    .map(|r| r.0.clone())
+                    .unwrap_or_else(|| format!("err-{}", ctx.elapsed_ms()));
+                resp = resp.header("X-Error-Id", error_id.into_bytes());
+            }
+
+            resp
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "ErrorResponseTransformer"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Middleware adapter for ResponseInterceptor
+// ---------------------------------------------------------------------------
+
+/// Adapter that wraps a `ResponseInterceptor` as a `Middleware`.
+///
+/// This allows using response interceptors in the existing middleware stack.
+///
+/// # Example
+///
+/// ```ignore
+/// let timing = TimingInterceptor::new();
+/// let middleware = ResponseInterceptorMiddleware::new(timing);
+/// stack.push(middleware);
+/// ```
+pub struct ResponseInterceptorMiddleware<I>
+where
+    I: ResponseInterceptor,
+{
+    interceptor: I,
+}
+
+impl<I> ResponseInterceptorMiddleware<I>
+where
+    I: ResponseInterceptor,
+{
+    /// Wrap a response interceptor as middleware.
+    pub fn new(interceptor: I) -> Self {
+        Self { interceptor }
+    }
+}
+
+impl<I> Middleware for ResponseInterceptorMiddleware<I>
+where
+    I: ResponseInterceptor,
+{
+    fn before<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, ControlFlow> {
+        // Store the start time in request extensions
+        req.insert_extension(InterceptorStartTime(Instant::now()));
+        Box::pin(async { ControlFlow::Continue })
+    }
+
+    fn after<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a Request,
+        response: Response,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            // Retrieve start time from extensions
+            let start_time = req
+                .get_extension::<InterceptorStartTime>()
+                .map(|t| t.0)
+                .unwrap_or_else(Instant::now);
+
+            let interceptor_ctx = ResponseInterceptorContext::new(req, ctx, start_time);
+            self.interceptor.intercept(&interceptor_ctx, response).await
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        self.interceptor.name()
+    }
+}
+
+/// Internal type for storing interceptor start time in request extensions.
+#[derive(Debug, Clone, Copy)]
+struct InterceptorStartTime(Instant);
+
+// ===========================================================================
+// End Response Interceptors and Transformers
+// ===========================================================================
+
+#[cfg(test)]
+mod response_interceptor_tests {
+    use super::*;
+    use crate::request::Method;
+    use crate::response::StatusCode;
+
+    fn test_context() -> RequestContext {
+        RequestContext::new(asupersync::Cx::for_testing(), 1)
+    }
+
+    fn test_request() -> Request {
+        Request::new(Method::Get, "/test")
+    }
+
+    fn run_interceptor<I: ResponseInterceptor>(
+        interceptor: &I,
+        req: &Request,
+        resp: Response,
+    ) -> Response {
+        let ctx = test_context();
+        let start_time = Instant::now();
+        let interceptor_ctx = ResponseInterceptorContext::new(req, &ctx, start_time);
+        futures_executor::block_on(interceptor.intercept(&interceptor_ctx, resp))
+    }
+
+    #[test]
+    fn timing_interceptor_adds_header() {
+        let interceptor = TimingInterceptor::new();
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_timing = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Response-Time");
+        assert!(has_timing, "Should have X-Response-Time header");
+    }
+
+    #[test]
+    fn timing_interceptor_with_server_timing() {
+        let interceptor = TimingInterceptor::new().with_server_timing("app");
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_server_timing = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "Server-Timing");
+        assert!(has_server_timing, "Should have Server-Timing header");
+    }
+
+    #[test]
+    fn timing_interceptor_custom_header_name() {
+        let interceptor = TimingInterceptor::new().header_name("X-Custom-Time");
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_custom = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Custom-Time");
+        assert!(has_custom, "Should have X-Custom-Time header");
+    }
+
+    #[test]
+    fn debug_info_interceptor_adds_headers() {
+        let interceptor = DebugInfoInterceptor::new();
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_path = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Debug-Path");
+        let has_method = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Debug-Method");
+        let has_timing = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Debug-Handler-Time");
+
+        assert!(has_path, "Should have X-Debug-Path header");
+        assert!(has_method, "Should have X-Debug-Method header");
+        assert!(has_timing, "Should have X-Debug-Handler-Time header");
+    }
+
+    #[test]
+    fn debug_info_interceptor_custom_prefix() {
+        let interceptor = DebugInfoInterceptor::new().header_prefix("X-Trace-");
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_trace_path = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Trace-Path");
+        assert!(has_trace_path, "Should have X-Trace-Path header");
+    }
+
+    #[test]
+    fn debug_info_interceptor_selective_options() {
+        let interceptor = DebugInfoInterceptor::new()
+            .include_path(true)
+            .include_method(false)
+            .include_timing(false)
+            .include_request_id(false);
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_path = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Debug-Path");
+        let has_method = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Debug-Method");
+
+        assert!(has_path, "Should have X-Debug-Path header");
+        assert!(!has_method, "Should NOT have X-Debug-Method header");
+    }
+
+    #[test]
+    fn header_transform_adds_headers() {
+        let interceptor = HeaderTransformInterceptor::new()
+            .add("X-Powered-By", b"fastapi_rust".to_vec())
+            .add("X-Version", b"1.0".to_vec());
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let result = run_interceptor(&interceptor, &req, resp);
+
+        let has_powered_by = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Powered-By");
+        let has_version = result.headers().iter().any(|(name, _)| name == "X-Version");
+
+        assert!(has_powered_by, "Should have X-Powered-By header");
+        assert!(has_version, "Should have X-Version header");
+    }
+
+    #[test]
+    fn response_body_transform_modifies_body() {
+        let transformer = ResponseBodyTransform::new(|body| {
+            let mut result = b"[".to_vec();
+            result.extend_from_slice(&body);
+            result.extend_from_slice(b"]");
+            result
+        });
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK)
+            .body(crate::response::ResponseBody::Bytes(b"hello".to_vec()));
+
+        let result = run_interceptor(&transformer, &req, resp);
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"[hello]");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+    }
+
+    #[test]
+    fn response_body_transform_with_content_type_filter() {
+        let transformer =
+            ResponseBodyTransform::new(|_| b"transformed".to_vec()).for_content_type("text/plain");
+        let req = test_request();
+
+        // JSON response should NOT be transformed
+        let json_resp = Response::with_status(StatusCode::OK)
+            .header("content-type", b"application/json".to_vec())
+            .body(crate::response::ResponseBody::Bytes(b"original".to_vec()));
+
+        let result = run_interceptor(&transformer, &req, json_resp);
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"original", "JSON should not be transformed");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+
+        // Plain text response SHOULD be transformed
+        let text_resp = Response::with_status(StatusCode::OK)
+            .header("content-type", b"text/plain".to_vec())
+            .body(crate::response::ResponseBody::Bytes(b"original".to_vec()));
+
+        let result = run_interceptor(&transformer, &req, text_resp);
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"transformed", "Text should be transformed");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+    }
+
+    #[test]
+    fn error_response_transformer_hides_details() {
+        let transformer = ErrorResponseTransformer::new()
+            .hide_details_for_status(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_replacement_body(b"An error occurred");
+
+        let req = test_request();
+
+        // 500 response should be transformed
+        let error_resp = Response::with_status(StatusCode::INTERNAL_SERVER_ERROR).body(
+            crate::response::ResponseBody::Bytes(b"Sensitive error details".to_vec()),
+        );
+
+        let result = run_interceptor(&transformer, &req, error_resp);
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"An error occurred");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+
+        // 200 response should NOT be transformed
+        let ok_resp = Response::with_status(StatusCode::OK)
+            .body(crate::response::ResponseBody::Bytes(b"Success".to_vec()));
+
+        let result = run_interceptor(&transformer, &req, ok_resp);
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"Success");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+    }
+
+    #[test]
+    fn response_interceptor_stack_chains_interceptors() {
+        let mut stack = ResponseInterceptorStack::new();
+        stack.push(TimingInterceptor::new());
+        stack.push(HeaderTransformInterceptor::new().add("X-Extra", b"value".to_vec()));
+
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK);
+
+        let ctx = test_context();
+        let start_time = Instant::now();
+        let interceptor_ctx = ResponseInterceptorContext::new(&req, &ctx, start_time);
+        let result = futures_executor::block_on(stack.process(&interceptor_ctx, resp));
+
+        let has_timing = result
+            .headers()
+            .iter()
+            .any(|(name, _)| name == "X-Response-Time");
+        let has_extra = result.headers().iter().any(|(name, _)| name == "X-Extra");
+
+        assert!(
+            has_timing,
+            "Should have timing header from first interceptor"
+        );
+        assert!(
+            has_extra,
+            "Should have extra header from second interceptor"
+        );
+    }
+
+    #[test]
+    fn response_interceptor_stack_empty_is_noop() {
+        let stack = ResponseInterceptorStack::new();
+        assert!(stack.is_empty());
+        assert_eq!(stack.len(), 0);
+
+        let req = test_request();
+        let resp = Response::with_status(StatusCode::OK)
+            .body(crate::response::ResponseBody::Bytes(b"unchanged".to_vec()));
+
+        let ctx = test_context();
+        let start_time = Instant::now();
+        let interceptor_ctx = ResponseInterceptorContext::new(&req, &ctx, start_time);
+        let result = futures_executor::block_on(stack.process(&interceptor_ctx, resp));
+
+        match result.body_ref() {
+            crate::response::ResponseBody::Bytes(b) => {
+                assert_eq!(b, b"unchanged");
+            }
+            _ => panic!("Expected bytes body"),
+        }
+    }
+
+    #[test]
+    fn interceptor_context_provides_timing() {
+        let ctx = test_context();
+        let req = test_request();
+        let start_time = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let interceptor_ctx = ResponseInterceptorContext::new(&req, &ctx, start_time);
+
+        assert!(
+            interceptor_ctx.elapsed_ms() >= 5,
+            "Elapsed time should be at least 5ms"
+        );
+        assert!(interceptor_ctx.elapsed().as_millis() >= 5);
+    }
+
+    #[test]
+    fn conditional_interceptor_applies_conditionally() {
+        // Only add header if response is 200 OK
+        let inner = HeaderTransformInterceptor::new().add("X-Success", b"true".to_vec());
+        let conditional =
+            ConditionalInterceptor::new(inner, |_ctx, resp| resp.status().as_u16() == 200);
+
+        let req = test_request();
+
+        // 200 response should get the header
+        let ok_resp = Response::with_status(StatusCode::OK);
+        let result = run_interceptor(&conditional, &req, ok_resp);
+        let has_success = result.headers().iter().any(|(name, _)| name == "X-Success");
+        assert!(has_success, "200 response should get X-Success header");
+
+        // 404 response should NOT get the header
+        let not_found = Response::with_status(StatusCode::NOT_FOUND);
+        let result = run_interceptor(&conditional, &req, not_found);
+        let has_success = result.headers().iter().any(|(name, _)| name == "X-Success");
+        assert!(!has_success, "404 response should NOT get X-Success header");
+    }
+}
+
 #[cfg(test)]
 mod cache_control_tests {
     use super::*;

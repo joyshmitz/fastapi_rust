@@ -111,14 +111,17 @@ pub use extract::{
     XRequestId, constant_time_eq, constant_time_str_eq, snake_to_header_case,
 };
 pub use middleware::{
-    AddResponseHeader, BoxFuture, CompositeKeyExtractor, ControlFlow, Cors, CorsConfig, CsrfConfig,
-    CsrfMiddleware, CsrfMode, CsrfToken, Handler, HeaderKeyExtractor, HttpsRedirectConfig,
-    HttpsRedirectMiddleware, InspectionVerbosity, IpKeyExtractor, KeyExtractor, Layer, Layered,
-    Middleware, MiddlewareStack, NoopMiddleware, OriginPattern, PathKeyExtractor, PathPrefixFilter,
-    RateLimitAlgorithm, RateLimitBuilder, RateLimitConfig, RateLimitMiddleware, RateLimitResult,
-    ReferrerPolicy, RequestId, RequestIdConfig, RequestIdMiddleware, RequestInspectionMiddleware,
-    RequestResponseLogger, RequireHeader, SecurityHeaders, SecurityHeadersConfig,
-    TraceRejectionMiddleware, XFrameOptions,
+    AddResponseHeader, BoxFuture, CompositeKeyExtractor, ConditionalInterceptor, ControlFlow, Cors,
+    CorsConfig, CsrfConfig, CsrfMiddleware, CsrfMode, CsrfToken, DebugInfoInterceptor,
+    ErrorResponseTransformer, Handler, HeaderKeyExtractor, HeaderTransformInterceptor,
+    HttpsRedirectConfig, HttpsRedirectMiddleware, InspectionVerbosity, IpKeyExtractor,
+    KeyExtractor, Layer, Layered, Middleware, MiddlewareStack, NoopMiddleware, OriginPattern,
+    PathKeyExtractor, PathPrefixFilter, RateLimitAlgorithm, RateLimitBuilder, RateLimitConfig,
+    RateLimitMiddleware, RateLimitResult, ReferrerPolicy, RequestId, RequestIdConfig,
+    RequestIdMiddleware, RequestInspectionMiddleware, RequestResponseLogger, RequireHeader,
+    ResponseBodyTransform, ResponseInterceptor, ResponseInterceptorContext,
+    ResponseInterceptorMiddleware, ResponseInterceptorStack, SecurityHeaders,
+    SecurityHeadersConfig, TimingInterceptor, TraceRejectionMiddleware, XFrameOptions,
 };
 #[cfg(feature = "compression")]
 pub use middleware::{CompressionConfig, CompressionMiddleware};
