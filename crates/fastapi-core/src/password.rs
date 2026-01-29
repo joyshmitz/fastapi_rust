@@ -315,30 +315,60 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 // Utility functions
 // ============================================================
 
-/// Generate random salt bytes using simple entropy mixing.
+/// Generate random salt bytes from the OS entropy source.
+///
+/// Uses `/dev/urandom` on Unix systems for cryptographically secure randomness.
+/// Falls back to entropy mixing from multiple sources if `/dev/urandom` is unavailable.
 fn generate_salt(len: usize) -> Vec<u8> {
+    // Try /dev/urandom first (available on Linux, macOS, BSDs)
+    if let Ok(bytes) = read_urandom(len) {
+        return bytes;
+    }
+
+    // Fallback: mix multiple entropy sources via SHA-256
+    fallback_salt(len)
+}
+
+/// Read `len` bytes from `/dev/urandom`.
+fn read_urandom(len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Fallback salt generation using entropy mixing (non-cryptographic).
+///
+/// Only used when `/dev/urandom` is unavailable.
+fn fallback_salt(len: usize) -> Vec<u8> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let mut salt = Vec::with_capacity(len);
-    let seed = SystemTime::now()
+    let time_seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
 
-    // Mix multiple entropy sources
-    for i in 0..len {
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let pid = std::process::id();
+
+    // Generate enough entropy by hashing diverse inputs through SHA-256
+    let mut entropy = Vec::with_capacity(len + 64);
+    for i in 0u64..(len as u64 / 32 + 1) {
         let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
-        (i as u64).hash(&mut hasher);
-        // Use address of stack variable as additional entropy
-        let stack_var = i;
-        (&stack_var as *const usize as u64).hash(&mut hasher);
+        time_seed.hash(&mut hasher);
+        i.hash(&mut hasher);
+        pid.hash(&mut hasher);
+        thread_id.hash(&mut hasher);
         let h = hasher.finish();
-        salt.push((h >> (8 * (i % 8))) as u8);
+        // Feed hash output into SHA-256 for better distribution
+        let block = sha256(&h.to_le_bytes());
+        entropy.extend_from_slice(&block);
     }
-    salt
+    entropy.truncate(len);
+    entropy
 }
 
 /// Timing-safe byte comparison.

@@ -12281,7 +12281,7 @@ mod rate_limit_tests {
     fn etag_middleware_generates_etag_for_get() {
         let mw = ETagMiddleware::new();
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Get, "/resource");
+        let req = Request::new(crate::request::Method::Get, "/resource");
 
         // Create response with body
         let response = Response::ok()
@@ -12309,7 +12309,7 @@ mod rate_limit_tests {
         let ctx = test_context();
 
         // First request to get the ETag
-        let mut req1 = Request::new(crate::request::Method::Get, "/resource");
+        let req1 = Request::new(crate::request::Method::Get, "/resource");
         let body = br#"{"status":"ok"}"#.to_vec();
         let response1 = Response::ok().body(ResponseBody::Bytes(body.clone()));
         let response1 = futures_executor::block_on(mw.after(&ctx, &req1, response1));
@@ -12357,7 +12357,7 @@ mod rate_limit_tests {
         let config = ETagConfig::new().weak(true);
         let mw = ETagMiddleware::with_config(config);
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Get, "/resource");
+        let req = Request::new(crate::request::Method::Get, "/resource");
 
         let response = Response::ok().body(ResponseBody::Bytes(b"data".to_vec()));
         let response = futures_executor::block_on(mw.after(&ctx, &req, response));
@@ -12376,7 +12376,7 @@ mod rate_limit_tests {
     fn etag_middleware_skips_post_requests() {
         let mw = ETagMiddleware::new();
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Post, "/resource");
+        let req = Request::new(crate::request::Method::Post, "/resource");
 
         let response = Response::ok().body(ResponseBody::Bytes(b"created".to_vec()));
         let response = futures_executor::block_on(mw.after(&ctx, &req, response));
@@ -12393,7 +12393,7 @@ mod rate_limit_tests {
     fn etag_middleware_handles_head_requests() {
         let mw = ETagMiddleware::new();
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Head, "/resource");
+        let req = Request::new(crate::request::Method::Head, "/resource");
 
         let response = Response::ok().body(ResponseBody::Bytes(b"data".to_vec()));
         let response = futures_executor::block_on(mw.after(&ctx, &req, response));
@@ -12411,7 +12411,7 @@ mod rate_limit_tests {
         let config = ETagConfig::new().mode(ETagMode::Disabled);
         let mw = ETagMiddleware::with_config(config);
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Get, "/resource");
+        let req = Request::new(crate::request::Method::Get, "/resource");
 
         let response = Response::ok().body(ResponseBody::Bytes(b"data".to_vec()));
         let response = futures_executor::block_on(mw.after(&ctx, &req, response));
@@ -12429,7 +12429,7 @@ mod rate_limit_tests {
         let config = ETagConfig::new().min_size(1000);
         let mw = ETagMiddleware::with_config(config);
         let ctx = test_context();
-        let mut req = Request::new(crate::request::Method::Get, "/resource");
+        let req = Request::new(crate::request::Method::Get, "/resource");
 
         // Small body below min_size
         let response = Response::ok().body(ResponseBody::Bytes(b"small".to_vec()));
@@ -12484,7 +12484,7 @@ mod rate_limit_tests {
         let ctx = test_context();
 
         // Get the strong ETag
-        let mut req1 = Request::new(crate::request::Method::Get, "/resource");
+        let req1 = Request::new(crate::request::Method::Get, "/resource");
         let body = b"test data".to_vec();
         let response1 = Response::ok().body(ResponseBody::Bytes(body.clone()));
         let response1 = futures_executor::block_on(mw.after(&ctx, &req1, response1));

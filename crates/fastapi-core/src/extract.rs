@@ -5702,7 +5702,7 @@ mod state_tests {
         const ITEMS_PER_PRODUCER: usize = 100;
 
         // Simple monotonic counter to simulate queue indices
-        let head = Arc::new(AtomicUsize::new(0));
+        let _head = Arc::new(AtomicUsize::new(0));
         let tail = Arc::new(AtomicUsize::new(0));
         let produced_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -5829,7 +5829,7 @@ mod state_tests {
         let handles: Vec<_> = (0..NUM_READERS)
             .map(|_| {
                 let state = app_state.clone();
-                let expected_medium = medium.clone();
+                let _expected_medium = medium.clone();
                 let expected_large = large.clone();
                 let errors = error_count.clone();
                 thread::spawn(move || {
