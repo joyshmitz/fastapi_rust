@@ -1,0 +1,11 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+FastAPI Rust v1.0.0
+High performance, easy to learn, fast to code
+
+Server: http://localhost:8000
+Docs:   http://localhost:8000/docs
+ReDoc:  http://localhost:8000/redoc
+OpenAPI: http://localhost:8000/openapi.json

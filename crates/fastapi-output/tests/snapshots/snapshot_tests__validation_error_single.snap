@@ -1,0 +1,8 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: result.plain
+---
+Validation Error (1 error(s)):
+
+  - body.email: value is not a valid email address
+    [type: value_error.email]

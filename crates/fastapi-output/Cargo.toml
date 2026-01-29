@@ -28,6 +28,7 @@ full = ["rich", "rich_rust/full"]
 # For testing
 serial_test = "3.2"
 proptest = "1"
+insta = { version = "1.34", features = ["redactions"] }
 
 [lints]
 workspace = true

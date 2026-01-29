@@ -1,0 +1,14 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Test Results
+------------
+Module: api::users
+  PASS test_create_user
+  FAIL test_validation
+    -> assertion failed: expected 200, got 422
+  SKIP test_auth
+
+Summary: 1 passed, 1 failed, 1 skipped (3 total)
+Progress: [========!!!!!!!!--------] 1/3 passed, 1 failed, 1 skipped

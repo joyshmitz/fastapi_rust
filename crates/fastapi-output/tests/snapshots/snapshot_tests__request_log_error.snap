@@ -1,0 +1,5 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+DELETE  /api/users/42 500 150.00ms

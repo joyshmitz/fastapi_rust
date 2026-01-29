@@ -1,0 +1,13 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Middleware Stack (5 layers):
+  1. CorsMiddleware
+  2. AuthMiddleware
+  3. RateLimitMiddleware
+  4. LoggingMiddleware
+  5. [Handler]
+
+Request flow: 1 -> 2 -> 3 -> 4 -> 5
+Response flow: 5 -> 4 -> 3 -> 2 -> 1

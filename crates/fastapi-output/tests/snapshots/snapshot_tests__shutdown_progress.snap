@@ -1,0 +1,9 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Shutdown Progress
+-----------------
+Phase: Grace Period
+Connections: none
+In-flight requests: 5

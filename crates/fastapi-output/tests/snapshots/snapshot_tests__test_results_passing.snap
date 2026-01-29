@@ -1,0 +1,13 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Test Results
+------------
+Module: api::users
+  PASS test_create_user
+  PASS test_get_user
+  PASS test_list_users
+
+Summary: 3 passed, 0 failed, 0 skipped (3 total)
+Progress: [========================] 3/3 passed

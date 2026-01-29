@@ -1,0 +1,7 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: result.plain
+---
+HTTP 401 Unauthorized
+Detail: Invalid or expired token
+Request: GET /api/protected

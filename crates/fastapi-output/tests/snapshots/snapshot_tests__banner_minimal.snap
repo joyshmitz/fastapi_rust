@@ -1,0 +1,8 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+FastAPI Rust v0.1.0
+High performance, easy to learn, fast to code
+
+Server: http://0.0.0.0:3000

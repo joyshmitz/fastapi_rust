@@ -1,0 +1,11 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Registered Routes
+-----------------
+Method  Path  Handler  Tags
+GET  /api/v1/users  list_users  [users, api-v1]
+GET  /api/v1/posts  list_posts  [posts, api-v1]
+
+Total: 2 route(s)

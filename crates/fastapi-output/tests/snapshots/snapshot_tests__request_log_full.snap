@@ -1,0 +1,5 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+POST    /api/users?validate=true 201 45.00ms

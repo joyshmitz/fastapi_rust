@@ -1,0 +1,8 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: result.plain
+---
+HTTP 422 Unprocessable Entity
+Detail: Validation failed
+Code: VALIDATION_ERROR
+Request: POST /api/users

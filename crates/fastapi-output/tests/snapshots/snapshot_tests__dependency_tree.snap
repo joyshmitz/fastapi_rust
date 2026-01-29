@@ -1,0 +1,10 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: output
+---
+Dependency Tree
+---------------
+\- Handler (scope: request)
+  \- UserService (scope: request)
+    +- DatabasePool (scope: singleton)
+    \- RedisCache (scope: singleton)

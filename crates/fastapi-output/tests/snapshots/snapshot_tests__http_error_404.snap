@@ -1,0 +1,7 @@
+---
+source: crates/fastapi-output/tests/snapshot_tests.rs
+expression: result.plain
+---
+HTTP 404 Not Found
+Detail: User not found
+Request: GET /api/users/999
