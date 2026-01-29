@@ -544,40 +544,35 @@ fn generate_field_validation(field: &Field, validators: &FieldValidators) -> Tok
         });
     }
 
-    // Regex validation
+    // Regex validation with cached compiled regex
     if let Some(ref pattern) = validators.regex {
+        // Validate the regex pattern at compile time
+        if let Err(e) = regex::Regex::new(pattern) {
+            let msg = format!("Invalid regex pattern in #[validate(regex = \"{pattern}\")]: {e}");
+            return quote! { compile_error!(#msg); };
+        }
+
         validations.push(quote! {
             {
-                // Compile regex at runtime - could be optimized with lazy_static in user code
-                match regex::Regex::new(#pattern) {
-                    Ok(re) => {
-                        if !re.is_match(&self.#field_name) {
-                            errors.push(
-                                fastapi_core::ValidationError::new(
-                                    fastapi_core::error::error_types::STRING_PATTERN_MISMATCH,
-                                    vec![
-                                        fastapi_core::error::LocItem::field("body"),
-                                        fastapi_core::error::LocItem::field(#field_name_str),
-                                    ],
-                                )
-                                .with_msg("String should match pattern")
-                                .with_ctx_value("pattern", serde_json::json!(#pattern))
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        // Invalid regex pattern - this is a programmer error
-                        errors.push(
-                            fastapi_core::ValidationError::new(
-                                fastapi_core::error::error_types::VALUE_ERROR,
-                                vec![
-                                    fastapi_core::error::LocItem::field("body"),
-                                    fastapi_core::error::LocItem::field(#field_name_str),
-                                ],
-                            )
-                            .with_msg("Invalid regex pattern in validation rule")
-                        );
-                    }
+                // Use OnceLock to compile regex once and cache for all validations
+                use std::sync::OnceLock;
+                static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+                let re = PATTERN.get_or_init(|| {
+                    regex::Regex::new(#pattern)
+                        .expect("regex validated at compile time")
+                });
+                if !re.is_match(&self.#field_name) {
+                    errors.push(
+                        fastapi_core::ValidationError::new(
+                            fastapi_core::error::error_types::STRING_PATTERN_MISMATCH,
+                            vec![
+                                fastapi_core::error::LocItem::field("body"),
+                                fastapi_core::error::LocItem::field(#field_name_str),
+                            ],
+                        )
+                        .with_msg("String should match pattern")
+                        .with_ctx_value("pattern", serde_json::json!(#pattern))
+                    );
                 }
             }
         });
