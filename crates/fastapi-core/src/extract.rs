@@ -7176,7 +7176,7 @@ impl BackgroundTasks {
     ///
     /// This method does NOT provide error isolation. If a task panics,
     /// subsequent tasks will not run. For panic isolation, use
-    /// [`execute_with_panic_isolation()`] instead.
+    /// [`Self::execute_with_panic_isolation()`] instead.
     ///
     /// Since tasks run after the response is sent, panics do not affect
     /// the HTTP response that was already delivered to the client.
