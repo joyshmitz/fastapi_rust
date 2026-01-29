@@ -60,6 +60,7 @@ mod dependency;
 pub mod docs;
 pub mod error;
 mod extract;
+pub mod fixtures;
 pub mod health;
 pub mod logging;
 pub mod middleware;
@@ -157,6 +158,12 @@ pub use testing::{
 // Re-export coverage utilities
 pub use coverage::{
     BranchHits, CoverageConfig, CoverageReport, CoverageTracker, EndpointHits, OutputFormat,
+};
+
+// Re-export fixture factories
+pub use fixtures::{
+    AuthFactory, CommonFixtures, JsonArrayFactory, JsonFactory, JsonObjectFactory, JwtFactory,
+    RequestFactory, ResponseFactory, UserFactory,
 };
 
 // Re-export logging utilities
