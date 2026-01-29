@@ -91,7 +91,7 @@ pub use range::{
     ByteRange, IfRangeResult, RangeError, RangeSpec, accept_ranges_bytes, check_if_range,
     content_range_unsatisfiable, parse_range_header, parse_range_spec, supports_ranges,
 };
-pub use response::{ChunkedEncoder, ResponseWrite, ResponseWriter};
+pub use response::{ChunkedEncoder, ResponseWrite, ResponseWriter, Trailers};
 pub use server::{
     AppServeExt, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_KEEP_ALIVE_TIMEOUT_SECS,
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_REQUESTS_PER_CONNECTION, DEFAULT_READ_BUFFER_SIZE,

@@ -72,6 +72,7 @@ pub mod shutdown;
 pub mod sse;
 pub mod static_files;
 pub mod testing;
+pub mod versioning;
 
 #[cfg(feature = "proptest")]
 pub mod proptest;
@@ -205,6 +206,9 @@ pub use shutdown::{
 };
 
 // Re-export routing utilities
+// Re-export versioning utilities
+pub use versioning::{ApiVersion, VersionConfig, VersionStrategy};
+
 pub use routing::{
     Converter, ParamInfo, PathSegment, RouteLookup, RoutePattern, RouteTable, TrailingSlashMode,
     format_allow_header,
