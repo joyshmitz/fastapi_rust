@@ -72,6 +72,153 @@
 //! | `compression` | Response compression middleware (gzip via flate2) |
 //! | `proptest` | Property-based testing support |
 
+//!
+//! # Cookbook
+//!
+//! Common patterns for building APIs with fastapi_rust.
+//!
+//! ## JSON CRUD Handler
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! #[get("/items/{id}")]
+//! async fn get_item(cx: &Cx, id: Path<i64>, state: State<AppState>) -> Result<Json<Item>, HttpError> {
+//!     let item = state.db.find(id.0).await?;
+//!     Ok(Json(item))
+//! }
+//! ```
+//!
+//! ## Pagination
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! #[get("/items")]
+//! async fn list_items(cx: &Cx, page: Pagination) -> Json<Page<Item>> {
+//!     // page.page() returns current page (default: 1)
+//!     // page.per_page() returns items per page (default: 20, max: 100)
+//!     let items = db.list(page.offset(), page.limit()).await;
+//!     Json(Page::new(items, total_count, page.page(), page.per_page()))
+//! }
+//! ```
+//!
+//! ## Bearer Token Authentication
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! #[get("/protected")]
+//! async fn protected(cx: &Cx, token: BearerToken) -> Json<UserInfo> {
+//!     let user = verify_jwt(token.token()).await?;
+//!     Json(user)
+//! }
+//! ```
+//!
+//! ## Background Tasks
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! #[post("/send-email")]
+//! async fn send_email(cx: &Cx, body: Json<EmailRequest>, tasks: BackgroundTasks) -> StatusCode {
+//!     tasks.add(move || {
+//!         // Runs after response is sent
+//!         email_service::send(&body.to, &body.subject, &body.body);
+//!     });
+//!     StatusCode::ACCEPTED
+//! }
+//! ```
+//!
+//! ## CORS + Rate Limiting Middleware
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! let app = App::new()
+//!     .middleware(Cors::new().allow_any_origin(true).allow_credentials(true))
+//!     .middleware(RateLimitBuilder::new().max_requests(100).window_secs(60).build());
+//! ```
+//!
+//! ## Error Handling
+//!
+//! ```ignore
+//! use fastapi::prelude::*;
+//!
+//! // Custom errors implement IntoResponse automatically via HttpError
+//! fn not_found(resource: &str, id: u64) -> HttpError {
+//!     HttpError::not_found(format!("{} {} not found", resource, id))
+//! }
+//! ```
+//!
+//! # Migrating from Python FastAPI
+//!
+//! ## Key Differences
+//!
+//! | Python FastAPI | fastapi_rust | Notes |
+//! |----------------|--------------|-------|
+//! | `@app.get("/")` | `#[get("/")]` | Proc macro instead of decorator |
+//! | `async def handler(item: Item)` | `async fn handler(cx: &Cx, item: Json<Item>)` | Explicit `Cx` context + typed extractors |
+//! | `Depends(get_db)` | `Depends<DbPool>` | Type-based DI, not function-based |
+//! | `HTTPException(404)` | `HttpError::not_found(msg)` | Typed error constructors |
+//! | `BackgroundTasks` | `BackgroundTasks` | Same concept, different API |
+//! | `Query(q: str)` | `Query<SearchParams>` | Struct-based query extraction |
+//! | `Path(item_id: int)` | `Path<i64>` | Type-safe path parameters |
+//! | `Body(...)` | `Json<T>` | Explicit JSON extraction |
+//! | `Response(status_code=201)` | `StatusCode::CREATED` | Type-safe status codes |
+//!
+//! ## Async Runtime
+//!
+//! Python FastAPI uses `asyncio`. fastapi_rust uses `asupersync`, which provides:
+//! - **Structured concurrency**: Request handlers run in regions
+//! - **Cancel-correctness**: Graceful cancellation via checkpoints
+//! - **Budgeted timeouts**: Request timeouts via budget exhaustion
+//!
+//! Every handler receives `&Cx` as its first parameter for async context.
+//!
+//! ## Dependency Injection
+//!
+//! Python uses function-based DI with `Depends(func)`. Rust uses trait-based DI:
+//!
+//! ```ignore
+//! // Python:
+//! // async def get_db():
+//! //     yield db_session
+//! //
+//! // @app.get("/")
+//! // async def handler(db: Session = Depends(get_db)):
+//!
+//! // Rust:
+//! impl FromDependency for DbPool {
+//!     async fn from_dependency(cx: &Cx, cache: &DependencyCache) -> Result<Self, HttpError> {
+//!         Ok(DbPool::acquire(cx).await?)
+//!     }
+//! }
+//!
+//! #[get("/")]
+//! async fn handler(cx: &Cx, db: Depends<DbPool>) -> Json<Data> { ... }
+//! ```
+//!
+//! ## Validation
+//!
+//! Python uses Pydantic models. Rust uses `#[derive(Validate)]`:
+//!
+//! ```ignore
+//! // Python:
+//! // class Item(BaseModel):
+//! //     name: str = Field(..., min_length=1, max_length=100)
+//! //     price: float = Field(..., gt=0)
+//!
+//! // Rust:
+//! #[derive(Validate)]
+//! struct Item {
+//!     #[validate(min_length = 1, max_length = 100)]
+//!     name: String,
+//!     #[validate(range(min = 0.01))]
+//!     price: f64,
+//! }
+//! ```
+
 #![forbid(unsafe_code)]
 // Design doc at PROPOSED_RUST_ARCHITECTURE.md (not embedded - too many conceptual code examples)
 
