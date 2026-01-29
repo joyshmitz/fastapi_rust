@@ -1160,22 +1160,44 @@ impl Router {
     }
 
     fn match_node<'a>(&'a self, path: &'a str) -> Option<(&'a Node, Vec<(&'a str, &'a str)>)> {
-        let ranges = segment_ranges(path);
-        let mut segments: Vec<&'a str> = Vec::with_capacity(ranges.len());
-        for (start, end) in &ranges {
-            segments.push(&path[*start..*end]);
+        // Use zero-allocation iterator for segment ranges
+        let mut range_iter = SegmentRangeIter::new(path);
+
+        // Collect ranges only once (needed for path converter lookahead)
+        // Use SmallVec-style optimization: stack-allocate for typical paths
+        let mut ranges_buf: [(usize, usize); 16] = [(0, 0); 16];
+        let mut ranges_vec: Vec<(usize, usize)> = Vec::new();
+        let mut range_count = 0;
+
+        for range in &mut range_iter {
+            if range_count < 16 {
+                ranges_buf[range_count] = range;
+            } else if range_count == 16 {
+                // Overflow to heap
+                ranges_vec = ranges_buf.to_vec();
+                ranges_vec.push(range);
+            } else {
+                ranges_vec.push(range);
+            }
+            range_count += 1;
         }
+
+        let ranges: &[(usize, usize)] = if range_count <= 16 {
+            &ranges_buf[..range_count]
+        } else {
+            &ranges_vec
+        };
+
         let last_end = ranges.last().map_or(0, |(_, end)| *end);
         let mut params = Vec::new();
         let mut node = &self.root;
-        let mut idx = 0;
 
-        while idx < segments.len() {
-            let segment = segments[idx];
+        for &(start, end) in ranges {
+            let segment = &path[start..end];
+
             // Try static match first
             if let Some(child) = node.find_static(segment) {
                 node = child;
-                idx += 1;
                 continue;
             }
 
@@ -1183,16 +1205,15 @@ impl Router {
             if let Some(child) = node.find_param() {
                 if let Some(ref info) = child.param {
                     if info.converter == Converter::Path {
-                        let start = ranges[idx].0;
                         let value = &path[start..last_end];
                         params.push((info.name.as_str(), value));
                         node = child;
-                        break;
+                        // Path converter consumes rest of path
+                        return Some((node, params));
                     }
                     if info.converter.matches(segment) {
                         params.push((info.name.as_str(), segment));
                         node = child;
-                        idx += 1;
                         continue;
                     }
                 }
@@ -1272,25 +1293,48 @@ fn validate_path_segments(
     Ok(())
 }
 
-fn segment_ranges(path: &str) -> Vec<(usize, usize)> {
-    let bytes = path.as_bytes();
-    let mut ranges = Vec::new();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        while idx < bytes.len() && bytes[idx] == b'/' {
-            idx += 1;
+// Note: segment_ranges was replaced by SegmentRangeIter for zero-allocation path matching.
+
+/// Zero-allocation iterator over path segment ranges.
+struct SegmentRangeIter<'a> {
+    bytes: &'a [u8],
+    idx: usize,
+}
+
+impl<'a> SegmentRangeIter<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            bytes: path.as_bytes(),
+            idx: 0,
         }
-        if idx >= bytes.len() {
-            break;
-        }
-        let start = idx;
-        while idx < bytes.len() && bytes[idx] != b'/' {
-            idx += 1;
-        }
-        let end = idx;
-        ranges.push((start, end));
     }
-    ranges
+}
+
+impl Iterator for SegmentRangeIter<'_> {
+    type Item = (usize, usize);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        // Skip leading slashes
+        while self.idx < self.bytes.len() && self.bytes[self.idx] == b'/' {
+            self.idx += 1;
+        }
+        if self.idx >= self.bytes.len() {
+            return None;
+        }
+        let start = self.idx;
+        // Find end of segment
+        while self.idx < self.bytes.len() && self.bytes[self.idx] != b'/' {
+            self.idx += 1;
+        }
+        Some((start, self.idx))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Estimate: at most one segment per 2 bytes (e.g., "/a/b/c")
+        let remaining = self.bytes.len().saturating_sub(self.idx);
+        (0, Some(remaining / 2 + 1))
+    }
 }
 
 fn paths_conflict(a: &str, b: &str) -> bool {
