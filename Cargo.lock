@@ -533,6 +533,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm 0.28.1",
  "insta",
+ "parking_lot",
  "proptest",
  "regex",
  "rich_rust",
