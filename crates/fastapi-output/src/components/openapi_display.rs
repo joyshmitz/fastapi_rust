@@ -12,6 +12,24 @@
 
 use crate::mode::OutputMode;
 use crate::themes::FastApiTheme;
+
+/// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 boundaries.
+/// Appends "..." if truncated.
+fn truncate_str(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let target = max_bytes.saturating_sub(3);
+    // Find the last valid UTF-8 char boundary at or before `target`
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= target)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", &s[..end])
+}
+
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_BOLD: &str = "\x1b[1m";
 
@@ -468,11 +486,7 @@ impl OpenApiDisplay {
                 continue;
             }
 
-            let path = if endpoint.path.len() > path_width {
-                format!("{}...", &endpoint.path[..path_width - 3])
-            } else {
-                endpoint.path.clone()
-            };
+            let path = truncate_str(&endpoint.path, path_width);
 
             let summary_text = endpoint.summary.as_deref().unwrap_or("-");
 
@@ -639,11 +653,7 @@ impl OpenApiDisplay {
 
         // Description if present
         if let Some(desc) = &summary.description {
-            let desc_truncated = if desc.len() > table_width - 4 {
-                format!("{}...", &desc[..table_width - 7])
-            } else {
-                desc.clone()
-            };
+            let desc_truncated = truncate_str(desc, table_width.saturating_sub(4));
             lines.push(format!(
                 "{border}│{ANSI_RESET} {muted}{:width$}{ANSI_RESET} {border}│{ANSI_RESET}",
                 desc_truncated,
@@ -678,21 +688,11 @@ impl OpenApiDisplay {
 
             let method_bg = self.method_color(&endpoint.method).to_ansi_bg();
 
-            let path = if endpoint.path.len() > path_width {
-                format!("{}...", &endpoint.path[..path_width - 3])
-            } else {
-                endpoint.path.clone()
-            };
+            let path = truncate_str(&endpoint.path, path_width);
 
             let summary_text = endpoint.summary.as_ref().map_or_else(
                 || "-".to_string(),
-                |s| {
-                    if s.len() > summary_width {
-                        format!("{}...", &s[..summary_width - 3])
-                    } else {
-                        s.clone()
-                    }
-                },
+                |s| truncate_str(s, summary_width),
             );
 
             // Build indicators
@@ -919,11 +919,7 @@ impl OpenApiDisplay {
                     ));
 
                     if let Some(desc) = &prop.description {
-                        let desc_truncated = if desc.len() > width - 6 {
-                            format!("{}...", &desc[..width - 9])
-                        } else {
-                            desc.clone()
-                        };
+                        let desc_truncated = truncate_str(desc, width.saturating_sub(6));
                         lines.push(format!(
                             "{border}│{ANSI_RESET}    {muted}{desc_truncated}{ANSI_RESET}"
                         ));
