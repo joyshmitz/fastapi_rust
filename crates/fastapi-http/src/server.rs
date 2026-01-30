@@ -215,20 +215,28 @@ impl ServerConfig {
     /// Sets allowed hosts for Host header validation.
     ///
     /// An empty list means "allow any host".
+    /// Patterns are normalized to lowercase for case-insensitive matching.
     #[must_use]
     pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        // Pre-lowercase patterns to avoid allocation during matching
+        self.allowed_hosts = hosts
+            .into_iter()
+            .map(|s| s.into().to_ascii_lowercase())
+            .collect();
         self
     }
 
     /// Adds a single allowed host.
+    ///
+    /// The pattern is normalized to lowercase for case-insensitive matching.
     #[must_use]
     pub fn allow_host(mut self, host: impl Into<String>) -> Self {
-        self.allowed_hosts.push(host.into());
+        // Pre-lowercase pattern to avoid allocation during matching
+        self.allowed_hosts.push(host.into().to_ascii_lowercase());
         self
     }
 
@@ -541,6 +549,7 @@ fn is_allowed_host(host: &HostHeader, allowed_hosts: &[String]) -> bool {
 }
 
 fn host_matches_pattern(host: &HostHeader, pattern: &str) -> bool {
+    // Note: patterns are pre-lowercased at config time, so no allocation needed here
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return false;
@@ -549,12 +558,12 @@ fn host_matches_pattern(host: &HostHeader, pattern: &str) -> bool {
         return true;
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        let suffix = suffix.to_ascii_lowercase();
+        // suffix is already lowercase (pre-processed at config time)
         if host.host == suffix {
             return false;
         }
         return host.host.len() > suffix.len() + 1
-            && host.host.ends_with(suffix.as_str())
+            && host.host.ends_with(suffix)
             && host.host.as_bytes()[host.host.len() - suffix.len() - 1] == b'.';
     }
 
