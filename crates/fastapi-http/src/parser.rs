@@ -767,12 +767,12 @@ impl Parser {
         let mut request = Request::with_version(method, path, http_version);
         request.set_query(query);
 
-        // Set headers
+        // Set headers (using optimized insert to avoid double allocation)
         for header in headers.iter() {
             let header = header?;
             request
                 .headers_mut()
-                .insert(header.name().to_string(), header.value().to_vec());
+                .insert_from_slice(header.name(), header.value());
         }
 
         // Set body
@@ -961,11 +961,12 @@ impl StatefulParser {
                     let mut request = Request::with_version(method, path, http_version);
                     request.set_query(query);
 
+                    // Use optimized insert to avoid double allocation
                     for header in headers.iter() {
                         let header = header?;
                         request
                             .headers_mut()
-                            .insert(header.name().to_string(), header.value().to_vec());
+                            .insert_from_slice(header.name(), header.value());
                     }
 
                     let body_length = headers.body_length();
