@@ -155,6 +155,42 @@ impl Headers {
             .insert(name.into().to_ascii_lowercase(), value.into());
     }
 
+    /// Insert a header from borrowed slices with minimal allocation.
+    ///
+    /// This is an optimized fast path for parsing that:
+    /// - Avoids double allocation for header names
+    /// - Lowercases in a single pass when needed
+    /// - Only allocates for the value copy
+    #[inline]
+    pub fn insert_from_slice(&mut self, name: &str, value: &[u8]) {
+        // Check if name needs lowercasing (avoiding double allocation)
+        let name_owned = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            // Need to lowercase - single allocation with transformation
+            name.to_ascii_lowercase()
+        } else {
+            // Already lowercase - single allocation, no transformation
+            name.to_owned()
+        };
+        self.inner.insert(name_owned, value.to_vec());
+    }
+
+    /// Insert a header with an already-lowercase name.
+    ///
+    /// # Safety Note
+    ///
+    /// This method assumes the name is already lowercase. If it contains
+    /// uppercase characters, lookups may fail. Use `insert` or
+    /// `insert_from_slice` for untrusted input.
+    #[inline]
+    pub fn insert_lowercase(&mut self, name: String, value: Vec<u8>) {
+        debug_assert!(
+            !name.bytes().any(|b| b.is_ascii_uppercase()),
+            "insert_lowercase called with non-lowercase name: {}",
+            name
+        );
+        self.inner.insert(name, value);
+    }
+
     /// Iterate over all headers as (name, value) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
         self.inner
