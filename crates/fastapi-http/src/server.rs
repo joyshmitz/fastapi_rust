@@ -511,6 +511,7 @@ fn parse_port(port: &str) -> Option<u16> {
 }
 
 fn is_valid_hostname(host: &str) -> bool {
+    // Note: str::len() returns byte length (RFC 1035 specifies 253 octets)
     if host.len() > 253 {
         return false;
     }

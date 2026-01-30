@@ -159,8 +159,8 @@ impl CleanupStack {
     /// Run all cleanup functions in LIFO order.
     ///
     /// This consumes all registered cleanup functions. Each cleanup is
-    /// awaited in sequence. If a cleanup function panics, the remaining
-    /// cleanups are still attempted.
+    /// awaited in sequence. If a cleanup function panics (either during
+    /// creation or execution), the remaining cleanups are still attempted.
     ///
     /// # Returns
     ///
@@ -170,13 +170,15 @@ impl CleanupStack {
         let mut completed = 0;
 
         for cleanup in cleanups {
-            // Call the cleanup function to get the future, catching panics
+            // Call the cleanup function to get the future, catching panics during creation
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (cleanup)()));
             match result {
                 Ok(future) => {
-                    // Now await the returned future
-                    future.await;
-                    completed += 1;
+                    // Run the future, catching any panics during execution
+                    if Self::run_cleanup_future(future).await {
+                        completed += 1;
+                    }
+                    // If cleanup panicked during execution, continue with remaining
                 }
                 Err(_) => {
                     // Cleanup panicked during creation, continue with remaining cleanups
@@ -185,6 +187,23 @@ impl CleanupStack {
         }
 
         completed
+    }
+
+    /// Run a single cleanup future, catching any panics during execution.
+    ///
+    /// Returns `true` if the cleanup completed successfully, `false` if it panicked.
+    async fn run_cleanup_future(mut future: Pin<Box<dyn Future<Output = ()> + Send>>) -> bool {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::task::Poll;
+
+        std::future::poll_fn(move |cx| {
+            match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                Ok(Poll::Ready(())) => Poll::Ready(true),
+                Ok(Poll::Pending) => Poll::Pending,
+                Err(_) => Poll::Ready(false), // Cleanup panicked, treat as failed
+            }
+        })
+        .await
     }
 }
 

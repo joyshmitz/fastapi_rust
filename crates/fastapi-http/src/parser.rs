@@ -391,9 +391,26 @@ impl<'a> Header<'a> {
         if !self.is_transfer_encoding() {
             return false;
         }
+        // Use case-insensitive search without allocating a new String
         self.value_str()
-            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+            .is_some_and(|v| contains_ignore_ascii_case(v, "chunked"))
     }
+}
+
+/// Case-insensitive substring search without allocation.
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let needle_bytes = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle_bytes.len())
+        .any(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
 /// Iterator over HTTP headers in a buffer.

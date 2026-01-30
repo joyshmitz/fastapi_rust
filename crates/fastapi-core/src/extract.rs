@@ -327,9 +327,14 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
             .and_then(|v| std::str::from_utf8(v).ok());
 
         let is_json = content_type.is_some_and(|ct| {
-            let ct_lower = ct.to_ascii_lowercase();
-            ct_lower.starts_with("application/json")
-                || ct_lower.starts_with("application/") && ct_lower.contains("+json")
+            // Case-insensitive check without allocation
+            ct.get(..16)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("application/json"))
+                || (ct.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("application/"))
+                    && ct
+                        .as_bytes()
+                        .windows(5)
+                        .any(|w| w.eq_ignore_ascii_case(b"+json")))
         });
 
         if !is_json {
