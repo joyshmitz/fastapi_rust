@@ -12114,7 +12114,7 @@ impl DigestAuth {
             } else {
                 // Look at the character before the match
                 let prev_char = self.credentials[..abs_pos].chars().next_back();
-                matches!(prev_char, Some(',') | Some(' ') | Some('\t'))
+                matches!(prev_char, Some(',' | ' ' | '\t'))
             };
 
             if at_boundary {
@@ -12125,11 +12125,10 @@ impl DigestAuth {
                     let inner = &after_eq[1..];
                     let end = inner.find('"')?;
                     return Some(&inner[..end]);
-                } else {
-                    // Unquoted value
-                    let end = after_eq.find(',').unwrap_or(after_eq.len());
-                    return Some(after_eq[..end].trim());
                 }
+                // Unquoted value
+                let end = after_eq.find(',').unwrap_or(after_eq.len());
+                return Some(after_eq[..end].trim());
             }
 
             // Not at boundary, continue searching after this position
