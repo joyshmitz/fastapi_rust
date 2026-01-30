@@ -330,7 +330,9 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
             // Case-insensitive check without allocation
             ct.get(..16)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("application/json"))
-                || (ct.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("application/"))
+                || (ct
+                    .get(..12)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("application/"))
                     && ct
                         .as_bytes()
                         .windows(5)
