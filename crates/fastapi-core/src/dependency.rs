@@ -12,6 +12,26 @@
 //! ```text
 //! Circular dependency detected: DbPool -> UserService -> AuthService -> DbPool
 //! ```
+//!
+//! # Configuration Errors Cause Panics
+//!
+//! Circular dependencies and scope violations are **configuration errors**
+//! that indicate a bug in the dependency graph setup. These errors cause
+//! panics rather than returning `Result` for the following reasons:
+//!
+//! 1. **Type safety**: The error type is `T::Error` (the dependency's error type),
+//!    which may not be constructible from internal errors like `CircularDependencyError`.
+//!
+//! 2. **Fail fast**: Configuration errors should crash early during development/testing,
+//!    not be silently caught and potentially ignored.
+//!
+//! 3. **Invariant violation**: A circular dependency means the dependency graph
+//!    is fundamentally broken and cannot be satisfied.
+//!
+//! To debug circular dependencies:
+//! - Review the panic message which shows the full cycle path
+//! - Check for unintended transitive dependencies
+//! - Consider using scoped dependencies to break cycles
 
 use crate::context::RequestContext;
 use crate::extract::FromRequest;
@@ -290,11 +310,10 @@ where
             }
         }
 
-        // Check for circular dependency
+        // Check for circular dependency (bd-276p: intentional panic for config errors)
         let type_name = std::any::type_name::<T>();
         if let Some(cycle) = ctx.resolution_stack().check_cycle::<T>(type_name) {
-            let err = CircularDependencyError::new(cycle);
-            panic!("{}", err);
+            handle_circular_dependency(cycle);
         }
 
         // Check for scope violation: request-scoped cannot depend on function-scoped
@@ -302,7 +321,7 @@ where
             .resolution_stack()
             .check_scope_violation(type_name, scope)
         {
-            panic!("{}", scope_err);
+            handle_scope_violation(scope_err);
         }
 
         // Push onto resolution stack
@@ -483,6 +502,67 @@ impl IntoResponse for DependencyScopeError {
             .header("content-type", b"application/json".to_vec())
             .body(ResponseBody::Bytes(body.into_bytes()))
     }
+}
+
+/// Handle a detected circular dependency by panicking with a helpful message.
+///
+/// This is marked `#[cold]` to hint to the compiler that this path is unlikely,
+/// and `#[inline(never)]` to keep the panic code out of the hot path.
+///
+/// # Panics
+///
+/// Always panics with a detailed error message including the cycle path and debugging hints.
+#[cold]
+#[inline(never)]
+fn handle_circular_dependency(cycle: Vec<String>) -> ! {
+    let err = CircularDependencyError::new(cycle);
+    panic!(
+        "\n\n\
+        ╔══════════════════════════════════════════════════════════════════════╗\n\
+        ║                    CIRCULAR DEPENDENCY DETECTED                      ║\n\
+        ╠══════════════════════════════════════════════════════════════════════╣\n\
+        ║ {}\n\
+        ╠══════════════════════════════════════════════════════════════════════╣\n\
+        ║ This is a configuration error in your dependency graph.              ║\n\
+        ║                                                                      ║\n\
+        ║ To fix:                                                              ║\n\
+        ║ 1. Review the cycle path above                                       ║\n\
+        ║ 2. Break the cycle by removing or refactoring one dependency         ║\n\
+        ║ 3. Consider using lazy initialization or scoped dependencies         ║\n\
+        ╚══════════════════════════════════════════════════════════════════════╝\n",
+        err
+    );
+}
+
+/// Handle a detected scope violation by panicking with a helpful message.
+///
+/// This is marked `#[cold]` to hint to the compiler that this path is unlikely,
+/// and `#[inline(never)]` to keep the panic code out of the hot path.
+///
+/// # Panics
+///
+/// Always panics with a detailed error message explaining the scope violation.
+#[cold]
+#[inline(never)]
+fn handle_scope_violation(scope_err: DependencyScopeError) -> ! {
+    panic!(
+        "\n\n\
+        ╔══════════════════════════════════════════════════════════════════════╗\n\
+        ║                    DEPENDENCY SCOPE VIOLATION                        ║\n\
+        ╠══════════════════════════════════════════════════════════════════════╣\n\
+        ║ {}\n\
+        ╠══════════════════════════════════════════════════════════════════════╣\n\
+        ║ Request-scoped dependencies are cached per-request and must not      ║\n\
+        ║ depend on function-scoped dependencies (which are created fresh      ║\n\
+        ║ each time).                                                          ║\n\
+        ║                                                                      ║\n\
+        ║ To fix:                                                              ║\n\
+        ║ 1. Change the inner dependency to request scope                      ║\n\
+        ║ 2. Or change the outer dependency to function scope                  ║\n\
+        ║ 3. Or restructure to avoid the dependency                            ║\n\
+        ╚══════════════════════════════════════════════════════════════════════╝\n",
+        scope_err
+    );
 }
 
 /// Tracks which types are currently being resolved to detect cycles and scope violations.
@@ -709,10 +789,10 @@ where
         }
 
         // Check for circular dependency before attempting resolution
+        // (bd-276p: intentional panic for config errors - see module docs)
         let type_name = std::any::type_name::<T>();
         if let Some(cycle) = ctx.resolution_stack().check_cycle::<T>(type_name) {
-            let err = CircularDependencyError::new(cycle);
-            panic!("{}", err);
+            handle_circular_dependency(cycle);
         }
 
         // Check for scope violation: request-scoped cannot depend on function-scoped
@@ -720,7 +800,7 @@ where
             .resolution_stack()
             .check_scope_violation(type_name, scope)
         {
-            panic!("{}", scope_err);
+            handle_scope_violation(scope_err);
         }
 
         // Push onto resolution stack and create guard for automatic cleanup
@@ -861,6 +941,14 @@ impl DependencyOverrides {
     }
 
     /// Resolve an override if one exists for `T`.
+    ///
+    /// # Type Safety
+    ///
+    /// The override is looked up by `TypeId::of::<T>()`, which should guarantee
+    /// that the stored closure returns the correct types. If a type mismatch
+    /// occurs despite the TypeId matching:
+    /// - In debug builds: panics via `debug_assert!` to catch bugs early
+    /// - In release builds: returns `None` to fall back to normal resolution
     pub async fn resolve<T>(
         &self,
         ctx: &RequestContext,
@@ -876,18 +964,34 @@ impl DependencyOverrides {
 
         let override_fn = override_fn?;
         match override_fn(ctx, req).await {
-            Ok(value) => {
-                let value = value
-                    .downcast::<T>()
-                    .expect("dependency override type mismatch");
-                Some(Ok(*value))
-            }
-            Err(err) => {
-                let err = err
-                    .downcast::<T::Error>()
-                    .expect("dependency override error type mismatch");
-                Some(Err(*err))
-            }
+            Ok(value) => match value.downcast::<T>() {
+                Ok(value) => Some(Ok(*value)),
+                Err(_) => {
+                    // Type mismatch should never happen due to TypeId matching.
+                    // Panic in debug builds to catch bugs early.
+                    debug_assert!(
+                        false,
+                        "dependency override type mismatch: expected {}, stored override returned wrong type",
+                        std::any::type_name::<T>()
+                    );
+                    // In release builds, fall back to normal resolution.
+                    None
+                }
+            },
+            Err(err) => match err.downcast::<T::Error>() {
+                Ok(err) => Some(Err(*err)),
+                Err(_) => {
+                    // Error type mismatch should never happen due to TypeId matching.
+                    // Panic in debug builds to catch bugs early.
+                    debug_assert!(
+                        false,
+                        "dependency override error type mismatch: expected {}, stored override returned wrong error type",
+                        std::any::type_name::<T::Error>()
+                    );
+                    // In release builds, fall back to normal resolution.
+                    None
+                }
+            },
         }
     }
 

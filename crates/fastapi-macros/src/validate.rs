@@ -523,20 +523,95 @@ fn generate_field_validation(field: &Field, validators: &FieldValidators) -> Tok
         });
     }
 
-    // Phone validation
+    // Phone validation (bd-apwl)
     if validators.phone {
         validations.push(quote! {
             {
                 let phone = &self.#field_name;
-                // Basic phone validation: optional leading +, then digits/spaces/hyphens/parens
-                // At least 7 digits total
-                let digits: Vec<char> = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-                let has_valid_chars = phone.chars().all(|c| {
-                    c.is_ascii_digit() || c == '+' || c == '-' || c == ' '
-                        || c == '(' || c == ')' || c == '.'
-                });
-                let is_valid = has_valid_chars && digits.len() >= 7 && digits.len() <= 15;
-                if !is_valid {
+
+                // Phone number validation rules:
+                // 1. Allowed characters: digits, +, -, space, (, ), .
+                // 2. '+' can only appear at the start (for international format)
+                // 3. Parentheses must be balanced and not empty
+                // 4. No consecutive separators (except space which can repeat)
+                // 5. Must have 7-15 digits (E.164 standard)
+                // 6. Must not start/end with separators (except leading +)
+
+                fn is_valid_phone(s: &str) -> bool {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        return false;
+                    }
+
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut digit_count = 0;
+                    let mut paren_depth = 0;
+                    let mut prev_was_separator = false;
+                    let mut has_content_in_parens = false;
+
+                    for (i, &c) in chars.iter().enumerate() {
+                        match c {
+                            '0'..='9' => {
+                                digit_count += 1;
+                                prev_was_separator = false;
+                                if paren_depth > 0 {
+                                    has_content_in_parens = true;
+                                }
+                            }
+                            '+' => {
+                                // '+' only allowed at start
+                                if i != 0 {
+                                    return false;
+                                }
+                                prev_was_separator = false;
+                            }
+                            '-' | '.' => {
+                                // No consecutive separators (except space)
+                                if prev_was_separator {
+                                    return false;
+                                }
+                                // Can't be first char (after optional +) or last
+                                if i == 0 || (i == 1 && chars[0] == '+') || i == chars.len() - 1 {
+                                    return false;
+                                }
+                                prev_was_separator = true;
+                            }
+                            ' ' => {
+                                // Spaces are more permissive but still can't be first/last
+                                if i == 0 || (i == 1 && chars[0] == '+') || i == chars.len() - 1 {
+                                    return false;
+                                }
+                                // Multiple spaces are allowed, don't set prev_was_separator
+                            }
+                            '(' => {
+                                // Can't have nested parens, can't be last char
+                                if paren_depth > 0 || i == chars.len() - 1 {
+                                    return false;
+                                }
+                                paren_depth += 1;
+                                has_content_in_parens = false;
+                                prev_was_separator = false;
+                            }
+                            ')' => {
+                                // Must have matching open paren, must have content inside
+                                if paren_depth == 0 || !has_content_in_parens {
+                                    return false;
+                                }
+                                paren_depth -= 1;
+                                prev_was_separator = false;
+                            }
+                            _ => {
+                                // Invalid character
+                                return false;
+                            }
+                        }
+                    }
+
+                    // Must have balanced parens and 7-15 digits
+                    paren_depth == 0 && digit_count >= 7 && digit_count <= 15
+                }
+
+                if !is_valid_phone(phone) {
                     errors.push(
                         fastapi_core::ValidationError::new(
                             fastapi_core::error::error_types::VALUE_ERROR,

@@ -1338,6 +1338,89 @@ fn test_phone_invalid_empty() {
     assert!(v.validate().is_err());
 }
 
+// Additional phone validation edge cases (bd-apwl)
+#[test]
+fn test_phone_invalid_plus_in_middle() {
+    // '+' should only be at the start
+    let v = PhoneTest {
+        phone: "555+1234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_consecutive_separators() {
+    // No consecutive hyphens or dots
+    let v = PhoneTest {
+        phone: "555--1234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+
+    let v = PhoneTest {
+        phone: "555..1234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_unbalanced_parens() {
+    // Unbalanced parentheses
+    let v = PhoneTest {
+        phone: "(555 1234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+
+    let v = PhoneTest {
+        phone: "555) 1234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_empty_parens() {
+    // Empty parentheses
+    let v = PhoneTest {
+        phone: "() 5551234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_leading_separator() {
+    // Can't start with separator (unless +)
+    let v = PhoneTest {
+        phone: "-5551234567".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_invalid_trailing_separator() {
+    // Can't end with separator
+    let v = PhoneTest {
+        phone: "5551234567-".to_string(),
+    };
+    assert!(v.validate().is_err());
+}
+
+#[test]
+fn test_phone_valid_with_dots() {
+    // Dots as separators are valid
+    let v = PhoneTest {
+        phone: "555.123.4567".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
+#[test]
+fn test_phone_valid_with_multiple_spaces() {
+    // Multiple spaces are allowed
+    let v = PhoneTest {
+        phone: "+1  555  1234567".to_string(),
+    };
+    assert!(v.validate().is_ok());
+}
+
 // ============================================================================
 // Contains / starts_with / ends_with validation tests
 // ============================================================================

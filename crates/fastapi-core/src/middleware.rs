@@ -691,15 +691,37 @@ impl OriginPattern {
 /// | `expose_headers` | none |
 /// | `max_age` | none |
 ///
+/// # Security: Credentials and Wildcards
+///
+/// According to the CORS specification (Fetch Standard), when credentials
+/// mode is enabled (`allow_credentials: true`), the following headers
+/// **cannot** use the `*` wildcard value:
+///
+/// - `Access-Control-Allow-Origin` (must echo the specific origin)
+/// - `Access-Control-Allow-Headers` (must list specific headers)
+/// - `Access-Control-Allow-Methods` (must list specific methods)
+/// - `Access-Control-Expose-Headers` (must list specific headers)
+///
+/// This implementation enforces this: when `allow_credentials(true)` is
+/// combined with `allow_any_origin()`, the response echoes back the
+/// specific request origin instead of returning `*`.
+///
 /// # Example
 ///
 /// ```ignore
-/// use fastapi_core::CorsConfig;
+/// use fastapi_core::Cors;
 ///
-/// let cors = CorsConfig::default()
-///     .allow_any_origin(true)
+/// // Secure: specific origin with credentials
+/// let cors = Cors::new()
+///     .allow_origin("https://myapp.example.com")
 ///     .allow_credentials(true)
-///     .expose_headers(vec!["X-Request-Id".into()]);
+///     .expose_headers(["X-Request-Id"]);
+///
+/// // Also secure: any origin echoes back specific origin when credentials enabled
+/// // (not recommended - prefer explicit origins for security)
+/// let cors = Cors::new()
+///     .allow_any_origin()
+///     .allow_credentials(true);
 /// ```
 #[derive(Debug, Clone)]
 pub struct CorsConfig {
@@ -2806,9 +2828,90 @@ pub trait KeyExtractor: Send + Sync {
     fn extract_key(&self, req: &Request) -> Option<String>;
 }
 
-/// Rate limit by client IP address (from `X-Forwarded-For` or `X-Real-IP` headers).
+/// The remote address (peer IP) of the TCP connection.
 ///
-/// Falls back to `"unknown"` when no client IP is available.
+/// This should be set by the HTTP server layer as a request extension to enable
+/// secure IP-based rate limiting. Unlike `X-Forwarded-For` headers, this value
+/// cannot be spoofed by clients.
+///
+/// # Example
+///
+/// ```ignore
+/// // In your HTTP server code:
+/// use fastapi_core::middleware::RemoteAddr;
+/// use std::net::IpAddr;
+///
+/// // When accepting a connection:
+/// let peer_addr: IpAddr = socket.peer_addr()?.ip();
+/// request.insert_extension(RemoteAddr(peer_addr));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RemoteAddr(pub std::net::IpAddr);
+
+impl std::fmt::Display for RemoteAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Rate limit by the actual TCP connection IP address.
+///
+/// This is the **secure** way to do IP-based rate limiting. It uses the
+/// `RemoteAddr` extension set by the HTTP server, which represents the actual
+/// TCP peer address and cannot be spoofed by clients.
+///
+/// # Prerequisites
+///
+/// Your HTTP server must set the `RemoteAddr` extension on each request:
+///
+/// ```ignore
+/// request.insert_extension(RemoteAddr(peer_addr.ip()));
+/// ```
+///
+/// If `RemoteAddr` is not set, this extractor returns `None` (request is not rate-limited).
+///
+/// # Security
+///
+/// This extractor is safe to use without a reverse proxy, as it relies on the
+/// TCP connection's peer address rather than client-supplied headers.
+#[derive(Debug, Clone)]
+pub struct ConnectedIpKeyExtractor;
+
+impl KeyExtractor for ConnectedIpKeyExtractor {
+    fn extract_key(&self, req: &Request) -> Option<String> {
+        req.get_extension::<RemoteAddr>()
+            .map(ToString::to_string)
+    }
+}
+
+/// Rate limit by client IP address from `X-Forwarded-For` or `X-Real-IP` headers.
+///
+/// # Security Warning
+///
+/// **This extractor trusts client-supplied headers, which can be spoofed!**
+///
+/// Only use this extractor when:
+/// 1. Your application runs behind a trusted reverse proxy (nginx, Cloudflare, etc.)
+/// 2. The proxy is configured to set/override these headers
+/// 3. Clients cannot connect directly to your application
+///
+/// For direct client connections, use [`ConnectedIpKeyExtractor`] instead.
+///
+/// # How Proxies Work
+///
+/// When a request passes through proxies:
+/// - `X-Forwarded-For: client_ip, proxy1_ip, proxy2_ip`
+/// - The first IP is typically the original client
+/// - Each proxy appends its own IP
+///
+/// This extractor takes the **first** IP from `X-Forwarded-For`, which is correct
+/// only if your trusted proxy always sets/overwrites this header.
+///
+/// # Fallback Behavior
+///
+/// Falls back to `"unknown"` when no IP header is present, which means all such
+/// requests share the same rate limit bucket. This may not be desirable in
+/// production - consider using [`TrustedProxyIpKeyExtractor`] for better control.
 #[derive(Debug, Clone)]
 pub struct IpKeyExtractor;
 
@@ -2829,6 +2932,166 @@ impl KeyExtractor for IpKeyExtractor {
             }
         }
         Some("unknown".to_string())
+    }
+}
+
+/// Rate limit by client IP with trusted proxy validation.
+///
+/// This is a **secure** IP extractor that only trusts `X-Forwarded-For` headers
+/// when the immediate upstream (TCP peer) is a known trusted proxy.
+///
+/// # How It Works
+///
+/// 1. If `RemoteAddr` extension is set and matches a trusted proxy CIDR:
+///    - Extract client IP from `X-Forwarded-For` (first IP in chain)
+/// 2. If `RemoteAddr` is set but NOT a trusted proxy:
+///    - Use the `RemoteAddr` directly (the client connected directly)
+/// 3. If `RemoteAddr` is not set:
+///    - Returns `None` (request is not rate-limited) - safer than guessing
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::middleware::{TrustedProxyIpKeyExtractor, RateLimitMiddleware};
+///
+/// let extractor = TrustedProxyIpKeyExtractor::new()
+///     .trust_cidr("10.0.0.0/8")      // Internal network
+///     .trust_cidr("172.16.0.0/12")   // Docker default
+///     .trust_loopback();              // localhost
+///
+/// let rate_limiter = RateLimitMiddleware::builder()
+///     .requests(100)
+///     .per(Duration::from_secs(60))
+///     .key_extractor(extractor)
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct TrustedProxyIpKeyExtractor {
+    /// List of trusted proxy CIDRs (stored as (ip, prefix_len))
+    trusted_cidrs: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl TrustedProxyIpKeyExtractor {
+    /// Create a new trusted proxy IP extractor with no trusted proxies.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            trusted_cidrs: Vec::new(),
+        }
+    }
+
+    /// Add a trusted CIDR range (e.g., "10.0.0.0/8", "192.168.1.0/24").
+    ///
+    /// # Panics
+    ///
+    /// Panics if the CIDR string is invalid.
+    #[must_use]
+    pub fn trust_cidr(mut self, cidr: &str) -> Self {
+        let (ip, prefix) = parse_cidr(cidr).expect("invalid CIDR notation");
+        self.trusted_cidrs.push((ip, prefix));
+        self
+    }
+
+    /// Trust loopback addresses (127.0.0.0/8 for IPv4, ::1/128 for IPv6).
+    #[must_use]
+    pub fn trust_loopback(mut self) -> Self {
+        self.trusted_cidrs.push((
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 0)),
+            8,
+        ));
+        self.trusted_cidrs.push((
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            128,
+        ));
+        self
+    }
+
+    /// Check if an IP is within any trusted CIDR range.
+    fn is_trusted(&self, ip: std::net::IpAddr) -> bool {
+        self.trusted_cidrs
+            .iter()
+            .any(|(cidr_ip, prefix)| ip_in_cidr(ip, *cidr_ip, *prefix))
+    }
+
+    /// Extract client IP from X-Forwarded-For header.
+    fn extract_from_header(&self, req: &Request) -> Option<String> {
+        if let Some(forwarded) = req.headers().get("x-forwarded-for") {
+            if let Ok(s) = std::str::from_utf8(forwarded) {
+                if let Some(ip) = s.split(',').next() {
+                    return Some(ip.trim().to_string());
+                }
+            }
+        }
+        if let Some(real_ip) = req.headers().get("x-real-ip") {
+            if let Ok(s) = std::str::from_utf8(real_ip) {
+                return Some(s.trim().to_string());
+            }
+        }
+        None
+    }
+}
+
+impl Default for TrustedProxyIpKeyExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyExtractor for TrustedProxyIpKeyExtractor {
+    fn extract_key(&self, req: &Request) -> Option<String> {
+        let remote = req.get_extension::<RemoteAddr>()?;
+
+        if self.is_trusted(remote.0) {
+            // Request came from trusted proxy - use header value
+            self.extract_from_header(req)
+                .or_else(|| Some(remote.to_string()))
+        } else {
+            // Request came directly from client - use connection IP
+            Some(remote.to_string())
+        }
+    }
+}
+
+/// Parse a CIDR string like "192.168.1.0/24" into (ip, prefix_length).
+fn parse_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (ip_str, prefix_str) = cidr.split_once('/')?;
+    let ip: std::net::IpAddr = ip_str.parse().ok()?;
+    let prefix: u8 = prefix_str.parse().ok()?;
+
+    // Validate prefix length
+    let max_prefix = match ip {
+        std::net::IpAddr::V4(_) => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return None;
+    }
+
+    Some((ip, prefix))
+}
+
+/// Check if an IP address is within a CIDR range.
+fn ip_in_cidr(ip: std::net::IpAddr, cidr_ip: std::net::IpAddr, prefix: u8) -> bool {
+    match (ip, cidr_ip) {
+        (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(cidr)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let ip_bits = u32::from(ip);
+            let cidr_bits = u32::from(cidr);
+            let mask = !0u32 << (32 - prefix);
+            (ip_bits & mask) == (cidr_bits & mask)
+        }
+        (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(cidr)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let ip_bits = u128::from(ip);
+            let cidr_bits = u128::from(cidr);
+            let mask = !0u128 << (128 - prefix);
+            (ip_bits & mask) == (cidr_bits & mask)
+        }
+        _ => false, // IPv4 vs IPv6 mismatch
     }
 }
 
@@ -8464,6 +8727,104 @@ mod tests {
         );
     }
 
+    // CORS Spec Compliance Tests (bd-l1qe)
+    // According to the Fetch Standard, when credentials mode is true,
+    // the Access-Control-Allow-Origin header MUST NOT be "*".
+
+    #[test]
+    fn cors_spec_compliance_credentials_never_wildcard_origin() {
+        // When credentials are enabled, Access-Control-Allow-Origin
+        // must echo the specific origin, never "*"
+        let cors = Cors::new().allow_any_origin().allow_credentials(true);
+        let ctx = test_context();
+
+        // Test with various origins
+        for origin in &[
+            "https://example.com",
+            "https://api.example.com",
+            "http://localhost:3000",
+        ] {
+            let mut req = Request::new(crate::request::Method::Get, "/");
+            req.headers_mut()
+                .insert("origin", origin.as_bytes().to_vec());
+
+            futures_executor::block_on(cors.before(&ctx, &mut req));
+            let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+
+            let allow_origin = header_value(&response, "access-control-allow-origin");
+            assert_eq!(
+                allow_origin,
+                Some((*origin).to_string()),
+                "With credentials enabled, Access-Control-Allow-Origin must echo '{}', not '*'",
+                origin
+            );
+            assert_ne!(
+                allow_origin,
+                Some("*".to_string()),
+                "CORS spec violation: credentials + wildcard origin is forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_spec_compliance_preflight_with_credentials() {
+        // Preflight response with credentials should also echo origin, not "*"
+        let cors = Cors::new()
+            .allow_any_origin()
+            .allow_credentials(true)
+            .allow_headers(["content-type", "x-custom-header"]);
+        let ctx = test_context();
+
+        let mut req = Request::new(crate::request::Method::Options, "/");
+        req.headers_mut()
+            .insert("origin", b"https://example.com".to_vec());
+        req.headers_mut()
+            .insert("access-control-request-method", b"POST".to_vec());
+        req.headers_mut()
+            .insert("access-control-request-headers", b"content-type".to_vec());
+
+        let result = futures_executor::block_on(cors.before(&ctx, &mut req));
+        let ControlFlow::Break(response) = result else {
+            panic!("expected preflight break");
+        };
+
+        // Verify Access-Control-Allow-Origin is NOT "*" with credentials
+        let allow_origin = header_value(&response, "access-control-allow-origin");
+        assert_eq!(allow_origin, Some("https://example.com".to_string()));
+        assert_ne!(
+            allow_origin,
+            Some("*".to_string()),
+            "CORS spec violation: preflight with credentials must not use wildcard origin"
+        );
+
+        // Verify credentials header is set
+        assert_eq!(
+            header_value(&response, "access-control-allow-credentials"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn cors_spec_without_credentials_allows_wildcard() {
+        // When credentials are NOT enabled, "*" is allowed for Access-Control-Allow-Origin
+        let cors = Cors::new().allow_any_origin();
+        let ctx = test_context();
+        let mut req = Request::new(crate::request::Method::Get, "/");
+        req.headers_mut()
+            .insert("origin", b"https://example.com".to_vec());
+
+        futures_executor::block_on(cors.before(&ctx, &mut req));
+        let response = futures_executor::block_on(cors.after(&ctx, &req, Response::ok()));
+
+        // Without credentials, wildcard IS allowed
+        assert_eq!(
+            header_value(&response, "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+        // Should NOT have credentials header
+        assert!(header_value(&response, "access-control-allow-credentials").is_none());
+    }
+
     #[test]
     fn cors_disallowed_preflight_forbidden() {
         let cors = Cors::new().allow_origin("https://good.example");
@@ -12271,6 +12632,172 @@ mod rate_limit_tests {
         let extractor = IpKeyExtractor;
         let req = Request::new(Method::Get, "/");
         assert_eq!(extractor.extract_key(&req), Some("unknown".to_string()));
+    }
+
+    // Tests for secure ConnectedIpKeyExtractor (bd-u9gw)
+    #[test]
+    fn connected_ip_extractor_with_remote_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let extractor = ConnectedIpKeyExtractor;
+        let mut req = Request::new(Method::Get, "/");
+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
+
+        assert_eq!(
+            extractor.extract_key(&req),
+            Some("192.168.1.100".to_string())
+        );
+    }
+
+    #[test]
+    fn connected_ip_extractor_without_remote_addr() {
+        let extractor = ConnectedIpKeyExtractor;
+        let req = Request::new(Method::Get, "/");
+
+        // Should return None when no RemoteAddr is set
+        assert_eq!(extractor.extract_key(&req), None);
+    }
+
+    #[test]
+    fn connected_ip_extractor_ignores_headers() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let extractor = ConnectedIpKeyExtractor;
+        let mut req = Request::new(Method::Get, "/");
+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        // Add spoofed header - should be ignored
+        req.headers_mut()
+            .insert("x-forwarded-for", b"1.2.3.4".to_vec());
+
+        // Should use RemoteAddr, not the header
+        assert_eq!(extractor.extract_key(&req), Some("10.0.0.1".to_string()));
+    }
+
+    // Tests for TrustedProxyIpKeyExtractor (bd-u9gw)
+    #[test]
+    fn trusted_proxy_extractor_from_trusted_proxy() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let extractor = TrustedProxyIpKeyExtractor::new().trust_cidr("10.0.0.0/8");
+
+        let mut req = Request::new(Method::Get, "/");
+        // Request came from trusted proxy 10.0.0.1
+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        // Proxy set X-Forwarded-For with real client IP
+        req.headers_mut()
+            .insert("x-forwarded-for", b"203.0.113.50".to_vec());
+
+        // Should trust the header and extract client IP
+        assert_eq!(
+            extractor.extract_key(&req),
+            Some("203.0.113.50".to_string())
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_extractor_from_untrusted_direct() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let extractor = TrustedProxyIpKeyExtractor::new().trust_cidr("10.0.0.0/8");
+
+        let mut req = Request::new(Method::Get, "/");
+        // Request came directly from client (not a trusted proxy)
+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50))));
+        // Client tries to spoof X-Forwarded-For
+        req.headers_mut()
+            .insert("x-forwarded-for", b"1.2.3.4".to_vec());
+
+        // Should ignore header and use RemoteAddr
+        assert_eq!(
+            extractor.extract_key(&req),
+            Some("203.0.113.50".to_string())
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_extractor_no_remote_addr() {
+        let extractor = TrustedProxyIpKeyExtractor::new().trust_loopback();
+
+        let mut req = Request::new(Method::Get, "/");
+        // No RemoteAddr set - should return None (safer than guessing)
+        req.headers_mut()
+            .insert("x-forwarded-for", b"1.2.3.4".to_vec());
+
+        assert_eq!(extractor.extract_key(&req), None);
+    }
+
+    #[test]
+    fn trusted_proxy_extractor_loopback_ipv4() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let extractor = TrustedProxyIpKeyExtractor::new().trust_loopback();
+
+        let mut req = Request::new(Method::Get, "/");
+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        req.headers_mut()
+            .insert("x-forwarded-for", b"8.8.8.8".to_vec());
+
+        assert_eq!(extractor.extract_key(&req), Some("8.8.8.8".to_string()));
+    }
+
+    #[test]
+    fn trusted_proxy_extractor_loopback_ipv6() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let extractor = TrustedProxyIpKeyExtractor::new().trust_loopback();
+
+        let mut req = Request::new(Method::Get, "/");
+        req.insert_extension(RemoteAddr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        req.headers_mut()
+            .insert("x-forwarded-for", b"8.8.8.8".to_vec());
+
+        assert_eq!(extractor.extract_key(&req), Some("8.8.8.8".to_string()));
+    }
+
+    #[test]
+    fn cidr_parsing() {
+        // Valid CIDRs
+        assert!(parse_cidr("10.0.0.0/8").is_some());
+        assert!(parse_cidr("192.168.1.0/24").is_some());
+        assert!(parse_cidr("0.0.0.0/0").is_some());
+        assert!(parse_cidr("::1/128").is_some());
+        assert!(parse_cidr("::/0").is_some());
+
+        // Invalid CIDRs
+        assert!(parse_cidr("10.0.0.0/33").is_none()); // Prefix too large for IPv4
+        assert!(parse_cidr("invalid").is_none());
+        assert!(parse_cidr("10.0.0.0").is_none()); // Missing prefix
+    }
+
+    #[test]
+    fn ip_in_cidr_matching() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let cidr_10 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
+
+        // In range
+        assert!(ip_in_cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            cidr_10,
+            8
+        ));
+        assert!(ip_in_cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)),
+            cidr_10,
+            8
+        ));
+
+        // Out of range
+        assert!(!ip_in_cidr(
+            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1)),
+            cidr_10,
+            8
+        ));
+        assert!(!ip_in_cidr(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            cidr_10,
+            8
+        ));
     }
 
     #[test]
