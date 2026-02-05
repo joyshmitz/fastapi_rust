@@ -1,5 +1,5 @@
 [package]
-name = "fastapi"
+name = "fastapi-rust"
 description = "Ultra-optimized Rust web framework inspired by FastAPI"
 version.workspace = true
 edition.workspace = true
@@ -7,10 +7,13 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/fastapi"
+documentation = "https://docs.rs/fastapi-rust"
 readme = "../../README.md"
 keywords = ["fastapi", "web", "framework", "http", "async"]
 categories = ["web-programming", "web-programming::http-server", "asynchronous"]
+
+[lib]
+name = "fastapi"
 
 [dependencies]
 fastapi-core = { workspace = true }

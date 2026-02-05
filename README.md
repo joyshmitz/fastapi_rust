@@ -197,10 +197,12 @@ Response Sent (only after region quiescent)
 
 ```toml
 [dependencies]
-fastapi = "0.1.0"
+fastapi = { package = "fastapi-rust", version = "0.1.0" }
 asupersync = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 ```
+
+**Note**: The crates.io package is `fastapi-rust`, but the crate name is `fastapi`.
 
 ### From Source
 
