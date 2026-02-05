@@ -43,7 +43,7 @@
 ## Quick Example
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct Item {
@@ -184,7 +184,7 @@ Response Sent (only after region quiescent)
 
 ### When to Consider Alternatives
 
-- You need production-proven stability today (fastapi_rust is v0.1.0)
+- You need production-proven stability today (fastapi_rust is v0.1.1)
 - You require WebSocket support (coming in Phase 2)
 - You have existing Tokio-based infrastructure
 - You need the massive ecosystem of Tower middleware
@@ -197,12 +197,12 @@ Response Sent (only after region quiescent)
 
 ```toml
 [dependencies]
-fastapi = { package = "fastapi-rust", version = "0.1.0" }
+fastapi_rust = { package = "fastapi-rust", version = "0.1.1" }
 asupersync = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 ```
 
-**Note**: The crates.io package is `fastapi-rust`, but the crate name is `fastapi`.
+**Note**: The crates.io package is `fastapi-rust`, and the crate name is `fastapi_rust`.
 
 ### From Source
 
@@ -223,7 +223,7 @@ cargo build --release
 
 ```
 +-------------------------------------------------------------------+
-|                         fastapi (facade)                           |
+|                       fastapi_rust (facade)                        |
 |   Re-exports all public types, prelude module                      |
 +-------------------------------------------------------------------+
         |           |           |           |           |
@@ -254,7 +254,7 @@ cargo build --release
 
 | Crate | ~Lines | Purpose |
 |-------|--------|---------|
-| `fastapi` | 100 | Facade: re-exports, prelude |
+| `fastapi_rust` | 100 | Facade: re-exports, prelude |
 | `fastapi-core` | 6,000 | Request, Response, extractors, DI, middleware, logging, testing, shutdown |
 | `fastapi-http` | 2,500 | Zero-copy HTTP/1.1 parser, body handling, query parsing, streaming |
 | `fastapi-router` | 600 | Radix trie routing, path matching, conflict detection |
@@ -268,7 +268,7 @@ cargo build --release
 Extract typed data from requests declaratively:
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 
 #[get("/users/{id}")]
 async fn get_user(
@@ -314,7 +314,7 @@ async fn create(
 Composable middleware with onion model execution:
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 
 // Built-in middleware
 let app = App::builder()
@@ -358,7 +358,7 @@ First registered runs first on the way in, last on the way out (onion model).
 Request-scoped dependencies with caching:
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 
 // Define a dependency
 #[derive(Clone)]
@@ -404,7 +404,7 @@ let overrides = DependencyOverrides::new()
 In-process testing without network I/O:
 
 ```rust
-use fastapi::testing::*;
+use fastapi_rust::testing::*;
 
 #[test]
 fn test_get_item() {
@@ -509,7 +509,7 @@ async fn get_item(id: Path<i64>) -> Result<Json<Item>, HttpError> {
 Cancel-correct shutdown with configurable grace periods:
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 use fastapi_core::shutdown::*;
 
 let app = App::builder()
@@ -539,7 +539,7 @@ Shutdown propagates through asupersync regions - no orphaned tasks.
 ## Configuration
 
 ```rust
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 
 let app = App::builder()
     // Metadata
@@ -688,7 +688,7 @@ Tokio's spawn model makes cancel-correctness difficult - tasks can outlive their
 
 ### Can I use this in production?
 
-Not yet. This is v0.1.0 in active development. The HTTP server implementation is pending asupersync's I/O support.
+Not yet. This is v0.1.1 in active development. The HTTP server implementation is pending asupersync's I/O support.
 
 ### How fast is it?
 

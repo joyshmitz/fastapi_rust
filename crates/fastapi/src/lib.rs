@@ -10,7 +10,7 @@
 //!
 //! # Role In The System
 //!
-//! `fastapi` is the user-facing facade crate. It re-exports the framework's
+//! `fastapi_rust` is the user-facing facade crate. It re-exports the framework's
 //! core types, macros, and utilities from the sub-crates so applications only
 //! need a single dependency. All real behavior lives in the sub-crates listed
 //! below; this crate exists to provide a cohesive, ergonomic API surface.
@@ -18,7 +18,7 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! #[derive(Serialize, Deserialize, JsonSchema)]
 //! struct Item {
@@ -87,7 +87,7 @@
 //! ## JSON CRUD Handler
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! #[get("/items/{id}")]
 //! async fn get_item(cx: &Cx, id: Path<i64>, state: State<AppState>) -> Result<Json<Item>, HttpError> {
@@ -99,7 +99,7 @@
 //! ## Pagination
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! #[get("/items")]
 //! async fn list_items(cx: &Cx, page: Pagination) -> Json<Page<Item>> {
@@ -113,7 +113,7 @@
 //! ## Bearer Token Authentication
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! #[get("/protected")]
 //! async fn protected(cx: &Cx, token: BearerToken) -> Json<UserInfo> {
@@ -125,7 +125,7 @@
 //! ## Background Tasks
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! #[post("/send-email")]
 //! async fn send_email(cx: &Cx, body: Json<EmailRequest>, tasks: BackgroundTasks) -> StatusCode {
@@ -140,7 +140,7 @@
 //! ## CORS + Rate Limiting Middleware
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! let app = App::new()
 //!     .middleware(Cors::new().allow_any_origin(true).allow_credentials(true))
@@ -150,7 +150,7 @@
 //! ## Error Handling
 //!
 //! ```ignore
-//! use fastapi::prelude::*;
+//! use fastapi_rust::prelude::*;
 //!
 //! // Custom errors implement IntoResponse automatically via HttpError
 //! fn not_found(resource: &str, id: u64) -> HttpError {

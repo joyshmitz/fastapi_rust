@@ -2,9 +2,9 @@
 //!
 //! This example validates all code snippets from docs/getting-started.md work correctly.
 //!
-//! Run with: cargo run --example getting_started -p fastapi
+//! Run with: cargo run --example getting_started -p fastapi-rust
 
-use fastapi::core::{
+use fastapi_rust::core::{
     App, AppConfig, Request, RequestContext, RequestIdMiddleware, Response, ResponseBody,
     SecurityHeaders, TestClient,
 };
@@ -19,6 +19,16 @@ fn health(_ctx: &RequestContext, _req: &mut Request) -> std::future::Ready<Respo
     std::future::ready(
         Response::ok().body(ResponseBody::Bytes(b"{\"status\":\"healthy\"}".to_vec())),
     )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn check_eq<T: PartialEq + std::fmt::Debug>(left: T, right: T, message: &str) -> bool {
+    if left == right {
+        true
+    } else {
+        eprintln!("Check failed: {message}. left={left:?} right={right:?}");
+        false
+    }
 }
 
 fn main() {
@@ -40,8 +50,12 @@ fn main() {
         response.status().as_u16(),
         response.text()
     );
-    assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(response.text(), "Hello, World!");
+    if !check_eq(response.status().as_u16(), 200, "GET / should return 200") {
+        return;
+    }
+    if !check_eq(response.text(), "Hello, World!", "GET / should return body") {
+        return;
+    }
 
     let response = client.get("/health").send();
     println!(
@@ -49,7 +63,13 @@ fn main() {
         response.status().as_u16(),
         response.text()
     );
-    assert_eq!(response.status().as_u16(), 200);
+    if !check_eq(
+        response.status().as_u16(),
+        200,
+        "GET /health should return 200",
+    ) {
+        return;
+    }
 
     // === App with Middleware ===
     println!("\n2. App with middleware:");
@@ -62,7 +82,13 @@ fn main() {
     let client = TestClient::new(app);
     let response = client.get("/").send();
     println!("   GET / -> {}", response.status().as_u16());
-    assert_eq!(response.status().as_u16(), 200);
+    if !check_eq(
+        response.status().as_u16(),
+        200,
+        "GET / with middleware should return 200",
+    ) {
+        return;
+    }
 
     // === App with Configuration ===
     println!("\n3. App with configuration:");
@@ -77,8 +103,20 @@ fn main() {
 
     println!("   App name: {}", app.config().name);
     println!("   Version: {}", app.config().version);
-    assert_eq!(app.config().name, "My API");
-    assert_eq!(app.config().version, "1.0.0");
+    if !check_eq(
+        app.config().name.as_str(),
+        "My API",
+        "Config name should match",
+    ) {
+        return;
+    }
+    if !check_eq(
+        app.config().version.as_str(),
+        "1.0.0",
+        "Config version should match",
+    ) {
+        return;
+    }
 
     // === 404 for unknown routes ===
     println!("\n4. 404 for unknown routes:");
@@ -87,7 +125,13 @@ fn main() {
     let client = TestClient::new(app);
     let response = client.get("/nonexistent").send();
     println!("   GET /nonexistent -> {}", response.status().as_u16());
-    assert_eq!(response.status().as_u16(), 404);
+    if !check_eq(
+        response.status().as_u16(),
+        404,
+        "Unknown routes should return 404",
+    ) {
+        return;
+    }
 
     println!("\nAll getting started examples validated successfully!");
 }

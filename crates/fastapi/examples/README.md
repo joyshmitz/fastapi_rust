@@ -16,7 +16,7 @@ The minimal "Hello, World!" example showing basic setup and usage.
 ### Running
 
 ```bash
-cargo run --example hello_world -p fastapi
+cargo run --example hello_world -p fastapi-rust
 ```
 
 ## getting_started
@@ -33,7 +33,7 @@ Validates all code snippets from the [Getting Started Guide](../../../docs/getti
 ### Running
 
 ```bash
-cargo run --example getting_started -p fastapi
+cargo run --example getting_started -p fastapi-rust
 ```
 
 ## More Examples

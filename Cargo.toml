@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Internal crates
-fastapi = { path = "crates/fastapi", version = "0.1.0", package = "fastapi-rust" }
+fastapi_rust = { path = "crates/fastapi", version = "0.1.1", package = "fastapi-rust" }
 fastapi-core = { path = "crates/fastapi-core", version = "0.1.0" }
 fastapi-http = { path = "crates/fastapi-http", version = "0.1.0" }
 fastapi-router = { path = "crates/fastapi-router", version = "0.1.0" }

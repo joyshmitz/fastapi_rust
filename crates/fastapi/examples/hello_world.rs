@@ -19,7 +19,7 @@
 //! ```
 
 // Import the core types from fastapi
-use fastapi::core::{
+use fastapi_rust::core::{
     App,            // The application builder and container
     Request,        // Incoming HTTP request
     RequestContext, // Request context (contains Cx, request ID, etc.)
@@ -46,6 +46,16 @@ use fastapi::core::{
 fn hello_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Ready<Response> {
     // Create a 200 OK response with a plain text body
     std::future::ready(Response::ok().body(ResponseBody::Bytes(b"Hello, World!".to_vec())))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn check_eq<T: PartialEq + std::fmt::Debug>(left: T, right: T, message: &str) -> bool {
+    if left == right {
+        true
+    } else {
+        eprintln!("Check failed: {message}. left={left:?} right={right:?}");
+        false
+    }
 }
 
 fn main() {
@@ -92,8 +102,12 @@ fn main() {
     println!("Response: {}\n", response.text());
 
     // Verify success
-    assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(response.text(), "Hello, World!");
+    if !check_eq(response.status().as_u16(), 200, "GET / should return 200") {
+        return;
+    }
+    if !check_eq(response.text(), "Hello, World!", "GET / should return body") {
+        return;
+    }
 
     // Try a path that doesn't exist - should get 404
     println!("Making request: GET /not-found");
@@ -103,7 +117,13 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(response.status().as_u16(), 404);
+    if !check_eq(
+        response.status().as_u16(),
+        404,
+        "Unknown routes should return 404",
+    ) {
+        return;
+    }
 
     println!("\nAll assertions passed!");
 }

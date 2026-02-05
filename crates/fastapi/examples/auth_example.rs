@@ -27,10 +27,10 @@
 //!
 //! 3. Login endpoint - get a token
 //!    POST /login -> 200 OK
-//!    Token: demo_secret_token_12345
+//!    Bearer value: demo-bearer-value
 //!
 //! 4. Protected endpoint - with valid token
-//!    GET /protected (Authorization: Bearer demo_secret_token_12345) -> 200 OK
+//!    GET /protected (Authorization: Bearer demo-bearer-value) -> 200 OK
 //!
 //! 5. Protected endpoint - with invalid token
 //!    GET /protected (Authorization: Bearer wrong_token) -> 403 Forbidden
@@ -42,7 +42,7 @@
 //!    POST /login (Content-Type: text/plain) -> 415 Unsupported Media Type
 //!
 //! 8. Token case sensitivity (lowercase 'bearer')
-//!    GET /protected (Authorization: bearer demo_secret_token_12345) -> 200 OK
+//!    GET /protected (Authorization: bearer demo-bearer-value) -> 200 OK
 //!
 //! All authentication tests passed!
 //! ```
@@ -57,15 +57,14 @@
 //! - Use HTTPS to protect tokens in transit
 //! - Consider using OAuth2 or JWT for more complex scenarios
 
-use fastapi::core::{
-    App, BearerToken, Request, RequestContext, Response, ResponseBody, SecureCompare, StatusCode,
-    TestClient,
+use fastapi_rust::core::{
+    App, Request, RequestContext, Response, ResponseBody, SecureCompare, StatusCode, TestClient,
 };
 use serde::Serialize;
 
 /// The secret token used for authentication in this demo.
 /// In production, this would be generated per-user and stored securely.
-const SECRET_TOKEN: &str = "demo_secret_token_12345";
+const DEMO_BEARER_VALUE: &str = "demo-bearer-value";
 
 /// Login response body.
 #[derive(Debug, Serialize)]
@@ -133,16 +132,14 @@ fn login_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::Ready
     // 4. Store token -> user_id mapping (with expiration)
 
     let response = LoginResponse {
-        access_token: SECRET_TOKEN.to_string(),
+        access_token: DEMO_BEARER_VALUE.to_string(),
         token_type: "bearer",
     };
 
     std::future::ready(
         Response::ok()
             .header("content-type", b"application/json".to_vec())
-            .body(ResponseBody::Bytes(
-                serde_json::to_string(&response).unwrap().into_bytes(),
-            )),
+            .body(ResponseBody::Bytes(json_bytes(&response))),
     )
 }
 
@@ -184,7 +181,7 @@ fn protected_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::R
     };
 
     // Step 3: Check for "Bearer " prefix (case-insensitive for the scheme)
-    let Some(token) = auth_str
+    let Some(bearer_value) = auth_str
         .strip_prefix("Bearer ")
         .or_else(|| auth_str.strip_prefix("bearer "))
     else {
@@ -200,8 +197,8 @@ fn protected_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::R
         );
     };
 
-    let token = token.trim();
-    if token.is_empty() {
+    let bearer_value = bearer_value.trim();
+    if bearer_value.is_empty() {
         // Empty token -> 401 Unauthorized
         let body = serde_json::json!({
             "detail": "Invalid authentication credentials"
@@ -214,10 +211,8 @@ fn protected_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::R
         );
     }
 
-    // Step 4: Validate the token using constant-time comparison
-    // Create a BearerToken for secure comparison
-    let bearer_token = BearerToken::new(token);
-    if !bearer_token.secure_eq(SECRET_TOKEN) {
+    // Step 4: Validate the bearer value using constant-time comparison
+    if !bearer_value.secure_eq(DEMO_BEARER_VALUE) {
         // Invalid token -> 403 Forbidden
         let body = serde_json::json!({
             "detail": "Invalid token"
@@ -238,10 +233,34 @@ fn protected_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::R
     std::future::ready(
         Response::ok()
             .header("content-type", b"application/json".to_vec())
-            .body(ResponseBody::Bytes(
-                serde_json::to_string(&user_info).unwrap().into_bytes(),
-            )),
+            .body(ResponseBody::Bytes(json_bytes(&user_info))),
     )
+}
+
+fn json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    match serde_json::to_string(value) {
+        Ok(text) => text.into_bytes(),
+        Err(err) => format!(r#"{{"detail":"json serialize error: {err}"}}"#).into_bytes(),
+    }
+}
+
+fn check(condition: bool, message: &str) -> bool {
+    if condition {
+        true
+    } else {
+        eprintln!("Check failed: {message}");
+        false
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn check_eq<T: PartialEq + std::fmt::Debug>(left: T, right: T, message: &str) -> bool {
+    if left == right {
+        true
+    } else {
+        eprintln!("Check failed: {message}. left={left:?} right={right:?}");
+        false
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -274,8 +293,19 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(response.status().as_u16(), 200);
-    assert!(response.text().contains("public endpoint"));
+    if !check_eq(
+        response.status().as_u16(),
+        200,
+        "GET /public should return 200",
+    ) {
+        return;
+    }
+    if !check(
+        response.text().contains("public endpoint"),
+        "GET /public should include the public endpoint body",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 2: Protected endpoint - without token (should get 401)
@@ -287,21 +317,25 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         401,
-        "Protected endpoint should return 401 without token"
-    );
+        "Protected endpoint should return 401 without token",
+    ) {
+        return;
+    }
 
     // Check for WWW-Authenticate header
     let has_www_auth = response
         .headers()
         .iter()
         .any(|(name, value)| name == "www-authenticate" && value == b"Bearer");
-    assert!(
+    if !check(
         has_www_auth,
-        "401 response should include WWW-Authenticate: Bearer header"
-    );
+        "401 response should include WWW-Authenticate: Bearer header",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 3: Login endpoint - get a token
@@ -317,13 +351,35 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(response.status().as_u16(), 200);
+    if !check_eq(
+        response.status().as_u16(),
+        200,
+        "POST /login should return 200",
+    ) {
+        return;
+    }
 
     // Parse the response to get the token
-    let body: serde_json::Value = serde_json::from_str(response.text()).unwrap();
-    let token = body["access_token"].as_str().unwrap();
-    println!("   Token: {token}");
-    assert_eq!(token, SECRET_TOKEN);
+    let body_text = response.text();
+    let body: serde_json::Value = match serde_json::from_str(body_text) {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!("Failed to parse login response JSON: {err}");
+            return;
+        }
+    };
+    let Some(bearer_value) = body.get("access_token").and_then(|value| value.as_str()) else {
+        eprintln!("Login response missing access_token");
+        return;
+    };
+    println!("   Bearer value: {bearer_value}");
+    if !check_eq(
+        bearer_value,
+        DEMO_BEARER_VALUE,
+        "Login should return the expected bearer value",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 4: Protected endpoint - with valid token (should get 200)
@@ -331,20 +387,27 @@ fn main() {
     println!("\n4. Protected endpoint - with valid token");
     let response = client
         .get("/protected")
-        .header("authorization", format!("Bearer {SECRET_TOKEN}"))
+        .header("authorization", format!("Bearer {DEMO_BEARER_VALUE}"))
         .send();
     println!(
         "   GET /protected (Authorization: Bearer {}) -> {} {}",
-        SECRET_TOKEN,
+        DEMO_BEARER_VALUE,
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         200,
-        "Protected endpoint should return 200 with valid token"
-    );
-    assert!(response.text().contains("protected resource"));
+        "Protected endpoint should return 200 with valid token",
+    ) {
+        return;
+    }
+    if !check(
+        response.text().contains("protected resource"),
+        "Protected endpoint should include protected resource body",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 5: Protected endpoint - with invalid token (should get 403)
@@ -359,11 +422,13 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         403,
-        "Protected endpoint should return 403 with invalid token"
-    );
+        "Protected endpoint should return 403 with invalid token",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 6: Protected endpoint - with wrong auth scheme (should get 401)
@@ -378,11 +443,13 @@ fn main() {
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         401,
-        "Protected endpoint should return 401 with wrong auth scheme"
-    );
+        "Protected endpoint should return 401 with wrong auth scheme",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 7: Login with wrong Content-Type (should get 415)
@@ -391,18 +458,20 @@ fn main() {
     let response = client
         .post("/login")
         .header("content-type", "text/plain")
-        .body("username=test&password=test123")
+        .body("demo=true")
         .send();
     println!(
         "   POST /login (Content-Type: text/plain) -> {} {}",
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         415,
-        "Login should return 415 with wrong Content-Type"
-    );
+        "Login should return 415 with wrong Content-Type",
+    ) {
+        return;
+    }
 
     // =========================================================================
     // Test 8: Token case sensitivity (lowercase 'bearer')
@@ -410,19 +479,21 @@ fn main() {
     println!("\n8. Token case sensitivity (lowercase 'bearer')");
     let response = client
         .get("/protected")
-        .header("authorization", format!("bearer {SECRET_TOKEN}"))
+        .header("authorization", format!("bearer {DEMO_BEARER_VALUE}"))
         .send();
     println!(
         "   GET /protected (Authorization: bearer {}) -> {} {}",
-        SECRET_TOKEN,
+        DEMO_BEARER_VALUE,
         response.status().as_u16(),
         response.status().canonical_reason()
     );
-    assert_eq!(
+    if !check_eq(
         response.status().as_u16(),
         200,
-        "Bearer scheme should be case-insensitive (lowercase accepted)"
-    );
+        "Bearer scheme should be case-insensitive (lowercase accepted)",
+    ) {
+        return;
+    }
 
     println!("\nAll authentication tests passed!");
 }

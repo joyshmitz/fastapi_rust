@@ -1,7 +1,7 @@
 [package]
 name = "fastapi-rust"
 description = "Ultra-optimized Rust web framework inspired by FastAPI"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ keywords = ["fastapi", "web", "framework", "http", "async"]
 categories = ["web-programming", "web-programming::http-server", "asynchronous"]
 
 [lib]
-name = "fastapi"
+name = "fastapi_rust"
 
 [dependencies]
 fastapi-core = { workspace = true }

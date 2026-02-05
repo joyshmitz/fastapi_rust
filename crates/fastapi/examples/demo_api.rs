@@ -14,7 +14,7 @@
 //!
 //! Run with: `cargo run --example demo_api`
 
-use fastapi::prelude::*;
+use fastapi_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -240,24 +240,24 @@ fn print_demo_info() {
     // Demonstrate the handlers
     println!("Health check:");
     let health = health_check();
-    println!("  {}", serde_json::to_string_pretty(&health).unwrap());
+    print_pretty(&health);
     println!();
 
     println!("List users (page 1, 2 per page):");
     let users = list_users(1, 2);
-    println!("  {}", serde_json::to_string_pretty(&users).unwrap());
+    print_pretty(&users);
     println!();
 
     println!("Get user 1:");
     match get_user(1) {
-        Ok(resp) => println!("  {}", serde_json::to_string_pretty(&resp).unwrap()),
+        Ok(resp) => print_pretty(&resp),
         Err((code, msg)) => println!("  Error {code}: {msg}"),
     }
     println!();
 
     println!("Get user 999 (not found):");
     match get_user(999) {
-        Ok(resp) => println!("  {}", serde_json::to_string_pretty(&resp).unwrap()),
+        Ok(resp) => print_pretty(&resp),
         Err((code, msg)) => println!("  Error {code}: {msg}"),
     }
     println!();
@@ -268,7 +268,14 @@ fn print_demo_info() {
         email: "new@example.com".into(),
         role: Some(UserRole::Editor),
     });
-    println!("  {}", serde_json::to_string_pretty(&new_user).unwrap());
+    print_pretty(&new_user);
+}
+
+fn print_pretty<T: Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("  {text}"),
+        Err(err) => println!("  <json error: {err}>"),
+    }
 }
 
 // ============================================================

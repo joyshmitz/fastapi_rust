@@ -18,7 +18,7 @@
 //! # Running This Example
 //!
 //! ```bash
-//! cargo run --example crud_api -p fastapi
+//! cargo run --example crud_api -p fastapi-rust
 //! ```
 //!
 //! # Equivalent curl Commands
@@ -44,7 +44,7 @@
 //! curl -X DELETE http://localhost:8000/users/1
 //! ```
 
-use fastapi::core::{
+use fastapi_rust::core::{
     App, Body, Request, RequestContext, Response, ResponseBody, StatusCode, TestClient,
 };
 use serde::{Deserialize, Serialize};
@@ -78,8 +78,13 @@ struct UserDb {
 static STORE: Mutex<Option<UserDb>> = Mutex::new(None);
 
 fn with_db<R>(f: impl FnOnce(&mut UserDb) -> R) -> R {
-    let mut guard = STORE.lock().unwrap();
-    let db = guard.as_mut().expect("store initialized");
+    let mut guard = STORE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let db = guard.get_or_insert_with(|| UserDb {
+        users: HashMap::new(),
+        next_id: 1,
+    });
     f(db)
 }
 
@@ -124,11 +129,15 @@ fn json_error(status: StatusCode, detail: &str) -> Response {
 }
 
 fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
-    Response::with_status(status)
-        .header("content-type", b"application/json".to_vec())
-        .body(ResponseBody::Bytes(
-            serde_json::to_string(value).unwrap().into_bytes(),
-        ))
+    match serde_json::to_string(value) {
+        Ok(text) => Response::with_status(status)
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(text.into_bytes())),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("JSON serialization failed: {err}"),
+        ),
+    }
 }
 
 fn validate_input(input: &UserInput) -> Option<Response> {
@@ -248,10 +257,23 @@ fn delete_user(_ctx: &RequestContext, req: &mut Request) -> std::future::Ready<R
 // Main
 // ============================================================================
 
+#[allow(clippy::needless_pass_by_value)]
+fn check_eq<T: PartialEq + std::fmt::Debug>(left: T, right: T, message: &str) -> bool {
+    if left == right {
+        true
+    } else {
+        eprintln!("Check failed: {message}. left={left:?} right={right:?}");
+        false
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     // Initialize the global store
-    *STORE.lock().unwrap() = Some(UserDb {
+    let mut guard = STORE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(UserDb {
         users: HashMap::new(),
         next_id: 1,
     });
@@ -282,7 +304,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 201);
+    if !check_eq(resp.status().as_u16(), 201, "Create user should return 201") {
+        return;
+    }
 
     let resp = client
         .post("/users")
@@ -294,7 +318,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 201);
+    if !check_eq(resp.status().as_u16(), 201, "Create user should return 201") {
+        return;
+    }
 
     // 2. List users
     println!("\n2. List all users");
@@ -304,7 +330,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 200);
+    if !check_eq(resp.status().as_u16(), 200, "List users should return 200") {
+        return;
+    }
 
     // 3. Get user by ID
     println!("\n3. Get user by ID");
@@ -314,7 +342,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 200);
+    if !check_eq(resp.status().as_u16(), 200, "Get user should return 200") {
+        return;
+    }
 
     // 4. Get nonexistent user
     println!("\n4. Get nonexistent user");
@@ -324,7 +354,13 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 404);
+    if !check_eq(
+        resp.status().as_u16(),
+        404,
+        "Missing user should return 404",
+    ) {
+        return;
+    }
 
     // 5. Update user
     println!("\n5. Update user");
@@ -338,7 +374,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 200);
+    if !check_eq(resp.status().as_u16(), 200, "Update user should return 200") {
+        return;
+    }
 
     // 6. Validation: empty name
     println!("\n6. Validation error (empty name)");
@@ -352,7 +390,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 400);
+    if !check_eq(resp.status().as_u16(), 400, "Empty name should return 400") {
+        return;
+    }
 
     // 7. Validation: invalid email
     println!("\n7. Validation error (invalid email)");
@@ -366,7 +406,13 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 400);
+    if !check_eq(
+        resp.status().as_u16(),
+        400,
+        "Invalid email should return 400",
+    ) {
+        return;
+    }
 
     // 8. Wrong Content-Type
     println!("\n8. Wrong Content-Type");
@@ -380,13 +426,21 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 415);
+    if !check_eq(
+        resp.status().as_u16(),
+        415,
+        "Wrong Content-Type should return 415",
+    ) {
+        return;
+    }
 
     // 9. Delete user
     println!("\n9. Delete user");
     let resp = client.delete("/users/2").send();
     println!("   DELETE /users/2 -> {}", resp.status().as_u16());
-    assert_eq!(resp.status().as_u16(), 204);
+    if !check_eq(resp.status().as_u16(), 204, "Delete user should return 204") {
+        return;
+    }
 
     // 10. Verify deletion
     println!("\n10. Verify deletion");
@@ -396,7 +450,13 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 404);
+    if !check_eq(
+        resp.status().as_u16(),
+        404,
+        "Deleted user should return 404",
+    ) {
+        return;
+    }
 
     let resp = client.get("/users").send();
     println!(
@@ -404,7 +464,9 @@ fn main() {
         resp.status().as_u16(),
         resp.text()
     );
-    assert_eq!(resp.status().as_u16(), 200);
+    if !check_eq(resp.status().as_u16(), 200, "List users should return 200") {
+        return;
+    }
 
     println!("\nAll CRUD operations passed!");
 }
