@@ -18,6 +18,26 @@
 
 </div>
 
+<div align="center">
+<h3>Quick Install</h3>
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/fastapi_rust/main/install.sh?$(date +%s)" | bash
+```
+
+**Or add to your project:**
+
+```toml
+# Cargo.toml
+[dependencies]
+fastapi = { git = "https://github.com/Dicklesworthstone/fastapi_rust.git" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git" }
+serde = { version = "1", features = ["derive"] }
+```
+
+<p><em>Requires Rust 1.85+ (2024 edition). Co-developed with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a>.</em></p>
+</div>
+
 ---
 
 ## TL;DR

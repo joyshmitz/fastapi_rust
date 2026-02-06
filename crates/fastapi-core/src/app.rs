@@ -1348,6 +1348,116 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
         })
 }
 
+// ============================================================================
+// OpenAPI Configuration
+// ============================================================================
+
+/// Configuration for OpenAPI documentation generation.
+///
+/// When enabled, the application will automatically generate an OpenAPI 3.1
+/// specification and serve it at the configured endpoint (default `/openapi.json`).
+///
+/// # Example
+///
+/// ```ignore
+/// use fastapi_core::app::{App, OpenApiConfig};
+///
+/// let app = App::builder()
+///     .openapi(OpenApiConfig::new()
+///         .title("My API")
+///         .version("1.0.0")
+///         .description("A sample API"))
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct OpenApiConfig {
+    /// Whether OpenAPI documentation is enabled.
+    pub enabled: bool,
+    /// API title for the OpenAPI spec.
+    pub title: String,
+    /// API version for the OpenAPI spec.
+    pub version: String,
+    /// API description.
+    pub description: Option<String>,
+    /// Path to serve the OpenAPI JSON (default: "/openapi.json").
+    pub openapi_path: String,
+    /// Servers to include in the spec.
+    pub servers: Vec<(String, Option<String>)>,
+    /// Tags for organizing operations.
+    pub tags: Vec<(String, Option<String>)>,
+}
+
+impl Default for OpenApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            title: "FastAPI Rust".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            openapi_path: "/openapi.json".to_string(),
+            servers: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+}
+
+impl OpenApiConfig {
+    /// Create a new OpenAPI configuration with defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the API title.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Set the API version.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = version.into();
+        self
+    }
+
+    /// Set the API description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the path for the OpenAPI JSON endpoint.
+    #[must_use]
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.openapi_path = path.into();
+        self
+    }
+
+    /// Add a server to the spec.
+    #[must_use]
+    pub fn server(mut self, url: impl Into<String>, description: Option<String>) -> Self {
+        self.servers.push((url.into(), description));
+        self
+    }
+
+    /// Add a tag to the spec.
+    #[must_use]
+    pub fn tag(mut self, name: impl Into<String>, description: Option<String>) -> Self {
+        self.tags.push((name.into(), description));
+        self
+    }
+
+    /// Disable OpenAPI documentation.
+    #[must_use]
+    pub fn disable(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+}
+
 /// Builder for constructing an [`App`].
 ///
 /// Use this to configure routes, middleware, and shared state before
@@ -1442,6 +1552,27 @@ impl<S: StateRegistry> AppBuilder<S> {
     #[must_use]
     pub fn config(mut self, config: AppConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Enables and configures OpenAPI documentation.
+    ///
+    /// When enabled, the application will automatically generate an OpenAPI 3.1
+    /// specification and serve it at the configured endpoint.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let app = App::builder()
+    ///     .openapi(OpenApiConfig::new()
+    ///         .title("My API")
+    ///         .version("1.0.0")
+    ///         .description("A sample API"))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn openapi(mut self, config: OpenApiConfig) -> Self {
+        self.openapi_config = Some(config);
         self
     }
 
@@ -2035,8 +2166,48 @@ impl<S: StateRegistry> AppBuilder<S> {
     /// Builds the application.
     ///
     /// This consumes the builder and returns the configured [`App`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if any routes conflict (same method + structurally identical path pattern).
     #[must_use]
-    pub fn build(self) -> App {
+    pub fn build(mut self) -> App {
+        // Generate OpenAPI spec if configured
+        let (openapi_spec, openapi_path) = if let Some(ref openapi_config) = self.openapi_config {
+            if openapi_config.enabled {
+                let spec = self.generate_openapi_spec(openapi_config);
+                let spec_json =
+                    serde_json::to_string_pretty(&spec).unwrap_or_else(|_| "{}".to_string());
+                (
+                    Some(Arc::new(spec_json)),
+                    Some(openapi_config.openapi_path.clone()),
+                )
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Add OpenAPI endpoint if spec was generated
+        if let (Some(spec), Some(path)) = (&openapi_spec, &openapi_path) {
+            let spec_clone = Arc::clone(spec);
+            self.routes.push(RouteEntry::new(
+                Method::Get,
+                path.clone(),
+                move |_ctx: &RequestContext, _req: &mut Request| {
+                    let spec = Arc::clone(&spec_clone);
+                    async move {
+                        Response::ok()
+                            .header("content-type", b"application/json".to_vec())
+                            .body(crate::response::ResponseBody::Bytes(
+                                spec.as_bytes().to_vec(),
+                            ))
+                    }
+                },
+            ));
+        }
+
         let mut middleware_stack = MiddlewareStack::with_capacity(self.middleware.len());
         for mw in self.middleware {
             middleware_stack.push_arc(mw);
@@ -2064,6 +2235,65 @@ impl<S: StateRegistry> AppBuilder<S> {
             lifespan_cleanup: parking_lot::Mutex::new(None),
             mounted_apps: self.mounted_apps,
         }
+    }
+
+    /// Generate an OpenAPI spec from registered routes.
+    fn generate_openapi_spec(&self, config: &OpenApiConfig) -> fastapi_openapi::OpenApi {
+        use fastapi_openapi::{OpenApiBuilder, Operation, Response as OAResponse};
+        use std::collections::HashMap;
+
+        let mut builder = OpenApiBuilder::new(&config.title, &config.version);
+
+        // Add description if provided
+        if let Some(ref desc) = config.description {
+            builder = builder.description(desc);
+        }
+
+        // Add servers
+        for (url, desc) in &config.servers {
+            builder = builder.server(url, desc.clone());
+        }
+
+        // Add tags
+        for (name, desc) in &config.tags {
+            builder = builder.tag(name, desc.clone());
+        }
+
+        // Add operations for each registered route
+        for entry in &self.routes {
+            // Create a basic operation with default response
+            let mut responses = HashMap::new();
+            responses.insert(
+                "200".to_string(),
+                OAResponse {
+                    description: "Successful response".to_string(),
+                    content: HashMap::new(),
+                },
+            );
+
+            let operation = Operation {
+                operation_id: Some(format!(
+                    "{}_{}",
+                    entry.method.as_str().to_lowercase(),
+                    entry
+                        .path
+                        .replace('/', "_")
+                        .replace(['{', '}'], "")
+                        .trim_matches('_')
+                )),
+                summary: None,
+                description: None,
+                tags: Vec::new(),
+                parameters: Vec::new(),
+                request_body: None,
+                responses,
+                deprecated: false,
+            };
+
+            builder = builder.operation(entry.method.as_str(), &entry.path, operation);
+        }
+
+        builder.build()
     }
 }
 

@@ -19005,3 +19005,126 @@ mod body_size_limit_tests {
         assert!(result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod valid_tests {
+    use super::*;
+    use crate::error::ValidationErrors;
+    use crate::request::Method;
+    use crate::validation::Validate;
+
+    fn test_context() -> RequestContext {
+        let cx = asupersync::Cx::for_testing();
+        RequestContext::new(cx, 12345)
+    }
+
+    // Implement Validate for String (for testing purposes)
+    impl Validate for String {
+        fn validate(&self) -> Result<(), ValidationErrors> {
+            if self.is_empty() {
+                let mut errors = ValidationErrors::new();
+                errors.push(crate::error::ValidationError::new(
+                    crate::error::error_types::STRING_TOO_SHORT,
+                    crate::error::loc::body(),
+                ));
+                Err(errors)
+            } else if self.len() > 100 {
+                let mut errors = ValidationErrors::new();
+                errors.push(crate::error::ValidationError::new(
+                    crate::error::error_types::STRING_TOO_LONG,
+                    crate::error::loc::body(),
+                ));
+                Err(errors)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Mock extractor for testing
+    struct MockExtractor(String);
+
+    impl Deref for MockExtractor {
+        type Target = String;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl FromRequest for MockExtractor {
+        type Error = HttpError;
+
+        async fn from_request(
+            _ctx: &RequestContext,
+            req: &mut Request,
+        ) -> Result<Self, Self::Error> {
+            let body = req.take_body();
+            let bytes = body.into_bytes();
+            let s = String::from_utf8(bytes).map_err(|_| HttpError::bad_request())?;
+            Ok(MockExtractor(s))
+        }
+    }
+
+    #[test]
+    fn valid_deref() {
+        let valid = Valid(42i32);
+        assert_eq!(*valid, 42);
+    }
+
+    #[test]
+    fn valid_into_inner() {
+        let valid = Valid("hello".to_string());
+        assert_eq!(valid.into_inner(), "hello");
+    }
+
+    #[test]
+    fn valid_extract_and_validate_success() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/test");
+        req.set_body(Body::Bytes(b"valid string".to_vec()));
+
+        let result =
+            futures_executor::block_on(Valid::<MockExtractor>::from_request(&ctx, &mut req));
+        assert!(result.is_ok());
+        let Valid(MockExtractor(inner)) = result.unwrap();
+        assert_eq!(inner, "valid string");
+    }
+
+    #[test]
+    fn valid_extract_validation_fails_empty() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/test");
+        req.set_body(Body::Bytes(b"".to_vec()));
+
+        let result =
+            futures_executor::block_on(Valid::<MockExtractor>::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(ValidExtractError::Validation(_))));
+    }
+
+    #[test]
+    fn valid_extract_validation_fails_too_long() {
+        let ctx = test_context();
+        let mut req = Request::new(Method::Post, "/test");
+        // Create a string longer than 100 characters
+        let long_string = "a".repeat(101);
+        req.set_body(Body::Bytes(long_string.into_bytes()));
+
+        let result =
+            futures_executor::block_on(Valid::<MockExtractor>::from_request(&ctx, &mut req));
+        assert!(matches!(result, Err(ValidExtractError::Validation(_))));
+    }
+
+    #[test]
+    fn valid_extract_error_display() {
+        let extract_err: ValidExtractError<HttpError> =
+            ValidExtractError::Extract(HttpError::bad_request());
+        let display = format!("{}", extract_err);
+        assert!(display.contains("Extraction failed"));
+
+        let validation_err: ValidExtractError<HttpError> =
+            ValidExtractError::Validation(ValidationErrors::new());
+        let display = format!("{}", validation_err);
+        assert!(display.contains("validation error"));
+    }
+}

@@ -376,9 +376,25 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
     let fn_inputs = &input_fn.sig.inputs;
     let fn_output = &input_fn.sig.output;
     let fn_asyncness = &input_fn.sig.asyncness;
+    let fn_attrs = &input_fn.attrs;
 
-    let route_fn_name = syn::Ident::new(&format!("__route_{fn_name}"), fn_name.span());
-    let reg_name = syn::Ident::new(&format!("__FASTAPI_ROUTE_REG_{fn_name}"), fn_name.span());
+    // Parse all parameters
+    let params: Vec<ParamInfo> = fn_inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            FnArg::Typed(PatType { pat, ty, .. }) => {
+                if let Pat::Ident(PatIdent { ident, .. }) = pat.as_ref() {
+                    Some(ParamInfo {
+                        name: ident.clone(),
+                        ty: ty.as_ref().clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
 
     let method_ident = syn::Ident::new(method, proc_macro2::Span::call_site());
     let path = &attrs.path;
@@ -640,6 +656,8 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
 
     // Generate the expanded code
     let expanded = quote! {
+        // Original function preserved for direct calling
+        #(#fn_attrs)*
         #fn_vis #fn_asyncness fn #fn_name(#fn_inputs) #fn_output #fn_block
 
         // Compile-time assertions: all extractor parameters must implement FromRequest
@@ -670,6 +688,7 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
             #(#response_calls)*
         }
 
+        // Static registration for route discovery
         #[doc(hidden)]
         #[allow(unsafe_code)]
         #[allow(non_upper_case_globals)]

@@ -933,6 +933,58 @@ impl ValidationError {
         self
     }
 
+    /// Create a "greater_than_equal" error for minimum value constraint.
+    #[must_use]
+    pub fn greater_than_equal<T: std::fmt::Display>(loc: Vec<LocItem>, min: T) -> Self {
+        let min_str = min.to_string();
+        Self::new(error_types::GREATER_THAN_EQUAL, loc)
+            .with_msg(format!(
+                "Input should be greater than or equal to {min_str}"
+            ))
+            .with_ctx_value("ge", serde_json::json!(min_str))
+    }
+
+    /// Create a "less_than_equal" error for maximum value constraint.
+    #[must_use]
+    pub fn less_than_equal<T: std::fmt::Display>(loc: Vec<LocItem>, max: T) -> Self {
+        let max_str = max.to_string();
+        Self::new(error_types::LESS_THAN_EQUAL, loc)
+            .with_msg(format!("Input should be less than or equal to {max_str}"))
+            .with_ctx_value("le", serde_json::json!(max_str))
+    }
+
+    /// Create a "string_pattern_mismatch" error for regex pattern constraint.
+    #[must_use]
+    pub fn pattern_mismatch(loc: Vec<LocItem>, pattern: &str) -> Self {
+        Self::new(error_types::STRING_PATTERN_MISMATCH, loc)
+            .with_msg(format!("String should match pattern '{pattern}'"))
+            .with_ctx_value("pattern", serde_json::json!(pattern))
+    }
+
+    /// Create a "value_error" for invalid email format.
+    #[must_use]
+    pub fn invalid_email(loc: Vec<LocItem>) -> Self {
+        Self::new(error_types::VALUE_ERROR, loc).with_msg("Value is not a valid email address")
+    }
+
+    /// Create a "value_error" for invalid URL format.
+    #[must_use]
+    pub fn invalid_url(loc: Vec<LocItem>) -> Self {
+        Self::new(error_types::URL_TYPE, loc).with_msg("Input should be a valid URL")
+    }
+
+    /// Create a "value_error" for invalid UUID format.
+    #[must_use]
+    pub fn invalid_uuid(loc: Vec<LocItem>) -> Self {
+        Self::new(error_types::UUID_TYPE, loc).with_msg("Input should be a valid UUID")
+    }
+
+    /// Create a generic "value_error" with custom message.
+    #[must_use]
+    pub fn value_error(loc: Vec<LocItem>, msg: impl Into<String>) -> Self {
+        Self::new(error_types::VALUE_ERROR, loc).with_msg(msg)
+    }
+
     /// Get the default message for an error type.
     fn default_message(error_type: &str) -> String {
         match error_type {

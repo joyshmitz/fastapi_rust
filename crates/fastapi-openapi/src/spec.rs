@@ -153,6 +153,19 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Create default 200 OK response map.
+fn default_responses() -> HashMap<String, Response> {
+    let mut responses = HashMap::new();
+    responses.insert(
+        "200".to_string(),
+        Response {
+            description: "Successful response".to_string(),
+            content: HashMap::new(),
+        },
+    );
+    responses
+}
+
 /// Operation parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Parameter {
