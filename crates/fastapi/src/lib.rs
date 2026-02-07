@@ -493,26 +493,8 @@ impl OpenApiExt for App {
     where
         F: FnOnce(OpenApiBuilder) -> OpenApiBuilder,
     {
-        // Start with app config
         let mut builder = OpenApiBuilder::new(&self.config().name, &self.config().version);
-
-        // Add routes from the application
-        for (method, path) in self.routes() {
-            let operation_id = generate_operation_id(method, path);
-            let method_str = method_to_str(method);
-            builder = builder.operation(
-                method_str,
-                path,
-                fastapi_openapi::Operation {
-                    operation_id: Some(operation_id),
-                    ..Default::default()
-                },
-            );
-        }
-
-        // Apply custom configuration
         builder = configure(builder);
-
         builder.build()
     }
 }

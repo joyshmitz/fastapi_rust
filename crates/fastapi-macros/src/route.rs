@@ -12,9 +12,14 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    FnArg, GenericArgument, ItemFn, LitStr, PathArguments, ReturnType, Token, Type, parse::Parse,
-    parse::ParseStream, parse_macro_input, punctuated::Punctuated,
+    FnArg, GenericArgument, ItemFn, LitStr, Pat, PatIdent, PatType, PathArguments, ReturnType,
+    Token, Type, parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated,
 };
+
+struct ParamInfo {
+    name: syn::Ident,
+    ty: Type,
+}
 
 /// A declared response type for OpenAPI documentation.
 struct ResponseDecl {
@@ -395,6 +400,9 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
             FnArg::Receiver(_) => None,
         })
         .collect();
+
+    let route_fn_name = syn::Ident::new(&format!("__route_{fn_name}"), fn_name.span());
+    let reg_name = syn::Ident::new(&format!("__FASTAPI_ROUTE_REG_{fn_name}"), fn_name.span());
 
     let method_ident = syn::Ident::new(method, proc_macro2::Span::call_site());
     let path = &attrs.path;

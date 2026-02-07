@@ -2,6 +2,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt;
 
 /// HTTP version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

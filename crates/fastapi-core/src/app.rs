@@ -1517,6 +1517,8 @@ pub struct AppBuilder<S: StateRegistry = ()> {
     lifespan: Option<BoxLifespanFn>,
     /// Mounted sub-applications at specific path prefixes.
     mounted_apps: Vec<MountedApp>,
+    /// Optional OpenAPI configuration.
+    openapi_config: Option<OpenApiConfig>,
     _state_marker: PhantomData<S>,
 }
 
@@ -1534,6 +1536,7 @@ impl Default for AppBuilder<()> {
             async_shutdown_hooks: Vec::new(),
             lifespan: None,
             mounted_apps: Vec::new(),
+            openapi_config: None,
             _state_marker: PhantomData,
         }
     }
@@ -1839,6 +1842,7 @@ impl<S: StateRegistry> AppBuilder<S> {
             async_shutdown_hooks: self.async_shutdown_hooks,
             lifespan: self.lifespan,
             mounted_apps: self.mounted_apps,
+            openapi_config: self.openapi_config,
             _state_marker: PhantomData,
         }
     }
@@ -2175,7 +2179,7 @@ impl<S: StateRegistry> AppBuilder<S> {
         // Generate OpenAPI spec if configured
         let (openapi_spec, openapi_path) = if let Some(ref openapi_config) = self.openapi_config {
             if openapi_config.enabled {
-                let spec = self.generate_openapi_spec(openapi_config);
+                let spec = self.generate_openapi_stub(openapi_config);
                 let spec_json =
                     serde_json::to_string_pretty(&spec).unwrap_or_else(|_| "{}".to_string());
                 (
@@ -2191,19 +2195,19 @@ impl<S: StateRegistry> AppBuilder<S> {
 
         // Add OpenAPI endpoint if spec was generated
         if let (Some(spec), Some(path)) = (&openapi_spec, &openapi_path) {
-            let spec_clone = Arc::clone(spec);
+            let spec_clone: Arc<String> = Arc::clone(spec);
             self.routes.push(RouteEntry::new(
                 Method::Get,
                 path.clone(),
                 move |_ctx: &RequestContext, _req: &mut Request| {
                     let spec = Arc::clone(&spec_clone);
-                    async move {
+                    Box::pin(async move {
                         Response::ok()
                             .header("content-type", b"application/json".to_vec())
                             .body(crate::response::ResponseBody::Bytes(
                                 spec.as_bytes().to_vec(),
                             ))
-                    }
+                    })
                 },
             ));
         }
@@ -2237,63 +2241,30 @@ impl<S: StateRegistry> AppBuilder<S> {
         }
     }
 
-    /// Generate an OpenAPI spec from registered routes.
-    fn generate_openapi_spec(&self, config: &OpenApiConfig) -> fastapi_openapi::OpenApi {
-        use fastapi_openapi::{OpenApiBuilder, Operation, Response as OAResponse};
-        use std::collections::HashMap;
-
-        let mut builder = OpenApiBuilder::new(&config.title, &config.version);
-
-        // Add description if provided
-        if let Some(ref desc) = config.description {
-            builder = builder.description(desc);
-        }
-
-        // Add servers
-        for (url, desc) in &config.servers {
-            builder = builder.server(url, desc.clone());
-        }
-
-        // Add tags
-        for (name, desc) in &config.tags {
-            builder = builder.tag(name, desc.clone());
-        }
-
-        // Add operations for each registered route
+    /// Generate a minimal OpenAPI-like spec stub from registered routes.
+    fn generate_openapi_stub(&self, config: &OpenApiConfig) -> serde_json::Value {
+        let mut paths = serde_json::Map::new();
         for entry in &self.routes {
-            // Create a basic operation with default response
-            let mut responses = HashMap::new();
-            responses.insert(
-                "200".to_string(),
-                OAResponse {
-                    description: "Successful response".to_string(),
-                    content: HashMap::new(),
-                },
-            );
-
-            let operation = Operation {
-                operation_id: Some(format!(
-                    "{}_{}",
-                    entry.method.as_str().to_lowercase(),
-                    entry
-                        .path
-                        .replace('/', "_")
-                        .replace(['{', '}'], "")
-                        .trim_matches('_')
-                )),
-                summary: None,
-                description: None,
-                tags: Vec::new(),
-                parameters: Vec::new(),
-                request_body: None,
-                responses,
-                deprecated: false,
-            };
-
-            builder = builder.operation(entry.method.as_str(), &entry.path, operation);
+            let method = entry.method.as_str().to_lowercase();
+            let op = serde_json::json!({
+                "responses": { "200": { "description": "Successful response" } }
+            });
+            paths
+                .entry(entry.path.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .unwrap()
+                .insert(method, op);
         }
-
-        builder.build()
+        let mut spec = serde_json::json!({
+            "openapi": "3.0.3",
+            "info": { "title": config.title, "version": config.version },
+            "paths": paths,
+        });
+        if let Some(ref desc) = config.description {
+            spec["info"]["description"] = serde_json::Value::String(desc.clone());
+        }
+        spec
     }
 }
 
