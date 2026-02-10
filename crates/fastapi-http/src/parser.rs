@@ -872,6 +872,15 @@ impl StatefulParser {
         self.buffer.len()
     }
 
+    /// Take the currently buffered (unconsumed) bytes.
+    ///
+    /// This is primarily used for protocol upgrades (e.g., WebSocket) where the HTTP parser
+    /// must hand off any already-read bytes to the next protocol layer.
+    #[must_use]
+    pub fn take_buffered(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
+    }
+
     /// Clear buffered data and reset state.
     pub fn clear(&mut self) {
         self.buffer.clear();

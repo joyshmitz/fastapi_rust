@@ -2862,11 +2862,8 @@ impl AppServeExt for App {
             // Create the TCP server
             let server = TcpServer::new(config);
 
-            // Wrap app in Arc for sharing with handler
-            // App implements Handler trait, so we can use serve_handler
+            // Wrap app in Arc for sharing.
             let app = Arc::new(self);
-            let handler: Arc<dyn fastapi_core::Handler> =
-                Arc::clone(&app) as Arc<dyn fastapi_core::Handler>;
 
             // Create a root Cx for the server
             let cx = Cx::for_testing();
@@ -2875,8 +2872,8 @@ impl AppServeExt for App {
             let bind_addr = &server.config().bind_addr;
             println!("🚀 Server starting on http://{bind_addr}");
 
-            // Run the server using the Handler-based serve method
-            let result = server.serve_handler(&cx, handler).await;
+            // Run the server with App-aware routing (enables protocol upgrades like WebSocket).
+            let result = server.serve_app(&cx, Arc::clone(&app)).await;
 
             // Run shutdown hooks (use the original Arc<App>)
             app.run_shutdown_hooks().await;

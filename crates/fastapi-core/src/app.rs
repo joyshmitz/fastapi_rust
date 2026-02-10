@@ -195,6 +195,17 @@ pub type BoxHandler = Box<
         + Sync,
 >;
 
+/// A boxed websocket handler function.
+pub type BoxWebSocketHandler = Box<
+    dyn Fn(
+            &RequestContext,
+            &mut Request,
+            crate::websocket::WebSocket,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::websocket::WebSocketError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A registered route with its handler.
 #[derive(Clone)]
 pub struct RouteEntry {
@@ -267,6 +278,54 @@ impl std::fmt::Debug for RouteEntry {
             .field("method", &self.method)
             .field("path", &self.path)
             .field("meta", &self.meta.as_ref().map(|r| r.operation_id.as_str()))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A registered websocket route with its handler.
+#[derive(Clone)]
+pub struct WebSocketRouteEntry {
+    /// The path pattern for this websocket route.
+    pub path: String,
+    /// Handler function.
+    handler: Arc<BoxWebSocketHandler>,
+}
+
+impl WebSocketRouteEntry {
+    /// Create a new websocket route entry.
+    pub fn new<H, Fut>(path: impl Into<String>, handler: H) -> Self
+    where
+        H: Fn(&RequestContext, &mut Request, crate::websocket::WebSocket) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Result<(), crate::websocket::WebSocketError>> + Send + 'static,
+    {
+        let handler: BoxWebSocketHandler = Box::new(move |ctx, req, ws| {
+            let fut = handler(ctx, req, ws);
+            Box::pin(fut)
+        });
+        Self {
+            path: path.into(),
+            handler: Arc::new(handler),
+        }
+    }
+
+    /// Calls the websocket handler.
+    pub async fn call(
+        &self,
+        ctx: &RequestContext,
+        req: &mut Request,
+        ws: crate::websocket::WebSocket,
+    ) -> Result<(), crate::websocket::WebSocketError> {
+        (self.handler)(ctx, req, ws).await
+    }
+}
+
+impl std::fmt::Debug for WebSocketRouteEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketRouteEntry")
+            .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
@@ -746,6 +805,7 @@ impl OpenApiConfig {
 pub struct AppBuilder {
     config: AppConfig,
     routes: Vec<RouteEntry>,
+    ws_routes: Vec<WebSocketRouteEntry>,
     middleware: Vec<Arc<dyn Middleware>>,
     state: StateContainer,
     exception_handlers: ExceptionHandlers,
@@ -761,6 +821,7 @@ impl Default for AppBuilder {
         Self {
             config: AppConfig::default(),
             routes: Vec::new(),
+            ws_routes: Vec::new(),
             middleware: Vec::new(),
             state: StateContainer::default(),
             exception_handlers: ExceptionHandlers::default(),
@@ -863,6 +924,23 @@ impl AppBuilder {
     #[must_use]
     pub fn route_entry(mut self, entry: RouteEntry) -> Self {
         self.routes.push(entry);
+        self
+    }
+
+    /// Adds a websocket route to the application.
+    ///
+    /// WebSocket routes are matched only when the server receives a valid
+    /// websocket upgrade request. They do not appear in OpenAPI output.
+    #[must_use]
+    pub fn websocket<H, Fut>(mut self, path: impl Into<String>, handler: H) -> Self
+    where
+        H: Fn(&RequestContext, &mut Request, crate::websocket::WebSocket) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Result<(), crate::websocket::WebSocketError>> + Send + 'static,
+    {
+        self.ws_routes.push(WebSocketRouteEntry::new(path, handler));
         self
     }
 
@@ -1227,10 +1305,20 @@ impl AppBuilder {
                 .expect("route conflict during App::build()");
         }
 
+        // Build the websocket router separately (so websocket + HTTP can share the same path).
+        let mut ws_router = Router::new();
+        for entry in &self.ws_routes {
+            ws_router
+                .add(Route::new(Method::Get, &entry.path))
+                .expect("websocket route conflict during App::build()");
+        }
+
         App {
             config: self.config,
             routes: self.routes,
+            ws_routes: self.ws_routes,
             router,
+            ws_router,
             middleware: middleware_stack,
             state: Arc::new(self.state),
             exception_handlers: Arc::new(self.exception_handlers),
@@ -1328,7 +1416,9 @@ impl std::fmt::Debug for AppBuilder {
 pub struct App {
     config: AppConfig,
     routes: Vec<RouteEntry>,
+    ws_routes: Vec<WebSocketRouteEntry>,
     router: Router,
+    ws_router: Router,
     middleware: MiddlewareStack,
     state: Arc<StateContainer>,
     exception_handlers: Arc<ExceptionHandlers>,
@@ -1377,6 +1467,12 @@ impl App {
     #[must_use]
     pub fn route_count(&self) -> usize {
         self.routes.len()
+    }
+
+    /// Returns the number of registered websocket routes.
+    #[must_use]
+    pub fn websocket_route_count(&self) -> usize {
+        self.ws_routes.len()
     }
 
     /// Returns an iterator over route metadata (method, path).
@@ -1552,9 +1648,47 @@ impl App {
                         }
                         Err(_) => {
                             warnings += 1;
-                        }
-                    }
+        }
+    }
+
+    /// Handles an incoming websocket upgrade request after the handshake has been accepted.
+    ///
+    /// The HTTP server is responsible for validating the upgrade headers and writing the 101
+    /// response. This function only performs path matching and calls the websocket handler.
+    pub async fn handle_websocket(
+        &self,
+        ctx: &RequestContext,
+        req: &mut Request,
+        ws: crate::websocket::WebSocket,
+    ) -> Result<(), crate::websocket::WebSocketError> {
+        match self.ws_router.lookup(req.path(), Method::Get) {
+            RouteLookup::Match(route_match) => {
+                let entry = self.ws_routes.iter().find(|e| e.path == route_match.route.path);
+                let Some(entry) = entry else {
+                    return Err(crate::websocket::WebSocketError::Protocol(
+                        "websocket route missing handler",
+                    ));
+                };
+
+                if !route_match.params.is_empty() {
+                    let path_params = crate::extract::PathParams::from_pairs(
+                        route_match
+                            .params
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                            .collect(),
+                    );
+                    req.insert_extension(path_params);
                 }
+
+                entry.call(ctx, req, ws).await
+            }
+            _ => Err(crate::websocket::WebSocketError::Protocol(
+                "no websocket route matched",
+            )),
+        }
+    }
+}
                 Err(e) if e.abort => {
                     return StartupOutcome::Aborted(e);
                 }
