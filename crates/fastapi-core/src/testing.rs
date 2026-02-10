@@ -61,7 +61,40 @@ use crate::response::{Response, ResponseBody, StatusCode};
 /// added to subsequent requests.
 #[derive(Debug, Clone, Default)]
 pub struct CookieJar {
-    cookies: HashMap<String, String>,
+    cookies: Vec<StoredCookie>,
+    next_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookieSameSite {
+    Lax,
+    Strict,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CookieDomain {
+    /// Unscoped cookies are always sent (used by manual `CookieJar::set()`).
+    Any,
+    /// Host-only cookie (Domain attribute not present).
+    HostOnly(String),
+    /// Domain cookie (Domain attribute present).
+    Domain(String),
+}
+
+#[derive(Debug, Clone)]
+struct StoredCookie {
+    id: u64,
+    name: String,
+    value: String,
+    domain: CookieDomain,
+    path: String,
+    secure: bool,
+    #[allow(dead_code)]
+    http_only: bool,
+    #[allow(dead_code)]
+    same_site: Option<CookieSameSite>,
+    expires_at: Option<std::time::SystemTime>,
 }
 
 impl CookieJar {
@@ -73,23 +106,56 @@ impl CookieJar {
 
     /// Sets a cookie in the jar.
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.cookies.insert(name.into(), value.into());
+        let name = name.into();
+        let value = value.into();
+
+        // Preserve previous semantics: manual `set()` behaves like a single cookie per name.
+        self.cookies
+            .retain(|c| !(c.name == name && c.domain == CookieDomain::Any));
+
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.cookies.push(StoredCookie {
+            id,
+            name,
+            value,
+            domain: CookieDomain::Any,
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: None,
+            expires_at: None,
+        });
     }
 
     /// Gets a cookie value by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.cookies.get(name).map(String::as_str)
+        self.cookies
+            .iter()
+            .filter(|c| c.name == name)
+            .max_by_key(|c| c.id)
+            .map(|c| c.value.as_str())
     }
 
     /// Removes a cookie from the jar.
     pub fn remove(&mut self, name: &str) -> Option<String> {
-        self.cookies.remove(name)
+        let mut removed: Option<String> = None;
+        self.cookies.retain(|c| {
+            if c.name == name {
+                removed = Some(c.value.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Clears all cookies from the jar.
     pub fn clear(&mut self) {
         self.cookies.clear();
+        self.next_id = 0;
     }
 
     /// Returns the number of cookies in the jar.
@@ -107,30 +173,445 @@ impl CookieJar {
     /// Formats cookies for the Cookie header.
     #[must_use]
     pub fn to_cookie_header(&self) -> Option<String> {
-        if self.cookies.is_empty() {
-            None
+        let mut by_name: HashMap<&str, &StoredCookie> = HashMap::new();
+        for c in &self.cookies {
+            match by_name.get(c.name.as_str()) {
+                Some(existing) if existing.id >= c.id => {}
+                _ => {
+                    by_name.insert(c.name.as_str(), c);
+                }
+            }
+        }
+
+        if by_name.is_empty() {
+            return None;
+        }
+
+        Some(
+            by_name
+                .into_values()
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    /// Formats cookies for the Cookie header for a specific request.
+    ///
+    /// This applies the cookie matching rules needed for session persistence:
+    /// domain, path, secure, and expiration.
+    #[must_use]
+    pub fn cookie_header_for_request(&self, request: &Request) -> Option<String> {
+        let host = request_host(request);
+        let path = request.path();
+        let is_secure = request_is_secure(request);
+        let now = std::time::SystemTime::now();
+
+        // Select one cookie per name using path length (more specific wins), then newest.
+        let mut selected: HashMap<&str, &StoredCookie> = HashMap::new();
+        for c in &self.cookies {
+            if c.secure && !is_secure {
+                continue;
+            }
+            if let Some(exp) = c.expires_at {
+                if exp <= now {
+                    continue;
+                }
+            }
+            if !domain_matches(&c.domain, host.as_deref()) {
+                continue;
+            }
+            if !path_matches(&c.path, path) {
+                continue;
+            }
+
+            match selected.get(c.name.as_str()) {
+                None => {
+                    selected.insert(c.name.as_str(), c);
+                }
+                Some(existing) => {
+                    let a = (c.path.len(), c.id);
+                    let b = (existing.path.len(), existing.id);
+                    if a > b {
+                        selected.insert(c.name.as_str(), c);
+                    }
+                }
+            }
+        }
+
+        if selected.is_empty() {
+            return None;
+        }
+
+        Some(
+            selected
+                .into_values()
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    /// Parses a Set-Cookie header and updates the jar.
+    pub fn parse_set_cookie(&mut self, request: &Request, header_value: &[u8]) {
+        let Ok(value) = std::str::from_utf8(header_value) else {
+            return;
+        };
+        self.parse_set_cookie_str(request, value);
+    }
+
+    fn parse_set_cookie_str(&mut self, request: &Request, value: &str) {
+        let mut parts = value.split(';');
+        let Some((name, val)) = parse_cookie_name_value(parts.next()) else {
+            return;
+        };
+
+        let host = request_host(request);
+        let attrs = parse_set_cookie_attrs(parts);
+
+        let Some(domain) = cookie_domain_for_set_cookie(host.as_deref(), attrs.domain) else {
+            return;
+        };
+
+        let path = attrs
+            .path
+            .unwrap_or_else(|| default_cookie_path(request.path()));
+
+        let expires_at = match compute_cookie_expiration(attrs.max_age, attrs.expires_at) {
+            CookieExpiration::Delete => {
+                self.remove_by_key(name, &domain, &path);
+                return;
+            }
+            CookieExpiration::Keep(expires_at) => expires_at,
+        };
+
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.upsert(StoredCookie {
+            id,
+            name: name.to_string(),
+            value: val.to_string(),
+            domain,
+            path,
+            secure: attrs.secure,
+            http_only: attrs.http_only,
+            same_site: attrs.same_site,
+            expires_at,
+        });
+    }
+
+    fn remove_by_key(&mut self, name: &str, domain: &CookieDomain, path: &str) {
+        self.cookies
+            .retain(|c| !(c.name == name && &c.domain == domain && c.path == path));
+    }
+
+    fn upsert(&mut self, cookie: StoredCookie) {
+        // Replace existing cookie with same (name, domain, path), otherwise insert.
+        for existing in &mut self.cookies {
+            if existing.name == cookie.name
+                && existing.domain == cookie.domain
+                && existing.path == cookie.path
+            {
+                *existing = cookie;
+                return;
+            }
+        }
+        self.cookies.push(cookie);
+    }
+}
+
+#[derive(Debug, Default)]
+struct SetCookieAttrs {
+    domain: Option<String>,
+    path: Option<String>,
+    max_age: Option<i64>,
+    secure: bool,
+    http_only: bool,
+    same_site: Option<CookieSameSite>,
+    expires_at: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CookieExpiration {
+    Delete,
+    Keep(Option<std::time::SystemTime>),
+}
+
+fn parse_cookie_name_value(first: Option<&str>) -> Option<(&str, &str)> {
+    let first = first?;
+    let (name, val) = first.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, val.trim()))
+}
+
+fn parse_set_cookie_attrs<'a>(parts: impl Iterator<Item = &'a str>) -> SetCookieAttrs {
+    let mut attrs = SetCookieAttrs::default();
+    for raw in parts {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = raw.split_once('=') {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            match k.as_str() {
+                "domain" => {
+                    let mut d = v.trim_matches('"').trim().to_ascii_lowercase();
+                    if let Some(stripped) = d.strip_prefix('.') {
+                        d = stripped.to_string();
+                    }
+                    if !d.is_empty() {
+                        attrs.domain = Some(d);
+                    }
+                }
+                "path" => {
+                    let p = v.trim_matches('"').trim();
+                    if p.starts_with('/') {
+                        attrs.path = Some(p.to_string());
+                    }
+                }
+                "max-age" => {
+                    if let Ok(n) = v.parse::<i64>() {
+                        attrs.max_age = Some(n);
+                    }
+                }
+                "samesite" => {
+                    let ss = v.trim_matches('"').trim();
+                    attrs.same_site = match ss.to_ascii_lowercase().as_str() {
+                        "lax" => Some(CookieSameSite::Lax),
+                        "strict" => Some(CookieSameSite::Strict),
+                        "none" => Some(CookieSameSite::None),
+                        _ => None,
+                    };
+                }
+                "expires" => {
+                    if let Some(t) = parse_http_date(v) {
+                        attrs.expires_at = Some(t);
+                    }
+                }
+                _ => {}
+            }
         } else {
-            Some(
-                self.cookies
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
+            match raw.to_ascii_lowercase().as_str() {
+                "secure" => attrs.secure = true,
+                "httponly" => attrs.http_only = true,
+                _ => {}
+            }
+        }
+    }
+    attrs
+}
+
+fn cookie_domain_for_set_cookie(
+    host: Option<&str>,
+    domain_attr: Option<String>,
+) -> Option<CookieDomain> {
+    match domain_attr {
+        Some(d) => {
+            let h = host?;
+            let domain = CookieDomain::Domain(d);
+            if domain_matches(&domain, Some(h)) {
+                Some(domain)
+            } else {
+                None
+            }
+        }
+        None => {
+            let h = host?;
+            Some(CookieDomain::HostOnly(h.to_string()))
+        }
+    }
+}
+
+fn compute_cookie_expiration(
+    max_age: Option<i64>,
+    mut expires_at: Option<std::time::SystemTime>,
+) -> CookieExpiration {
+    let now = std::time::SystemTime::now();
+    if let Some(n) = max_age {
+        if n <= 0 {
+            return CookieExpiration::Delete;
+        }
+        let Ok(secs) = u64::try_from(n) else {
+            return CookieExpiration::Delete;
+        };
+        expires_at = now.checked_add(std::time::Duration::from_secs(secs));
+    }
+    if let Some(exp) = expires_at {
+        if exp <= now {
+            return CookieExpiration::Delete;
+        }
+    }
+    CookieExpiration::Keep(expires_at)
+}
+
+fn request_host(request: &Request) -> Option<String> {
+    let host = request.headers().get("host")?;
+    let s = std::str::from_utf8(host).ok()?;
+    let host = s.trim();
+    if host.is_empty() {
+        return None;
+    }
+    // Strip port if present.
+    Some(host.split(':').next().unwrap_or(host).to_ascii_lowercase())
+}
+
+fn request_is_secure(request: &Request) -> bool {
+    if let Some(info) = request.get_extension::<crate::request::ConnectionInfo>() {
+        if info.is_tls {
+            return true;
         }
     }
 
-    /// Parses a Set-Cookie header and adds the cookie to the jar.
-    pub fn parse_set_cookie(&mut self, header_value: &[u8]) {
-        if let Ok(value) = std::str::from_utf8(header_value) {
-            // Parse simple name=value; ignore attributes for now
-            if let Some(cookie_part) = value.split(';').next() {
-                if let Some((name, val)) = cookie_part.split_once('=') {
-                    self.set(name.trim(), val.trim());
+    if let Some(forwarded) = request.headers().get("forwarded") {
+        if let Ok(s) = std::str::from_utf8(forwarded) {
+            for entry in s.split(',') {
+                for param in entry.split(';') {
+                    let param = param.trim();
+                    if let Some((k, v)) = param.split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("proto") {
+                            let proto = v.trim().trim_matches('"');
+                            if proto.eq_ignore_ascii_case("https") {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+
+    if let Some(proto) = request.headers().get("x-forwarded-proto") {
+        let first = proto.split(|&b| b == b',').next().unwrap_or(proto);
+        let first = trim_ascii_bytes(first);
+        return first.eq_ignore_ascii_case(b"https");
+    }
+    if let Some(ssl) = request.headers().get("x-forwarded-ssl") {
+        return ssl.eq_ignore_ascii_case(b"on");
+    }
+    if let Some(https) = request.headers().get("front-end-https") {
+        return https.eq_ignore_ascii_case(b"on");
+    }
+
+    false
+}
+
+fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(b' ' | b'\t')) {
+        bytes = &bytes[1..];
+    }
+    while matches!(bytes.last(), Some(b' ' | b'\t')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn default_cookie_path(request_path: &str) -> String {
+    // RFC 6265 default-path algorithm (5.1.4).
+    if !request_path.starts_with('/') {
+        return "/".to_string();
+    }
+    if request_path == "/" {
+        return "/".to_string();
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(idx) => request_path[..idx].to_string(),
+    }
+}
+
+fn domain_matches(domain: &CookieDomain, host: Option<&str>) -> bool {
+    match domain {
+        CookieDomain::Any => true,
+        CookieDomain::HostOnly(d) => host.is_some_and(|h| h.eq_ignore_ascii_case(d)),
+        CookieDomain::Domain(d) => {
+            let Some(h) = host else { return false };
+            if h.eq_ignore_ascii_case(d) {
+                return true;
+            }
+            // Suffix match with dot boundary.
+            h.len() > d.len() && h.ends_with(d) && h.as_bytes()[h.len() - d.len() - 1] == b'.'
+        }
+    }
+}
+
+fn path_matches(cookie_path: &str, request_path: &str) -> bool {
+    if cookie_path == "/" {
+        return request_path.starts_with('/');
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    if cookie_path.ends_with('/') {
+        return true;
+    }
+    request_path
+        .as_bytes()
+        .get(cookie_path.len())
+        .is_none_or(|&b| b == b'/')
+}
+
+fn parse_http_date(input: &str) -> Option<std::time::SystemTime> {
+    // Parse IMF-fixdate: "Wed, 21 Oct 2015 07:28:00 GMT"
+    // We intentionally keep this minimal; invalid dates are ignored per RFC6265.
+    let s = input.trim().trim_matches('"').trim();
+    let (_dow, rest) = s.split_once(',')?;
+    let rest = rest.trim();
+    let mut it = rest.split_whitespace();
+    let day = it.next()?.parse::<u32>().ok()?;
+    let month = match it.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = it.next()?.parse::<i32>().ok()?;
+    let time = it.next()?;
+    let tz = it.next()?;
+    if tz != "GMT" {
+        return None;
+    }
+    let (hh, mm, ss) = {
+        let mut t = time.split(':');
+        let hh = t.next()?.parse::<u32>().ok()?;
+        let mm = t.next()?.parse::<u32>().ok()?;
+        let ss = t.next()?.parse::<u32>().ok()?;
+        (hh, mm, ss)
+    };
+
+    // Convert to unix timestamp using a small civil->days function.
+    fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+        // Howard Hinnant's algorithm.
+        let y = i64::from(y) - i64::from(m <= 2);
+        let era = (if y >= 0 { y } else { y - 399 }) / 400;
+        let yoe = y - era * 400;
+        let m = i64::from(m);
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(d) - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+
+    let days = days_from_civil(year, month, day);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hh) * 3600 + i64::from(mm) * 60 + i64::from(ss))?;
+    if secs < 0 {
+        return None;
+    }
+    let secs_u64 = u64::try_from(secs).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_u64))
 }
 
 /// Test client for in-process HTTP testing.
@@ -318,10 +799,16 @@ impl<H: Handler + 'static> TestClient<H> {
     ///
     /// This is called internally by `RequestBuilder::send()`.
     fn execute(&self, mut request: Request) -> TestResponse {
+        // Many features (cookies, redirects, absolute URL building) require a host.
+        // In tests, default to a stable host if one wasn't provided.
+        if !request.headers().contains("host") {
+            request.headers_mut().insert("host", b"testserver".to_vec());
+        }
+
         // Add cookies from jar to request
         {
             let jar = self.cookies();
-            if let Some(cookie_header) = jar.to_cookie_header() {
+            if let Some(cookie_header) = jar.cookie_header_for_request(&request) {
                 request
                     .headers_mut()
                     .insert("cookie", cookie_header.into_bytes());
@@ -342,7 +829,7 @@ impl<H: Handler + 'static> TestClient<H> {
             let mut jar = self.cookies();
             for (name, value) in response.headers() {
                 if name.eq_ignore_ascii_case("set-cookie") {
-                    jar.parse_set_cookie(value);
+                    jar.parse_set_cookie(&request, value);
                 }
             }
         }
@@ -1965,6 +2452,44 @@ mod tests {
         jar.remove("session");
         assert_eq!(jar.len(), 1);
         assert_eq!(jar.get("session"), None);
+    }
+
+    #[test]
+    fn test_cookie_jar_request_matching_rules() {
+        use crate::request::ConnectionInfo;
+
+        let mut jar = CookieJar::new();
+
+        let mut req = Request::new(Method::Get, "/account/settings");
+        req.headers_mut().insert("host", b"example.com".to_vec());
+
+        // Secure cookie should not be sent over non-secure request.
+        jar.parse_set_cookie(
+            &req,
+            b"sid=1; Path=/account; Secure; HttpOnly; SameSite=Lax",
+        );
+        assert_eq!(jar.cookie_header_for_request(&req), None);
+
+        // Mark request as TLS-enabled; now it matches.
+        req.insert_extension(ConnectionInfo::HTTPS);
+        assert_eq!(
+            jar.cookie_header_for_request(&req).as_deref(),
+            Some("sid=1")
+        );
+
+        // Path mismatch should prevent sending.
+        let mut req2 = Request::new(Method::Get, "/other");
+        req2.headers_mut().insert("host", b"example.com".to_vec());
+        req2.insert_extension(ConnectionInfo::HTTPS);
+        assert_eq!(jar.cookie_header_for_request(&req2), None);
+
+        // Domain cookies should match subdomains.
+        jar.parse_set_cookie(&req, b"sub=1; Domain=example.com; Path=/");
+        let mut req3 = Request::new(Method::Get, "/");
+        req3.headers_mut()
+            .insert("host", b"api.example.com".to_vec());
+        let hdr = jar.cookie_header_for_request(&req3).expect("cookie header");
+        assert!(hdr.contains("sub=1"));
     }
 
     #[test]

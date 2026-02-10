@@ -52,12 +52,12 @@ This section is a living, high-level parity view against the legacy FastAPI beha
 | Docs pages (Swagger/ReDoc shells) | `crates/fastapi-core/src/docs.rs` | Implemented | HTML shells exist; assets expected via CDN/static hosting. |
 | Docs endpoints wiring (routes) | `crates/fastapi-core/src/app.rs` (`enable_docs`) | Implemented | `.enable_docs(DocsConfig)` mounts `/docs`, `/redoc`, and `/docs/oauth2-redirect` (paths configurable). |
 | Testing harness | `crates/fastapi-core/src/testing.rs` | Implemented | In-process TestClient + assertions. |
-| WebSockets | N/A | Missing | Not implemented yet. |
-| HTTP/2 | N/A | Missing | Not implemented (out of scope until HTTP/1.1 parity is locked down). |
+| WebSockets | N/A | Missing | Tracked as `bd-z09e`. |
+| HTTP/2 | N/A | Missing | Tracked as `bd-2c9t`. |
 
 **Highest-leverage gaps (parity):**
 
-- OpenAPI generation: map handlers/extractors/types to operations/schemas (remove stub behavior).
+- OpenAPI generation: map handlers/extractors/types to operations/schemas (remove placeholder behaviors).
 - Validation rules: expand `Validate` derive + runtime validation to match spec exactly.
 - Security: flesh out auth flows and error semantics to match legacy FastAPI expectations.
 

@@ -309,7 +309,7 @@ The fourth review systematically audited all beads for correctness and completen
 | ResponseValidationError | `fastapi_rust-h5t` |
 | Swagger UI / ReDoc endpoints | `fastapi_rust-iw9` |
 | OAuth2AuthorizationCodeBearer | `fastapi_rust-zva` |
-| HTTPDigest auth (stub) | `fastapi_rust-1lu` |
+| HTTP Digest auth (gap tracked) | `bd-gl3v` |
 | Root path handling (proxy) | `fastapi_rust-22x` |
 | Lifespan context manager | `fastapi_rust-cad` |
 

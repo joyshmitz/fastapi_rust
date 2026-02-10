@@ -63,6 +63,25 @@ impl HttpVersion {
     }
 }
 
+/// Connection metadata supplied by the server (or test harness).
+///
+/// The core request type does not inherently know whether it arrived over TLS;
+/// servers should insert this as an extension when that information is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// True if the connection is using TLS (HTTPS).
+    pub is_tls: bool,
+}
+
+impl ConnectionInfo {
+    /// Plain HTTP connection.
+    #[allow(dead_code)]
+    pub const HTTP: Self = Self { is_tls: false };
+    /// HTTPS connection (TLS).
+    #[allow(dead_code)]
+    pub const HTTPS: Self = Self { is_tls: true };
+}
+
 /// HTTP headers collection.
 #[derive(Debug, Default)]
 pub struct Headers {

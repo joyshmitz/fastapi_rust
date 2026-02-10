@@ -38,7 +38,7 @@ cargo run --example getting_started -p fastapi-rust
 
 ## More Examples
 
-Planned examples (not implemented yet):
+Planned examples:
 
 - `json_api` - JSON request/response handling
 - `middleware` - Custom middleware

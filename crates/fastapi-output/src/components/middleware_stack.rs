@@ -104,8 +104,7 @@ impl MiddlewareStackDisplay {
     }
 
     fn render_rich(&self, output: &RichOutput) {
-        // Rich rendering is intentionally simple for now.
-        // When rich_rust is enabled, this can be upgraded to use panels/trees.
+        // Rich mode currently shares the same deterministic text output as plain mode.
         self.render_plain(output);
     }
 

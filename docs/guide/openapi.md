@@ -1,6 +1,6 @@
 # OpenAPI Documentation
 
-> **Status (as of 2026-02-10)**: OpenAPI schema/spec types exist (`fastapi-openapi`), `#[derive(JsonSchema)]` exists, and `App` can serve an OpenAPI JSON endpoint. Automatic, full-coverage generation from all handler/extractor types is still being expanded.
+> **Status (as of 2026-02-10)**: OpenAPI schema/spec types exist (`fastapi-openapi`), `#[derive(JsonSchema)]` exists, and `App` can serve an OpenAPI JSON endpoint. Full-coverage generation from all handler/extractor types is tracked under `bd-uz2s`.
 
 ## Concept
 
@@ -28,9 +28,9 @@ let spec = OpenApiBuilder::new()
     .build();
 ```
 
-## Not Implemented Yet (Or Still Expanding)
+## Missing / In Progress
 
-OpenAPI generation coverage is currently incomplete for the full framework surface (all extractors, responses, and security flows).
+OpenAPI generation coverage is currently incomplete for the full framework surface (all extractors, responses, and security flows). The concrete gap list lives under `bd-uz2s`.
 
 ```rust
 #[derive(JsonSchema)]

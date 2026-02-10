@@ -515,36 +515,43 @@ impl GracefulShutdown {
     /// - The future completes normally
     /// - Graceful shutdown completes
     /// - Forced shutdown is triggered
-    ///
-    /// Note: This is a simplified implementation. For production use with
-    /// proper concurrent select behavior, consider using the futures crate's
-    /// `select` macro or similar.
     pub async fn run<F, T>(self, fut: F) -> ShutdownOutcome<T>
     where
         F: Future<Output = T>,
     {
         use std::pin::pin;
+        use std::task::Poll;
 
         let mut fut = pin!(fut);
 
-        // Poll both futures until one completes.
-        // This is a simple implementation that checks shutdown first.
-        futures_executor::block_on(async {
-            loop {
-                // Check if shutdown was requested
-                if self.receiver.is_shutting_down() {
-                    if self.receiver.is_forced() {
-                        return ShutdownOutcome::ForcedShutdown;
-                    }
-                    return ShutdownOutcome::GracefulShutdown;
-                }
+        std::future::poll_fn(|cx| {
+            // Drive the main future forward first; if it completes we return immediately.
+            if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+                return Poll::Ready(ShutdownOutcome::Completed(v));
+            }
 
-                // Try to poll the main future (non-blocking check)
-                // In a real implementation, we'd use proper select semantics
-                // For now, we just await the future directly
-                break ShutdownOutcome::Completed(fut.as_mut().await);
+            // If shutdown has started, return the appropriate outcome.
+            //
+            // Note: `forced` is an orthogonal flag; if it is set we treat it as higher priority.
+            if self.receiver.state.is_forced() {
+                return Poll::Ready(ShutdownOutcome::ForcedShutdown);
+            }
+            if self.receiver.state.phase().is_shutting_down() {
+                return Poll::Ready(ShutdownOutcome::GracefulShutdown);
+            }
+
+            // Register to be woken on any shutdown phase/forced transition.
+            self.receiver.state.register_waker(cx.waker());
+            // Double-check after registering to avoid missing a transition.
+            if self.receiver.state.is_forced() {
+                Poll::Ready(ShutdownOutcome::ForcedShutdown)
+            } else if self.receiver.state.phase().is_shutting_down() {
+                Poll::Ready(ShutdownOutcome::GracefulShutdown)
+            } else {
+                Poll::Pending
             }
         })
+        .await
     }
 
     /// Get the configuration.
@@ -801,6 +808,47 @@ mod tests {
 
         controller.shutdown();
         assert!(receiver.is_shutting_down());
+    }
+
+    #[test]
+    fn graceful_shutdown_run_completed() {
+        let controller = ShutdownController::new();
+        let shutdown = GracefulShutdown::new(controller.subscribe());
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime must build");
+        let out = rt.block_on(async { shutdown.run(async { 42i32 }).await });
+
+        assert!(matches!(out, ShutdownOutcome::Completed(42)));
+    }
+
+    #[test]
+    fn graceful_shutdown_run_graceful_shutdown() {
+        let controller = ShutdownController::new();
+        controller.shutdown();
+        let shutdown = GracefulShutdown::new(controller.subscribe());
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime must build");
+        let out = rt.block_on(async { shutdown.run(std::future::pending::<i32>()).await });
+
+        assert!(matches!(out, ShutdownOutcome::GracefulShutdown));
+    }
+
+    #[test]
+    fn graceful_shutdown_run_forced_shutdown() {
+        let controller = ShutdownController::new();
+        controller.force_shutdown();
+        let shutdown = GracefulShutdown::new(controller.subscribe());
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime must build");
+        let out = rt.block_on(async { shutdown.run(std::future::pending::<i32>()).await });
+
+        assert!(matches!(out, ShutdownOutcome::ForcedShutdown));
     }
 
     #[test]

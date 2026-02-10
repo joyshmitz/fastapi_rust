@@ -1420,6 +1420,7 @@ dependencies = [
  "os_pipe",
  "pulldown-cmark",
  "regex",
+ "serde",
  "serde_json",
  "smallvec",
  "stdio-override",

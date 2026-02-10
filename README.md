@@ -661,9 +661,9 @@ Current parity status and the concrete gap list are tracked in:
 - **OpenAPI generation**: currently minimal; needs real operation/schema mapping from route metadata.
 - **TCP server integration/hardening**: `fastapi-http` has a server implementation, but the end-to-end
   surface is still evolving.
-- **WebSockets**: not implemented.
-- **Multipart/form/file uploads**: not implemented.
-- **HTTP/2**: not implemented.
+- **WebSockets**: missing (`bd-z09e`).
+- **Multipart/form/file uploads**: missing (`bd-3ess`).
+- **HTTP/2**: missing (`bd-2c9t`).
 
 ### Non-Negotiables / Constraints
 
@@ -685,11 +685,12 @@ Tokio's spawn model makes cancel-correctness difficult - tasks can outlive their
 
 ### Can I use this in production?
 
-Not yet. This is v0.1.2 in active development. The HTTP server implementation is pending asupersync's I/O support.
+Not production-ready yet. This is v0.1.2 in active development; the TCP server exists (built on `asupersync::net`),
+but parity and production hardening are tracked under `bd-uz2s`.
 
 ### How fast is it?
 
-We haven't benchmarked yet (no TCP server), but the architecture is designed for:
+We haven't published end-to-end benchmarks yet, but the architecture is designed for:
 - Zero allocations on the fast path
 - Zero-copy request parsing
 - No runtime reflection

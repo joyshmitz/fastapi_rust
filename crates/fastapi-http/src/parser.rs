@@ -140,6 +140,10 @@ fn has_invalid_request_line_bytes(line: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct RequestLine<'a> {
     method: Method,
+    /// Full URI as it appeared on the request line (path + optional `?query`).
+    ///
+    /// This is a zero-copy slice into the request buffer.
+    uri: &'a str,
     path: &'a str,
     query: Option<&'a str>,
     version: &'a str,
@@ -195,6 +199,7 @@ impl<'a> RequestLine<'a> {
 
         Ok(Self {
             method,
+            uri,
             path,
             query,
             version,
@@ -251,12 +256,7 @@ impl<'a> RequestLine<'a> {
     /// Example: For `GET /items?q=test HTTP/1.1`, returns `/items?q=test`.
     #[must_use]
     pub fn uri(&self) -> &'a str {
-        // If there's a query, the original URI includes the ?
-        // We reconstruct it from path and query
-        // Note: This doesn't allocate because we return a str slice from the original buffer
-        // Actually, we can't easily do this without allocation or storing the original uri
-        // For now, just return the path if no query, or indicate this returns path only
-        self.path
+        self.uri
     }
 
     /// Returns the HTTP version string.
@@ -1204,9 +1204,19 @@ mod tests {
         let line = RequestLine::parse(buffer).unwrap();
 
         assert_eq!(line.method(), Method::Get);
+        assert_eq!(line.uri(), "/items?q=test&page=1");
         assert_eq!(line.path(), "/items");
         assert_eq!(line.query(), Some("q=test&page=1"));
         assert_eq!(line.version(), "HTTP/1.1");
+    }
+
+    #[test]
+    fn request_line_uri_without_query_matches_path() {
+        let buffer = b"GET /path HTTP/1.1\r\n";
+        let line = RequestLine::parse(buffer).unwrap();
+        assert_eq!(line.uri(), "/path");
+        assert_eq!(line.path(), "/path");
+        assert_eq!(line.query(), None);
     }
 
     #[test]

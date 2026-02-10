@@ -732,7 +732,7 @@ HTTPDigest:
     description: str | None
     auto_error: bool = true
 
-    # Note: Stub only - doesn't implement full Digest
+    # Note: Not implemented in Rust yet; tracked as `bd-gl3v`.
     __call__(request) -> HTTPAuthorizationCredentials | None
 ```
 

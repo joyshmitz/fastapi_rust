@@ -64,8 +64,11 @@ fastapi_rust is under active development. This guide covers features that are cu
 - Application configuration
 - Startup/shutdown hooks
 
-**Not Implemented Yet (or still expanding):**
-- Fully automatic OpenAPI generation from handler/extractor types (schema/spec types exist; generation coverage is being expanded)
+**Missing / In Progress (tracked in Beads):**
+- Fully automatic OpenAPI generation from handler/extractor types (tracked under `bd-uz2s`)
+- WebSockets (tracked as `bd-z09e`)
+- Multipart/form-data + file uploads (tracked as `bd-3ess`)
+- HTTP/2 (tracked as `bd-2c9t`)
 
 ## Prerequisites
 

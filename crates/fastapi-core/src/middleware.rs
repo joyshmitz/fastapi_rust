@@ -5484,9 +5484,45 @@ impl HttpsRedirectMiddleware {
     /// This checks both the scheme and the X-Forwarded-Proto header
     /// for proxy-aware detection.
     fn is_secure(&self, req: &Request) -> bool {
+        fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+            while matches!(bytes.first(), Some(b' ' | b'\t')) {
+                bytes = &bytes[1..];
+            }
+            while matches!(bytes.last(), Some(b' ' | b'\t')) {
+                bytes = &bytes[..bytes.len() - 1];
+            }
+            bytes
+        }
+
+        if let Some(info) = req.get_extension::<crate::request::ConnectionInfo>() {
+            if info.is_tls {
+                return true;
+            }
+        }
+
+        // RFC 7239 Forwarded: for=...;proto=https;host=...
+        if let Some(forwarded) = req.headers().get("Forwarded") {
+            if let Ok(s) = std::str::from_utf8(forwarded) {
+                for entry in s.split(',') {
+                    for param in entry.split(';') {
+                        let param = param.trim();
+                        if let Some((k, v)) = param.split_once('=') {
+                            if k.trim().eq_ignore_ascii_case("proto") {
+                                let proto = v.trim().trim_matches('"');
+                                if proto.eq_ignore_ascii_case("https") {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check X-Forwarded-Proto header first (for reverse proxy)
         if let Some(proto) = req.headers().get("X-Forwarded-Proto") {
-            return proto.eq_ignore_ascii_case(b"https");
+            let first = proto.split(|&b| b == b',').next().unwrap_or(proto);
+            return trim_ascii(first).eq_ignore_ascii_case(b"https");
         }
 
         // Check X-Forwarded-Ssl header (alternative)
@@ -5499,8 +5535,6 @@ impl HttpsRedirectMiddleware {
             return https.eq_ignore_ascii_case(b"on");
         }
 
-        // No forwarding headers - assume HTTP for now
-        // In a real server, we'd check the connection's TLS status
         false
     }
 
