@@ -49,6 +49,8 @@ pub enum HttpVersion {
     Http10,
     /// HTTP/1.1
     Http11,
+    /// HTTP/2
+    Http2,
 }
 
 impl HttpVersion {
@@ -58,6 +60,7 @@ impl HttpVersion {
         match s {
             "HTTP/1.0" => Some(Self::Http10),
             "HTTP/1.1" => Some(Self::Http11),
+            "HTTP/2" | "HTTP/2.0" => Some(Self::Http2),
             _ => None,
         }
     }

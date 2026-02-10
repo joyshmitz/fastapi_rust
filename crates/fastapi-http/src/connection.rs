@@ -77,22 +77,22 @@ impl ConnectionInfo {
             Err(_) => return info,
         };
 
-        for token in value_str.split(',') {
-            let token = token.trim();
-            if token.is_empty() {
+        for part in value_str.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
                 continue;
             }
 
             // Case-insensitive match without allocation for known tokens
-            if token.eq_ignore_ascii_case("close") {
+            if part.eq_ignore_ascii_case("close") {
                 info.close = true;
-            } else if token.eq_ignore_ascii_case("keep-alive") {
+            } else if part.eq_ignore_ascii_case("keep-alive") {
                 info.keep_alive = true;
-            } else if token.eq_ignore_ascii_case("upgrade") {
+            } else if part.eq_ignore_ascii_case("upgrade") {
                 info.upgrade = true;
             } else {
                 // Only allocate for custom hop-by-hop headers (rare path)
-                let lower = token.to_ascii_lowercase();
+                let lower = part.to_ascii_lowercase();
                 // Don't add standard hop-by-hop headers again
                 if !STANDARD_HOP_BY_HOP_HEADERS.contains(&lower.as_str()) {
                     info.hop_by_hop_headers.push(lower);
@@ -123,6 +123,7 @@ impl ConnectionInfo {
         match version {
             HttpVersion::Http11 => true,  // HTTP/1.1 defaults to keep-alive
             HttpVersion::Http10 => false, // HTTP/1.0 defaults to close
+            HttpVersion::Http2 => true, // HTTP/2 uses persistent connections (no Connection header semantics)
         }
     }
 }

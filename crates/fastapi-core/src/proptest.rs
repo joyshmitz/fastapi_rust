@@ -91,7 +91,11 @@ pub fn safe_method() -> impl Strategy<Value = Method> {
 
 /// Strategy that generates any valid HTTP version.
 pub fn arbitrary_http_version() -> impl Strategy<Value = HttpVersion> {
-    prop_oneof![Just(HttpVersion::Http10), Just(HttpVersion::Http11),]
+    prop_oneof![
+        Just(HttpVersion::Http10),
+        Just(HttpVersion::Http11),
+        Just(HttpVersion::Http2),
+    ]
 }
 
 // =============================================================================

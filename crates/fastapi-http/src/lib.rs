@@ -67,6 +67,7 @@
 pub mod body;
 pub mod connection;
 pub mod expect;
+pub mod http2;
 pub mod multipart;
 mod parser;
 mod query;

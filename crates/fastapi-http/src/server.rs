@@ -49,6 +49,7 @@ use crate::connection::should_keep_alive;
 use crate::expect::{
     CONTINUE_RESPONSE, ExpectHandler, ExpectResult, PreBodyValidator, PreBodyValidators,
 };
+use crate::http2;
 use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -334,6 +335,8 @@ pub enum ServerError {
     Io(io::Error),
     /// Parse error.
     Parse(ParseError),
+    /// HTTP/2 error.
+    Http2(http2::Http2Error),
     /// Server was shut down.
     Shutdown,
     /// Connection limit reached.
@@ -347,6 +350,7 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::Parse(e) => write!(f, "Parse error: {e}"),
+            Self::Http2(e) => write!(f, "HTTP/2 error: {e}"),
             Self::Shutdown => write!(f, "Server shutdown"),
             Self::ConnectionLimitReached => write!(f, "Connection limit reached"),
             Self::KeepAliveTimeout => write!(f, "Keep-alive timeout"),
@@ -359,6 +363,7 @@ impl std::error::Error for ServerError {
         match self {
             Self::Io(e) => Some(e),
             Self::Parse(e) => Some(e),
+            Self::Http2(e) => Some(e),
             _ => None,
         }
     }
@@ -660,6 +665,12 @@ impl From<ParseError> for ServerError {
     }
 }
 
+impl From<http2::Http2Error> for ServerError {
+    fn from(e: http2::Http2Error) -> Self {
+        Self::Http2(e)
+    }
+}
+
 /// Processes a connection with the given handler.
 ///
 /// This is the unified connection handling logic used by all server modes.
@@ -675,7 +686,15 @@ where
     H: Fn(RequestContext, &mut Request) -> Fut,
     Fut: Future<Output = Response>,
 {
+    let (proto, buffered) = sniff_protocol(&mut stream, config.keep_alive_timeout).await?;
+    if proto == SniffedProtocol::Http2PriorKnowledge {
+        return process_connection_http2(cx, request_counter, stream, config, handler).await;
+    }
+
     let mut parser = StatefulParser::new().with_limits(config.parse_limits.clone());
+    if !buffered.is_empty() {
+        parser.feed(&buffered)?;
+    }
     let mut read_buffer = vec![0u8; config.read_buffer_size];
     let mut response_writer = ResponseWriter::new();
     let mut requests_on_connection: usize = 0;
@@ -808,6 +827,316 @@ where
 
         if !server_will_keep_alive {
             return Ok(());
+        }
+    }
+}
+
+async fn process_connection_http2<H, Fut>(
+    cx: &Cx,
+    request_counter: &AtomicU64,
+    stream: TcpStream,
+    config: &ServerConfig,
+    handler: H,
+) -> Result<(), ServerError>
+where
+    H: Fn(RequestContext, &mut Request) -> Fut,
+    Fut: Future<Output = Response>,
+{
+    const FLAG_END_HEADERS: u8 = 0x4;
+    const FLAG_ACK: u8 = 0x1;
+
+    let mut framed = http2::FramedH2::new(stream, Vec::new());
+    let mut hpack = http2::HpackDecoder::new();
+    let mut max_frame_size: u32 = 16 * 1024;
+
+    let first = framed.read_frame(max_frame_size).await?;
+    if first.header.frame_type() != http2::FrameType::Settings
+        || first.header.stream_id != 0
+        || (first.header.flags & FLAG_ACK) != 0
+    {
+        return Err(http2::Http2Error::Protocol("expected client SETTINGS after preface").into());
+    }
+    apply_http2_settings(&mut hpack, &mut max_frame_size, &first.payload)?;
+
+    framed
+        .write_frame(http2::FrameType::Settings, 0, 0, &[])
+        .await?;
+    framed
+        .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+        .await?;
+
+    let default_body_limit = config.parse_limits.max_request_size;
+
+    loop {
+        if cx.is_cancel_requested() {
+            return Ok(());
+        }
+
+        let frame = framed.read_frame(max_frame_size).await?;
+        match frame.header.frame_type() {
+            http2::FrameType::Settings => {
+                if frame.header.stream_id != 0 {
+                    return Err(http2::Http2Error::Protocol("SETTINGS must be on stream 0").into());
+                }
+                if (frame.header.flags & FLAG_ACK) != 0 {
+                    continue;
+                }
+                apply_http2_settings(&mut hpack, &mut max_frame_size, &frame.payload)?;
+                framed
+                    .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+                    .await?;
+            }
+            http2::FrameType::Ping => {
+                if frame.header.stream_id != 0 || frame.payload.len() != 8 {
+                    return Err(http2::Http2Error::Protocol("invalid PING frame").into());
+                }
+                if (frame.header.flags & FLAG_ACK) == 0 {
+                    framed
+                        .write_frame(http2::FrameType::Ping, FLAG_ACK, 0, &frame.payload)
+                        .await?;
+                }
+            }
+            http2::FrameType::Goaway => return Ok(()),
+            http2::FrameType::Headers => {
+                if frame.header.stream_id == 0 {
+                    return Err(
+                        http2::Http2Error::Protocol("HEADERS must not be on stream 0").into(),
+                    );
+                }
+                let stream_id = frame.header.stream_id;
+                let (end_stream, mut header_block) =
+                    extract_header_block_fragment(frame.header.flags, &frame.payload)?;
+
+                if (frame.header.flags & FLAG_END_HEADERS) == 0 {
+                    loop {
+                        let cont = framed.read_frame(max_frame_size).await?;
+                        if cont.header.frame_type() != http2::FrameType::Continuation
+                            || cont.header.stream_id != stream_id
+                        {
+                            return Err(http2::Http2Error::Protocol(
+                                "expected CONTINUATION for header block",
+                            )
+                            .into());
+                        }
+                        header_block.extend_from_slice(&cont.payload);
+                        if (cont.header.flags & FLAG_END_HEADERS) != 0 {
+                            break;
+                        }
+                    }
+                }
+
+                let headers = hpack
+                    .decode(&header_block)
+                    .map_err(http2::Http2Error::from)?;
+                let mut request = request_from_h2_headers(headers)?;
+
+                if !end_stream {
+                    let mut body = Vec::new();
+                    loop {
+                        let f = framed.read_frame(max_frame_size).await?;
+                        match f.header.frame_type() {
+                            http2::FrameType::Data if f.header.stream_id == stream_id => {
+                                let (data, data_end_stream) =
+                                    extract_data_payload(f.header.flags, &f.payload)?;
+                                if body.len().saturating_add(data.len()) > default_body_limit {
+                                    return Err(http2::Http2Error::Protocol(
+                                        "request body exceeds configured limit",
+                                    )
+                                    .into());
+                                }
+                                body.extend_from_slice(data);
+                                if data_end_stream {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                return Err(http2::Http2Error::Protocol(
+                                    "unsupported frame while reading request body",
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    request.set_body(fastapi_core::Body::Bytes(body));
+                }
+
+                let request_id = request_counter.fetch_add(1, Ordering::Relaxed);
+                let request_budget = Budget::new().with_deadline(config.request_timeout);
+                let request_cx = Cx::for_testing_with_budget(request_budget);
+                let ctx = RequestContext::new(request_cx, request_id);
+
+                if let Err(err) = validate_host_header(&request, config) {
+                    let response = err.response();
+                    process_connection_http2_write_response(
+                        &mut framed,
+                        response,
+                        stream_id,
+                        max_frame_size,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                if let Err(response) = config.pre_body_validators.validate_all(&request) {
+                    process_connection_http2_write_response(
+                        &mut framed,
+                        response,
+                        stream_id,
+                        max_frame_size,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                let response = handler(ctx, &mut request).await;
+                process_connection_http2_write_response(
+                    &mut framed,
+                    response,
+                    stream_id,
+                    max_frame_size,
+                )
+                .await?;
+
+                if let Some(tasks) = App::take_background_tasks(&mut request) {
+                    tasks.execute_all().await;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn process_connection_http2_write_response(
+    framed: &mut http2::FramedH2,
+    response: Response,
+    stream_id: u32,
+    max_frame_size: u32,
+) -> Result<(), ServerError> {
+    use std::future::poll_fn;
+
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+
+    let (status, mut headers, mut body) = response.into_parts();
+    if !status.allows_body() {
+        body = fastapi_core::ResponseBody::Empty;
+    }
+
+    let mut add_content_length = matches!(body, fastapi_core::ResponseBody::Bytes(_));
+    for (name, _) in &headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            add_content_length = false;
+            break;
+        }
+    }
+    if add_content_length {
+        headers.push((
+            "content-length".to_string(),
+            body.len().to_string().into_bytes(),
+        ));
+    }
+
+    let mut block: Vec<u8> = Vec::new();
+    let status_bytes = status.as_u16().to_string().into_bytes();
+    http2::hpack_encode_literal_without_indexing(&mut block, b":status", &status_bytes);
+    for (name, value) in &headers {
+        if is_h2_forbidden_header_name(name) {
+            continue;
+        }
+        let n = name.to_ascii_lowercase();
+        http2::hpack_encode_literal_without_indexing(&mut block, n.as_bytes(), value);
+    }
+
+    let max = usize::try_from(max_frame_size).unwrap_or(16 * 1024);
+    let mut headers_flags = FLAG_END_HEADERS;
+    if body.is_empty() {
+        headers_flags |= FLAG_END_STREAM;
+    }
+
+    if block.len() <= max {
+        framed
+            .write_frame(http2::FrameType::Headers, headers_flags, stream_id, &block)
+            .await?;
+    } else {
+        // Split into HEADERS + CONTINUATION.
+        let mut first_flags = 0u8;
+        if body.is_empty() {
+            first_flags |= FLAG_END_STREAM;
+        }
+        let (first, rest) = block.split_at(max);
+        framed
+            .write_frame(http2::FrameType::Headers, first_flags, stream_id, first)
+            .await?;
+        let mut remaining = rest;
+        while remaining.len() > max {
+            let (chunk, r) = remaining.split_at(max);
+            framed
+                .write_frame(http2::FrameType::Continuation, 0, stream_id, chunk)
+                .await?;
+            remaining = r;
+        }
+        framed
+            .write_frame(
+                http2::FrameType::Continuation,
+                FLAG_END_HEADERS,
+                stream_id,
+                remaining,
+            )
+            .await?;
+    }
+
+    match body {
+        fastapi_core::ResponseBody::Empty => Ok(()),
+        fastapi_core::ResponseBody::Bytes(bytes) => {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let mut remaining = bytes.as_slice();
+            while remaining.len() > max {
+                let (chunk, r) = remaining.split_at(max);
+                framed
+                    .write_frame(http2::FrameType::Data, 0, stream_id, chunk)
+                    .await?;
+                remaining = r;
+            }
+            framed
+                .write_frame(
+                    http2::FrameType::Data,
+                    FLAG_END_STREAM,
+                    stream_id,
+                    remaining,
+                )
+                .await?;
+            Ok(())
+        }
+        fastapi_core::ResponseBody::Stream(mut s) => {
+            loop {
+                let next = poll_fn(|cx| Pin::new(&mut s).poll_next(cx)).await;
+                match next {
+                    Some(chunk) => {
+                        let mut remaining = chunk.as_slice();
+                        while remaining.len() > max {
+                            let (c, r) = remaining.split_at(max);
+                            framed
+                                .write_frame(http2::FrameType::Data, 0, stream_id, c)
+                                .await?;
+                            remaining = r;
+                        }
+                        if !remaining.is_empty() {
+                            framed
+                                .write_frame(http2::FrameType::Data, 0, stream_id, remaining)
+                                .await?;
+                        }
+                    }
+                    None => {
+                        framed
+                            .write_frame(http2::FrameType::Data, FLAG_END_STREAM, stream_id, &[])
+                            .await?;
+                        break;
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1683,7 +2012,21 @@ impl TcpServer {
         peer_addr: SocketAddr,
         app: &App,
     ) -> Result<(), ServerError> {
+        let (proto, buffered) = sniff_protocol(&mut stream, self.config.keep_alive_timeout).await?;
+        if !buffered.is_empty() {
+            self.record_bytes_in(buffered.len() as u64);
+        }
+
+        if proto == SniffedProtocol::Http2PriorKnowledge {
+            return self
+                .handle_connection_app_http2(cx, stream, peer_addr, app)
+                .await;
+        }
+
         let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
+        if !buffered.is_empty() {
+            parser.feed(&buffered)?;
+        }
         let mut read_buffer = vec![0u8; self.config.read_buffer_size];
         let mut response_writer = ResponseWriter::new();
         let mut requests_on_connection: usize = 0;
@@ -1906,6 +2249,594 @@ impl TcpServer {
         }
     }
 
+    async fn handle_connection_app_http2(
+        &self,
+        cx: &Cx,
+        stream: TcpStream,
+        _peer_addr: SocketAddr,
+        app: &App,
+    ) -> Result<(), ServerError> {
+        const FLAG_END_STREAM: u8 = 0x1;
+        const FLAG_END_HEADERS: u8 = 0x4;
+        const FLAG_ACK: u8 = 0x1;
+
+        let mut framed = http2::FramedH2::new(stream, Vec::new());
+        let mut hpack = http2::HpackDecoder::new();
+        let mut max_frame_size: u32 = 16 * 1024; // RFC 7540 default.
+
+        let first = framed.read_frame(max_frame_size).await?;
+        self.record_bytes_in((http2::FrameHeader::LEN + first.payload.len()) as u64);
+
+        if first.header.frame_type() != http2::FrameType::Settings
+            || first.header.stream_id != 0
+            || (first.header.flags & FLAG_ACK) != 0
+        {
+            return Err(
+                http2::Http2Error::Protocol("expected client SETTINGS after preface").into(),
+            );
+        }
+
+        apply_http2_settings(&mut hpack, &mut max_frame_size, &first.payload)?;
+
+        // Send server SETTINGS (empty for now) and ACK the client's SETTINGS.
+        framed
+            .write_frame(http2::FrameType::Settings, 0, 0, &[])
+            .await?;
+        self.record_bytes_out(http2::FrameHeader::LEN as u64);
+
+        framed
+            .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+            .await?;
+        self.record_bytes_out(http2::FrameHeader::LEN as u64);
+
+        loop {
+            if cx.is_cancel_requested() {
+                return Ok(());
+            }
+
+            let frame = framed.read_frame(max_frame_size).await?;
+            self.record_bytes_in((http2::FrameHeader::LEN + frame.payload.len()) as u64);
+
+            match frame.header.frame_type() {
+                http2::FrameType::Settings => {
+                    if frame.header.stream_id != 0 {
+                        return Err(
+                            http2::Http2Error::Protocol("SETTINGS must be on stream 0").into()
+                        );
+                    }
+                    if (frame.header.flags & FLAG_ACK) != 0 {
+                        // ACK for our SETTINGS.
+                        continue;
+                    }
+                    apply_http2_settings(&mut hpack, &mut max_frame_size, &frame.payload)?;
+                    // ACK peer SETTINGS.
+                    framed
+                        .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+                        .await?;
+                    self.record_bytes_out(http2::FrameHeader::LEN as u64);
+                }
+                http2::FrameType::Ping => {
+                    // Respond to pings to avoid clients stalling.
+                    if frame.header.stream_id != 0 || frame.payload.len() != 8 {
+                        return Err(http2::Http2Error::Protocol("invalid PING frame").into());
+                    }
+                    if (frame.header.flags & FLAG_ACK) == 0 {
+                        framed
+                            .write_frame(http2::FrameType::Ping, FLAG_ACK, 0, &frame.payload)
+                            .await?;
+                        self.record_bytes_out((http2::FrameHeader::LEN + 8) as u64);
+                    }
+                }
+                http2::FrameType::Goaway => return Ok(()),
+                http2::FrameType::Headers => {
+                    if frame.header.stream_id == 0 {
+                        return Err(
+                            http2::Http2Error::Protocol("HEADERS must not be on stream 0").into(),
+                        );
+                    }
+
+                    let stream_id = frame.header.stream_id;
+                    let (end_stream, mut header_block) =
+                        extract_header_block_fragment(frame.header.flags, &frame.payload)?;
+
+                    // CONTINUATION frames until END_HEADERS.
+                    if (frame.header.flags & FLAG_END_HEADERS) == 0 {
+                        loop {
+                            let cont = framed.read_frame(max_frame_size).await?;
+                            self.record_bytes_in(
+                                (http2::FrameHeader::LEN + cont.payload.len()) as u64,
+                            );
+                            if cont.header.frame_type() != http2::FrameType::Continuation
+                                || cont.header.stream_id != stream_id
+                            {
+                                return Err(http2::Http2Error::Protocol(
+                                    "expected CONTINUATION for header block",
+                                )
+                                .into());
+                            }
+                            header_block.extend_from_slice(&cont.payload);
+                            if (cont.header.flags & FLAG_END_HEADERS) != 0 {
+                                break;
+                            }
+                        }
+                    }
+
+                    let headers = hpack
+                        .decode(&header_block)
+                        .map_err(http2::Http2Error::from)?;
+                    let mut request = request_from_h2_headers(headers)?;
+                    request.set_version(fastapi_core::HttpVersion::Http2);
+
+                    // If there is a body, read DATA frames until END_STREAM.
+                    if !end_stream {
+                        let max = app.config().max_body_size;
+                        let mut body = Vec::new();
+                        loop {
+                            let f = framed.read_frame(max_frame_size).await?;
+                            self.record_bytes_in(
+                                (http2::FrameHeader::LEN + f.payload.len()) as u64,
+                            );
+                            match f.header.frame_type() {
+                                http2::FrameType::Data if f.header.stream_id == stream_id => {
+                                    let (data, data_end_stream) =
+                                        extract_data_payload(f.header.flags, &f.payload)?;
+                                    if body.len().saturating_add(data.len()) > max {
+                                        return Err(http2::Http2Error::Protocol(
+                                            "request body exceeds configured max_body_size",
+                                        )
+                                        .into());
+                                    }
+                                    body.extend_from_slice(data);
+                                    if data_end_stream {
+                                        break;
+                                    }
+                                }
+                                http2::FrameType::Settings
+                                | http2::FrameType::Ping
+                                | http2::FrameType::Goaway => {
+                                    // Re-process control frames by pushing back through the top-level loop.
+                                    // For minimal correctness, handle them inline here.
+                                    // SETTINGS/PING were already validated above; just dispatch quickly.
+                                    if f.header.frame_type() == http2::FrameType::Goaway {
+                                        return Ok(());
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::Ping {
+                                        if f.header.stream_id != 0 || f.payload.len() != 8 {
+                                            return Err(http2::Http2Error::Protocol(
+                                                "invalid PING frame",
+                                            )
+                                            .into());
+                                        }
+                                        if (f.header.flags & FLAG_ACK) == 0 {
+                                            framed
+                                                .write_frame(
+                                                    http2::FrameType::Ping,
+                                                    FLAG_ACK,
+                                                    0,
+                                                    &f.payload,
+                                                )
+                                                .await?;
+                                            self.record_bytes_out(
+                                                (http2::FrameHeader::LEN + 8) as u64,
+                                            );
+                                        }
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::Settings {
+                                        if f.header.stream_id != 0 {
+                                            return Err(http2::Http2Error::Protocol(
+                                                "SETTINGS must be on stream 0",
+                                            )
+                                            .into());
+                                        }
+                                        if (f.header.flags & FLAG_ACK) == 0 {
+                                            apply_http2_settings(
+                                                &mut hpack,
+                                                &mut max_frame_size,
+                                                &f.payload,
+                                            )?;
+                                            framed
+                                                .write_frame(
+                                                    http2::FrameType::Settings,
+                                                    FLAG_ACK,
+                                                    0,
+                                                    &[],
+                                                )
+                                                .await?;
+                                            self.record_bytes_out(http2::FrameHeader::LEN as u64);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    return Err(http2::Http2Error::Protocol(
+                                        "unsupported frame while reading request body",
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        request.set_body(fastapi_core::Body::Bytes(body));
+                    }
+
+                    let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
+                    let request_budget = Budget::new().with_deadline(self.config.request_timeout);
+                    let request_cx = Cx::for_testing_with_budget(request_budget);
+                    let overrides = app.dependency_overrides();
+                    let ctx = RequestContext::with_overrides_and_body_limit(
+                        request_cx,
+                        request_id,
+                        overrides,
+                        app.config().max_body_size,
+                    );
+
+                    if let Err(err) = validate_host_header(&request, &self.config) {
+                        ctx.trace(&format!("Rejecting HTTP/2 request: {}", err.detail));
+                        let response = err.response();
+                        self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                            .await?;
+                        continue;
+                    }
+
+                    if let Err(response) = self.config.pre_body_validators.validate_all(&request) {
+                        self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                            .await?;
+                        continue;
+                    }
+
+                    let response = app.handle(&ctx, &mut request).await;
+
+                    // Send response on the same stream.
+                    self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                        .await?;
+
+                    if let Some(tasks) = App::take_background_tasks(&mut request) {
+                        tasks.execute_all().await;
+                    }
+
+                    // Yield to keep cancellation responsive.
+                    asupersync::runtime::yield_now().await;
+                }
+                _ => {
+                    // Minimal: ignore other frame types for now.
+                }
+            }
+        }
+    }
+
+    async fn write_h2_response(
+        &self,
+        framed: &mut http2::FramedH2,
+        response: Response,
+        stream_id: u32,
+        max_frame_size: u32,
+    ) -> Result<(), ServerError> {
+        use std::future::poll_fn;
+
+        const FLAG_END_STREAM: u8 = 0x1;
+        const FLAG_END_HEADERS: u8 = 0x4;
+
+        let (status, mut headers, mut body) = response.into_parts();
+        if !status.allows_body() {
+            body = fastapi_core::ResponseBody::Empty;
+        }
+
+        let mut add_content_length = matches!(body, fastapi_core::ResponseBody::Bytes(_));
+        for (name, _) in &headers {
+            if name.eq_ignore_ascii_case("content-length") {
+                add_content_length = false;
+                break;
+            }
+        }
+
+        if add_content_length {
+            let len = body.len();
+            headers.push(("content-length".to_string(), len.to_string().into_bytes()));
+        }
+
+        // Encode headers: :status + response headers (filtered for HTTP/2).
+        let mut block: Vec<u8> = Vec::new();
+        let status_bytes = status.as_u16().to_string().into_bytes();
+        http2::hpack_encode_literal_without_indexing(&mut block, b":status", &status_bytes);
+
+        for (name, value) in &headers {
+            if is_h2_forbidden_header_name(name) {
+                continue;
+            }
+            let n = name.to_ascii_lowercase();
+            http2::hpack_encode_literal_without_indexing(&mut block, n.as_bytes(), value);
+        }
+
+        // Write HEADERS + CONTINUATION if needed.
+        let max = usize::try_from(max_frame_size).unwrap_or(16 * 1024);
+        if block.len() <= max {
+            let mut flags = FLAG_END_HEADERS;
+            if body.is_empty() {
+                flags |= FLAG_END_STREAM;
+            }
+            framed
+                .write_frame(http2::FrameType::Headers, flags, stream_id, &block)
+                .await?;
+            self.record_bytes_out((http2::FrameHeader::LEN + block.len()) as u64);
+        } else {
+            let mut flags = 0u8;
+            if body.is_empty() {
+                flags |= FLAG_END_STREAM;
+            }
+            let (first, rest) = block.split_at(max);
+            framed
+                .write_frame(http2::FrameType::Headers, flags, stream_id, first)
+                .await?;
+            self.record_bytes_out((http2::FrameHeader::LEN + first.len()) as u64);
+
+            let mut remaining = rest;
+            while remaining.len() > max {
+                let (chunk, r) = remaining.split_at(max);
+                framed
+                    .write_frame(http2::FrameType::Continuation, 0, stream_id, chunk)
+                    .await?;
+                self.record_bytes_out((http2::FrameHeader::LEN + chunk.len()) as u64);
+                remaining = r;
+            }
+            framed
+                .write_frame(
+                    http2::FrameType::Continuation,
+                    FLAG_END_HEADERS,
+                    stream_id,
+                    remaining,
+                )
+                .await?;
+            self.record_bytes_out((http2::FrameHeader::LEN + remaining.len()) as u64);
+        }
+
+        // Write body.
+        match body {
+            fastapi_core::ResponseBody::Empty => Ok(()),
+            fastapi_core::ResponseBody::Bytes(bytes) => {
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                let mut remaining = bytes.as_slice();
+                while remaining.len() > max {
+                    let (chunk, r) = remaining.split_at(max);
+                    framed
+                        .write_frame(http2::FrameType::Data, 0, stream_id, chunk)
+                        .await?;
+                    self.record_bytes_out((http2::FrameHeader::LEN + chunk.len()) as u64);
+                    remaining = r;
+                }
+                framed
+                    .write_frame(
+                        http2::FrameType::Data,
+                        FLAG_END_STREAM,
+                        stream_id,
+                        remaining,
+                    )
+                    .await?;
+                self.record_bytes_out((http2::FrameHeader::LEN + remaining.len()) as u64);
+                Ok(())
+            }
+            fastapi_core::ResponseBody::Stream(mut s) => {
+                loop {
+                    let next = poll_fn(|cx| Pin::new(&mut s).poll_next(cx)).await;
+                    match next {
+                        Some(chunk) => {
+                            let mut remaining = chunk.as_slice();
+                            while remaining.len() > max {
+                                let (c, r) = remaining.split_at(max);
+                                framed
+                                    .write_frame(http2::FrameType::Data, 0, stream_id, c)
+                                    .await?;
+                                self.record_bytes_out((http2::FrameHeader::LEN + c.len()) as u64);
+                                remaining = r;
+                            }
+                            if !remaining.is_empty() {
+                                framed
+                                    .write_frame(http2::FrameType::Data, 0, stream_id, remaining)
+                                    .await?;
+                                self.record_bytes_out(
+                                    (http2::FrameHeader::LEN + remaining.len()) as u64,
+                                );
+                            }
+                        }
+                        None => {
+                            framed
+                                .write_frame(
+                                    http2::FrameType::Data,
+                                    FLAG_END_STREAM,
+                                    stream_id,
+                                    &[],
+                                )
+                                .await?;
+                            self.record_bytes_out(http2::FrameHeader::LEN as u64);
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn handle_connection_handler_http2(
+        &self,
+        cx: &Cx,
+        stream: TcpStream,
+        handler: &dyn fastapi_core::Handler,
+    ) -> Result<(), ServerError> {
+        const FLAG_END_HEADERS: u8 = 0x4;
+        const FLAG_ACK: u8 = 0x1;
+
+        let mut framed = http2::FramedH2::new(stream, Vec::new());
+        let mut hpack = http2::HpackDecoder::new();
+        let mut max_frame_size: u32 = 16 * 1024;
+
+        let first = framed.read_frame(max_frame_size).await?;
+        self.record_bytes_in((http2::FrameHeader::LEN + first.payload.len()) as u64);
+
+        if first.header.frame_type() != http2::FrameType::Settings
+            || first.header.stream_id != 0
+            || (first.header.flags & FLAG_ACK) != 0
+        {
+            return Err(
+                http2::Http2Error::Protocol("expected client SETTINGS after preface").into(),
+            );
+        }
+
+        apply_http2_settings(&mut hpack, &mut max_frame_size, &first.payload)?;
+
+        framed
+            .write_frame(http2::FrameType::Settings, 0, 0, &[])
+            .await?;
+        self.record_bytes_out(http2::FrameHeader::LEN as u64);
+
+        framed
+            .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+            .await?;
+        self.record_bytes_out(http2::FrameHeader::LEN as u64);
+
+        let default_body_limit = self.config.parse_limits.max_request_size;
+
+        loop {
+            if cx.is_cancel_requested() {
+                return Ok(());
+            }
+
+            let frame = framed.read_frame(max_frame_size).await?;
+            self.record_bytes_in((http2::FrameHeader::LEN + frame.payload.len()) as u64);
+
+            match frame.header.frame_type() {
+                http2::FrameType::Settings => {
+                    if frame.header.stream_id != 0 {
+                        return Err(
+                            http2::Http2Error::Protocol("SETTINGS must be on stream 0").into()
+                        );
+                    }
+                    if (frame.header.flags & FLAG_ACK) != 0 {
+                        continue;
+                    }
+                    apply_http2_settings(&mut hpack, &mut max_frame_size, &frame.payload)?;
+                    framed
+                        .write_frame(http2::FrameType::Settings, FLAG_ACK, 0, &[])
+                        .await?;
+                    self.record_bytes_out(http2::FrameHeader::LEN as u64);
+                }
+                http2::FrameType::Ping => {
+                    if frame.header.stream_id != 0 || frame.payload.len() != 8 {
+                        return Err(http2::Http2Error::Protocol("invalid PING frame").into());
+                    }
+                    if (frame.header.flags & FLAG_ACK) == 0 {
+                        framed
+                            .write_frame(http2::FrameType::Ping, FLAG_ACK, 0, &frame.payload)
+                            .await?;
+                        self.record_bytes_out((http2::FrameHeader::LEN + 8) as u64);
+                    }
+                }
+                http2::FrameType::Goaway => return Ok(()),
+                http2::FrameType::Headers => {
+                    if frame.header.stream_id == 0 {
+                        return Err(
+                            http2::Http2Error::Protocol("HEADERS must not be on stream 0").into(),
+                        );
+                    }
+
+                    let stream_id = frame.header.stream_id;
+                    let (end_stream, mut header_block) =
+                        extract_header_block_fragment(frame.header.flags, &frame.payload)?;
+
+                    if (frame.header.flags & FLAG_END_HEADERS) == 0 {
+                        loop {
+                            let cont = framed.read_frame(max_frame_size).await?;
+                            self.record_bytes_in(
+                                (http2::FrameHeader::LEN + cont.payload.len()) as u64,
+                            );
+                            if cont.header.frame_type() != http2::FrameType::Continuation
+                                || cont.header.stream_id != stream_id
+                            {
+                                return Err(http2::Http2Error::Protocol(
+                                    "expected CONTINUATION for header block",
+                                )
+                                .into());
+                            }
+                            header_block.extend_from_slice(&cont.payload);
+                            if (cont.header.flags & FLAG_END_HEADERS) != 0 {
+                                break;
+                            }
+                        }
+                    }
+
+                    let headers = hpack
+                        .decode(&header_block)
+                        .map_err(http2::Http2Error::from)?;
+                    let mut request = request_from_h2_headers(headers)?;
+
+                    if !end_stream {
+                        let mut body = Vec::new();
+                        loop {
+                            let f = framed.read_frame(max_frame_size).await?;
+                            self.record_bytes_in(
+                                (http2::FrameHeader::LEN + f.payload.len()) as u64,
+                            );
+                            match f.header.frame_type() {
+                                http2::FrameType::Data if f.header.stream_id == stream_id => {
+                                    let (data, data_end_stream) =
+                                        extract_data_payload(f.header.flags, &f.payload)?;
+                                    if body.len().saturating_add(data.len()) > default_body_limit {
+                                        return Err(http2::Http2Error::Protocol(
+                                            "request body exceeds configured limit",
+                                        )
+                                        .into());
+                                    }
+                                    body.extend_from_slice(data);
+                                    if data_end_stream {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    return Err(http2::Http2Error::Protocol(
+                                        "unsupported frame while reading request body",
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        request.set_body(fastapi_core::Body::Bytes(body));
+                    }
+
+                    let request_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
+                    let request_budget = Budget::new().with_deadline(self.config.request_timeout);
+                    let request_cx = Cx::for_testing_with_budget(request_budget);
+
+                    let overrides = handler
+                        .dependency_overrides()
+                        .unwrap_or_else(|| Arc::new(fastapi_core::DependencyOverrides::new()));
+
+                    let ctx = RequestContext::with_overrides_and_body_limit(
+                        request_cx,
+                        request_id,
+                        overrides,
+                        default_body_limit,
+                    );
+
+                    if let Err(err) = validate_host_header(&request, &self.config) {
+                        let response = err.response();
+                        self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                            .await?;
+                        continue;
+                    }
+                    if let Err(response) = self.config.pre_body_validators.validate_all(&request) {
+                        self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                            .await?;
+                        continue;
+                    }
+
+                    let response = handler.call(&ctx, &mut request).await;
+                    self.write_h2_response(&mut framed, response, stream_id, max_frame_size)
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Handles a single connection using the Handler trait.
     ///
     /// This is a specialized version for trait objects where we cannot use a closure
@@ -1917,7 +2848,20 @@ impl TcpServer {
         _peer_addr: SocketAddr,
         handler: &dyn fastapi_core::Handler,
     ) -> Result<(), ServerError> {
+        let (proto, buffered) = sniff_protocol(&mut stream, self.config.keep_alive_timeout).await?;
+        if !buffered.is_empty() {
+            self.record_bytes_in(buffered.len() as u64);
+        }
+        if proto == SniffedProtocol::Http2PriorKnowledge {
+            return self
+                .handle_connection_handler_http2(cx, stream, handler)
+                .await;
+        }
+
         let mut parser = StatefulParser::new().with_limits(self.config.parse_limits.clone());
+        if !buffered.is_empty() {
+            parser.feed(&buffered)?;
+        }
         let mut read_buffer = vec![0u8; self.config.read_buffer_size];
         let mut response_writer = ResponseWriter::new();
         let mut requests_on_connection: usize = 0;
@@ -2250,6 +3194,211 @@ async fn read_with_timeout(
             "keep-alive timeout expired",
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SniffedProtocol {
+    Http1,
+    Http2PriorKnowledge,
+}
+
+/// Sniff whether the connection is HTTP/2 prior-knowledge (h2c preface).
+///
+/// Returns the inferred protocol and the bytes already consumed from the stream.
+async fn sniff_protocol(
+    stream: &mut TcpStream,
+    keep_alive_timeout: Duration,
+) -> io::Result<(SniffedProtocol, Vec<u8>)> {
+    let mut buffered: Vec<u8> = Vec::new();
+    let preface = http2::PREFACE;
+
+    while buffered.len() < preface.len() {
+        let mut tmp = vec![0u8; preface.len() - buffered.len()];
+        let n = if keep_alive_timeout.is_zero() {
+            read_into_buffer(stream, &mut tmp).await?
+        } else {
+            read_with_timeout(stream, &mut tmp, keep_alive_timeout).await?
+        };
+        if n == 0 {
+            // EOF before any meaningful determination; treat as HTTP/1 with whatever we saw.
+            return Ok((SniffedProtocol::Http1, buffered));
+        }
+
+        buffered.extend_from_slice(&tmp[..n]);
+        if !preface.starts_with(&buffered) {
+            return Ok((SniffedProtocol::Http1, buffered));
+        }
+    }
+
+    Ok((SniffedProtocol::Http2PriorKnowledge, buffered))
+}
+
+fn apply_http2_settings(
+    hpack: &mut http2::HpackDecoder,
+    max_frame_size: &mut u32,
+    payload: &[u8],
+) -> Result<(), http2::Http2Error> {
+    // SETTINGS payload is a sequence of (u16 id, u32 value) pairs.
+    if payload.len() % 6 != 0 {
+        return Err(http2::Http2Error::Protocol(
+            "SETTINGS length must be a multiple of 6",
+        ));
+    }
+
+    for chunk in payload.chunks_exact(6) {
+        let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+        let value = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+        match id {
+            0x1 => {
+                // SETTINGS_HEADER_TABLE_SIZE
+                hpack.set_dynamic_table_max_size(value as usize);
+            }
+            0x5 => {
+                // SETTINGS_MAX_FRAME_SIZE (RFC 7540: 16384..=16777215)
+                if !(16_384..=16_777_215).contains(&value) {
+                    return Err(http2::Http2Error::Protocol(
+                        "invalid SETTINGS_MAX_FRAME_SIZE",
+                    ));
+                }
+                *max_frame_size = value;
+            }
+            0x6 => {
+                // SETTINGS_MAX_HEADER_LIST_SIZE
+                hpack.set_max_header_list_size(value as usize);
+            }
+            _ => {
+                // Ignore unsupported settings.
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_header_block_fragment(
+    flags: u8,
+    payload: &[u8],
+) -> Result<(bool, Vec<u8>), http2::Http2Error> {
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_PADDED: u8 = 0x8;
+    const FLAG_PRIORITY: u8 = 0x20;
+
+    let end_stream = (flags & FLAG_END_STREAM) != 0;
+    let mut idx = 0usize;
+
+    let pad_len = if (flags & FLAG_PADDED) != 0 {
+        if payload.is_empty() {
+            return Err(http2::Http2Error::Protocol(
+                "HEADERS PADDED set with empty payload",
+            ));
+        }
+        let v = payload[0] as usize;
+        idx += 1;
+        v
+    } else {
+        0
+    };
+
+    if (flags & FLAG_PRIORITY) != 0 {
+        // 5 bytes priority fields: dep(4) + weight(1)
+        if payload.len().saturating_sub(idx) < 5 {
+            return Err(http2::Http2Error::Protocol(
+                "HEADERS PRIORITY set but too short",
+            ));
+        }
+        idx += 5;
+    }
+
+    if payload.len() < idx {
+        return Err(http2::Http2Error::Protocol("invalid HEADERS payload"));
+    }
+    let frag = &payload[idx..];
+    if frag.len() < pad_len {
+        return Err(http2::Http2Error::Protocol(
+            "invalid HEADERS padding length",
+        ));
+    }
+    let end = frag.len() - pad_len;
+    Ok((end_stream, frag[..end].to_vec()))
+}
+
+fn extract_data_payload(flags: u8, payload: &[u8]) -> Result<(&[u8], bool), http2::Http2Error> {
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_PADDED: u8 = 0x8;
+
+    let end_stream = (flags & FLAG_END_STREAM) != 0;
+    if (flags & FLAG_PADDED) == 0 {
+        return Ok((payload, end_stream));
+    }
+    if payload.is_empty() {
+        return Err(http2::Http2Error::Protocol(
+            "DATA PADDED set with empty payload",
+        ));
+    }
+    let pad_len = payload[0] as usize;
+    let data = &payload[1..];
+    if data.len() < pad_len {
+        return Err(http2::Http2Error::Protocol("invalid DATA padding length"));
+    }
+    Ok((&data[..data.len() - pad_len], end_stream))
+}
+
+fn request_from_h2_headers(headers: http2::HeaderList) -> Result<Request, http2::Http2Error> {
+    let mut method: Option<fastapi_core::Method> = None;
+    let mut path: Option<String> = None;
+    let mut authority: Option<Vec<u8>> = None;
+
+    let mut req_headers: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for (name, value) in headers {
+        if name.starts_with(b":") {
+            match name.as_slice() {
+                b":method" => method = fastapi_core::Method::from_bytes(&value),
+                b":path" => {
+                    let s = std::str::from_utf8(&value)
+                        .map_err(|_| http2::Http2Error::Protocol("non-utf8 :path"))?;
+                    path = Some(s.to_string());
+                }
+                b":authority" => authority = Some(value),
+                _ => {}
+            }
+            continue;
+        }
+
+        let n = std::str::from_utf8(&name)
+            .map_err(|_| http2::Http2Error::Protocol("non-utf8 header name"))?;
+        req_headers.push((n.to_string(), value));
+    }
+
+    let method = method.ok_or(http2::Http2Error::Protocol("missing :method"))?;
+    let raw_path = path.ok_or(http2::Http2Error::Protocol("missing :path"))?;
+    let (path_only, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (raw_path, None),
+    };
+
+    let mut req = Request::with_version(method, path_only, fastapi_core::HttpVersion::Http2);
+    req.set_query(query);
+
+    if let Some(auth) = authority {
+        req.headers_mut().insert("host", auth);
+    }
+
+    for (n, v) in req_headers {
+        req.headers_mut().insert(n, v);
+    }
+
+    Ok(req)
+}
+
+fn is_h2_forbidden_header_name(name: &str) -> bool {
+    // RFC 7540: connection-specific headers are not permitted in HTTP/2.
+    // We conservatively drop common hop-by-hop headers here.
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("te")
 }
 
 /// Writes raw bytes to a TCP stream (e.g., for 100 Continue response).
