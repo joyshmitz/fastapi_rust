@@ -697,4 +697,3 @@ mod tests {
         assert_eq!(f.content_type, "image/jpeg");
     }
 }
-
