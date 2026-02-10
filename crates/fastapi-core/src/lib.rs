@@ -97,9 +97,9 @@ pub use request::{
 };
 pub use response::{
     Binary, BodyStream, FileResponse, Html, IntoResponse, Link, LinkHeader, LinkRel, NoContent,
-    Redirect, Response, ResponseBody, ResponseModelConfig, ResponseProduces, SameSite, SetCookie,
-    StatusCode, Text, ValidatedResponse, apply_conditional, check_if_match, check_if_none_match,
-    exclude_fields, include_fields, mime_type_for_extension,
+    Redirect, Response, ResponseBody, ResponseModelAliases, ResponseModelConfig, ResponseProduces,
+    SameSite, SetCookie, StatusCode, Text, ValidatedResponse, apply_conditional, check_if_match,
+    check_if_none_match, exclude_fields, include_fields, mime_type_for_extension,
 };
 
 // Re-export interactive docs helpers.

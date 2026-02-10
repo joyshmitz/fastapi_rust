@@ -1374,6 +1374,40 @@ pub struct ResponseModelConfig {
 
     /// Exclude fields with None values.
     pub exclude_none: bool,
+
+    /// Optional alias metadata for `by_alias` transformations.
+    ///
+    /// In Rust/serde, field rename behavior is compile-time. To support FastAPI-style
+    /// `response_model_by_alias` at runtime, callers must provide an explicit mapping
+    /// from canonical field names to alias field names.
+    ///
+    /// The recommended way is to derive it:
+    /// `#[derive(fastapi_macros::ResponseModelAliases)]` and then use
+    /// `ResponseModelConfig::with_aliases_from::<T>()`.
+    aliases: Option<&'static [(&'static str, &'static str)]>,
+
+    /// Optional provider for a default JSON value for the model.
+    ///
+    /// This is required to implement FastAPI-style `response_model_exclude_defaults`
+    /// without reflection. Provide it with `ResponseModelConfig::with_defaults_from::<T>()`
+    /// where `T: Default + Serialize`.
+    defaults_json: Option<fn() -> Result<serde_json::Value, String>>,
+
+    /// Optional set of canonical field names explicitly set for this response instance.
+    ///
+    /// This is required to implement FastAPI-style `response_model_exclude_unset`.
+    set_fields: Option<std::collections::HashSet<String>>,
+}
+
+/// Compile-time response model metadata: canonical field names to alias field names.
+///
+/// Implement this with `#[derive(fastapi_macros::ResponseModelAliases)]`.
+pub trait ResponseModelAliases {
+    /// Returns a mapping of `(canonical_name, alias_name)` pairs.
+    ///
+    /// Entries with identical names are allowed, but derive implementations typically
+    /// only include pairs where the alias differs from the canonical name.
+    fn response_model_aliases() -> &'static [(&'static str, &'static str)];
 }
 
 impl ResponseModelConfig {
@@ -1399,8 +1433,8 @@ impl ResponseModelConfig {
 
     /// Use serde aliases in output.
     ///
-    /// **Note:** This option is stored but not yet implemented in `filter_json`.
-    /// Full implementation requires compile-time serde attribute introspection.
+    /// To make this meaningful, supply alias metadata using
+    /// `with_aliases(...)` or `with_aliases_from::<T>()`.
     #[must_use]
     pub fn by_alias(mut self, value: bool) -> Self {
         self.by_alias = value;
@@ -1409,8 +1443,8 @@ impl ResponseModelConfig {
 
     /// Exclude unset fields.
     ///
-    /// **Note:** This option is stored but not yet implemented in `filter_json`.
-    /// Full implementation requires the type to track which fields were explicitly set.
+    /// To make this meaningful, supply the per-response set field list using
+    /// `with_set_fields(...)`.
     #[must_use]
     pub fn exclude_unset(mut self, value: bool) -> Self {
         self.exclude_unset = value;
@@ -1419,8 +1453,9 @@ impl ResponseModelConfig {
 
     /// Exclude fields with default values.
     ///
-    /// **Note:** This option is stored but not yet implemented in `filter_json`.
-    /// Full implementation requires compile-time default value comparison.
+    /// To make this meaningful, supply default JSON via
+    /// `with_defaults_from::<T>()` where `T: Default + Serialize`, or
+    /// `with_defaults_json_provider(...)`.
     #[must_use]
     pub fn exclude_defaults(mut self, value: bool) -> Self {
         self.exclude_defaults = value;
@@ -1434,6 +1469,48 @@ impl ResponseModelConfig {
         self
     }
 
+    /// Provide alias metadata explicitly.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &'static [(&'static str, &'static str)]) -> Self {
+        self.aliases = Some(aliases);
+        self
+    }
+
+    /// Provide alias metadata from a type-level provider.
+    #[must_use]
+    pub fn with_aliases_from<T: ResponseModelAliases>(mut self) -> Self {
+        self.aliases = Some(T::response_model_aliases());
+        self
+    }
+
+    /// Provide a default JSON provider explicitly.
+    #[must_use]
+    pub fn with_defaults_json_provider(
+        mut self,
+        provider: fn() -> Result<serde_json::Value, String>,
+    ) -> Self {
+        self.defaults_json = Some(provider);
+        self
+    }
+
+    fn defaults_json_for<T: Default + Serialize>() -> Result<serde_json::Value, String> {
+        serde_json::to_value(T::default()).map_err(|e| e.to_string())
+    }
+
+    /// Provide default JSON for the model via `T::default()`.
+    #[must_use]
+    pub fn with_defaults_from<T: Default + Serialize>(mut self) -> Self {
+        self.defaults_json = Some(Self::defaults_json_for::<T>);
+        self
+    }
+
+    /// Provide the set of canonical field names that were explicitly set for this response.
+    #[must_use]
+    pub fn with_set_fields(mut self, fields: std::collections::HashSet<String>) -> Self {
+        self.set_fields = Some(fields);
+        self
+    }
+
     /// Check if any filtering is configured.
     #[must_use]
     pub fn has_filtering(&self) -> bool {
@@ -1442,6 +1519,7 @@ impl ResponseModelConfig {
             || self.exclude_none
             || self.exclude_unset
             || self.exclude_defaults
+            || self.by_alias
     }
 
     /// Apply filtering to a JSON value.
@@ -1450,27 +1528,141 @@ impl ResponseModelConfig {
     /// - Applies include whitelist
     /// - Applies exclude blacklist
     /// - Removes None values if exclude_none is set
-    #[must_use]
-    pub fn filter_json(&self, mut value: serde_json::Value) -> serde_json::Value {
-        if let serde_json::Value::Object(ref mut map) = value {
-            // Apply include whitelist
-            if let Some(ref include_set) = self.include {
-                map.retain(|key, _| include_set.contains(key));
-            }
+    #[allow(clippy::result_large_err)]
+    pub fn filter_json(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::error::ResponseValidationError> {
+        let serde_json::Value::Object(mut map) = value else {
+            return Ok(value);
+        };
 
-            // Apply exclude blacklist
-            if let Some(ref exclude_set) = self.exclude {
-                map.retain(|key, _| !exclude_set.contains(key));
-            }
+        // Normalize to canonical field names first so include/exclude/set_fields operate
+        // on stable names even when serde serialization uses aliases.
+        if let Some(aliases) = self.aliases {
+            normalize_to_canonical(&mut map, aliases)?;
+        }
 
-            // Remove None values if configured
-            if self.exclude_none {
-                map.retain(|_, v| !v.is_null());
+        // Exclude unset fields (requires per-response set field list).
+        if self.exclude_unset {
+            let set_fields = self.set_fields.as_ref().ok_or_else(|| {
+                crate::error::ResponseValidationError::serialization_failed(
+                    "response_model_exclude_unset requires set-fields metadata \
+                     (use ResponseModelConfig::with_set_fields)",
+                )
+            })?;
+            map.retain(|k, _| set_fields.contains(k));
+        }
+
+        // Apply include whitelist
+        if let Some(ref include_set) = self.include {
+            map.retain(|key, _| include_set.contains(key));
+        }
+
+        // Apply exclude blacklist
+        if let Some(ref exclude_set) = self.exclude {
+            map.retain(|key, _| !exclude_set.contains(key));
+        }
+
+        // Remove None values if configured
+        if self.exclude_none {
+            map.retain(|_, v| !v.is_null());
+        }
+
+        // Exclude defaults (requires default JSON provider).
+        if self.exclude_defaults {
+            let provider = self.defaults_json.ok_or_else(|| {
+                crate::error::ResponseValidationError::serialization_failed(
+                    "response_model_exclude_defaults requires defaults metadata \
+                     (use ResponseModelConfig::with_defaults_from::<T>() or \
+                      ResponseModelConfig::with_defaults_json_provider)",
+                )
+            })?;
+            let defaults =
+                provider().map_err(crate::error::ResponseValidationError::serialization_failed)?;
+            let serde_json::Value::Object(defaults_map) = defaults else {
+                return Err(crate::error::ResponseValidationError::serialization_failed(
+                    "defaults provider did not return a JSON object",
+                ));
+            };
+
+            // Remove keys that match the default value exactly.
+            for (k, default_v) in defaults_map {
+                if map.get(&k).is_some_and(|v| v == &default_v) {
+                    map.remove(&k);
+                }
             }
         }
 
-        value
+        // Apply aliases for output (requires alias metadata).
+        if self.by_alias {
+            let aliases = self.aliases.ok_or_else(|| {
+                crate::error::ResponseValidationError::serialization_failed(
+                    "response_model_by_alias requires alias metadata \
+                     (use ResponseModelConfig::with_aliases(...) or \
+                      ResponseModelConfig::with_aliases_from::<T>())",
+                )
+            })?;
+            apply_aliases(&mut map, aliases)?;
+        }
+
+        Ok(serde_json::Value::Object(map))
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_to_canonical(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    aliases: &[(&'static str, &'static str)],
+) -> Result<(), crate::error::ResponseValidationError> {
+    for (canonical, alias) in aliases {
+        if canonical == alias {
+            continue;
+        }
+        let canonical = *canonical;
+        let alias = *alias;
+
+        if map.contains_key(canonical) && map.contains_key(alias) {
+            // Ambiguous: both names exist.
+            return Err(crate::error::ResponseValidationError::serialization_failed(
+                format!(
+                    "response model contains both canonical field '{canonical}' and alias '{alias}'"
+                ),
+            ));
+        }
+
+        if let Some(v) = map.remove(alias) {
+            map.insert(canonical.to_string(), v);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_aliases(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    aliases: &[(&'static str, &'static str)],
+) -> Result<(), crate::error::ResponseValidationError> {
+    for (canonical, alias) in aliases {
+        if canonical == alias {
+            continue;
+        }
+        let canonical = *canonical;
+        let alias = *alias;
+
+        if map.contains_key(canonical) && map.contains_key(alias) {
+            return Err(crate::error::ResponseValidationError::serialization_failed(
+                format!(
+                    "response model contains both canonical field '{canonical}' and alias '{alias}'"
+                ),
+            ));
+        }
+
+        if let Some(v) = map.remove(canonical) {
+            map.insert(alias.to_string(), v);
+        }
+    }
+    Ok(())
 }
 
 /// Trait for types that can be validated as response models.
@@ -1573,7 +1765,10 @@ impl<T: Serialize + ResponseModel> IntoResponse for ValidatedResponse<T> {
         };
 
         // Apply filtering
-        let filtered = self.config.filter_json(json_value);
+        let filtered = match self.config.filter_json(json_value) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
 
         // Serialize the filtered value
         let bytes = match serde_json::to_vec(&filtered) {
@@ -2649,7 +2844,7 @@ mod tests {
             "password": "secret"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
         assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
         assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
         assert!(filtered.get("email").is_none());
@@ -2672,7 +2867,7 @@ mod tests {
             "secret": "hidden"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
         assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
         assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
         assert!(filtered.get("password").is_none());
@@ -2690,7 +2885,7 @@ mod tests {
             "nickname": null
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
         assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
         assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
         assert!(filtered.get("middle_name").is_none());
@@ -2716,7 +2911,7 @@ mod tests {
             "password": "secret"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
         assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
         assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
         assert_eq!(
@@ -2725,6 +2920,80 @@ mod tests {
         );
         assert!(filtered.get("middle_name").is_none()); // null, excluded
         assert!(filtered.get("password").is_none()); // not in include
+    }
+
+    #[test]
+    fn response_model_config_by_alias_requires_alias_metadata() {
+        let config = ResponseModelConfig::new().by_alias(true);
+        let value = serde_json::json!({"userId": 1, "name": "Alice"});
+        assert!(config.filter_json(value).is_err());
+    }
+
+    #[test]
+    fn response_model_config_by_alias_normalizes_and_realiases() {
+        static ALIASES: &[(&str, &str)] = &[("user_id", "userId")];
+
+        // Input uses alias, output canonical when by_alias is false.
+        let config = ResponseModelConfig::new().with_aliases(ALIASES);
+        let value = serde_json::json!({"userId": 1, "name": "Alice"});
+        let filtered = config.filter_json(value).unwrap();
+        assert_eq!(filtered.get("user_id"), Some(&serde_json::json!(1)));
+        assert!(filtered.get("userId").is_none());
+
+        // Input uses canonical, output alias when by_alias is true.
+        let config = ResponseModelConfig::new()
+            .with_aliases(ALIASES)
+            .by_alias(true);
+        let value = serde_json::json!({"user_id": 1, "name": "Alice"});
+        let filtered = config.filter_json(value).unwrap();
+        assert_eq!(filtered.get("userId"), Some(&serde_json::json!(1)));
+        assert!(filtered.get("user_id").is_none());
+    }
+
+    #[test]
+    fn response_model_config_exclude_defaults_requires_defaults_provider() {
+        let config = ResponseModelConfig::new().exclude_defaults(true);
+        let value = serde_json::json!({"active": false});
+        assert!(config.filter_json(value).is_err());
+    }
+
+    #[test]
+    fn response_model_config_exclude_defaults_filters_matching_fields() {
+        #[derive(Default, Serialize)]
+        struct UserDefaults {
+            active: bool,
+            name: String,
+        }
+
+        // Default active=false, name=""; should drop active but keep name when name != default.
+        let config = ResponseModelConfig::new()
+            .with_defaults_from::<UserDefaults>()
+            .exclude_defaults(true);
+        let value = serde_json::json!({"active": false, "name": "Alice"});
+        let filtered = config.filter_json(value).unwrap();
+        assert!(filtered.get("active").is_none());
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+    }
+
+    #[test]
+    fn response_model_config_exclude_unset_requires_set_fields() {
+        let config = ResponseModelConfig::new().exclude_unset(true);
+        let value = serde_json::json!({"id": 1, "name": "Alice"});
+        assert!(config.filter_json(value).is_err());
+    }
+
+    #[test]
+    fn response_model_config_exclude_unset_filters_not_set() {
+        let set_fields: std::collections::HashSet<String> =
+            ["id", "name"].iter().map(|s| (*s).to_string()).collect();
+        let config = ResponseModelConfig::new()
+            .with_set_fields(set_fields)
+            .exclude_unset(true);
+        let value = serde_json::json!({"id": 1, "name": "Alice", "email": "a@b.com"});
+        let filtered = config.filter_json(value).unwrap();
+        assert_eq!(filtered.get("id"), Some(&serde_json::json!(1)));
+        assert_eq!(filtered.get("name"), Some(&serde_json::json!("Alice")));
+        assert!(filtered.get("email").is_none());
     }
 
     // =========================================================================

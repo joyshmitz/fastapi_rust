@@ -1456,9 +1456,12 @@ impl std::error::Error for ResponseValidationError {}
 
 impl IntoResponse for ResponseValidationError {
     fn into_response(self) -> Response {
-        // Always log the full error details server-side
-        // In a real application, this would use the logging system
-        // For now, we include it in debug_info if debug mode is enabled
+        // Internal errors should be logged server-side.
+        //
+        // This framework intentionally does not pick a logging backend. If you want
+        // structured logs, log `self.to_log_string()` from your middleware/handler.
+        //
+        // Debug mode controls what details are included in the client response.
 
         // Build the response body
         let body = if is_debug_mode_enabled() {

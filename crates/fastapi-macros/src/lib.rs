@@ -29,6 +29,7 @@ use proc_macro::TokenStream;
 
 mod openapi;
 mod param;
+mod response_model;
 mod route;
 mod validate;
 
@@ -149,4 +150,13 @@ pub fn derive_validate(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(JsonSchema, attributes(schema))]
 pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     openapi::derive_json_schema_impl(input)
+}
+
+/// Derive response model alias metadata for FastAPI-compatible `by_alias` handling.
+///
+/// This emits an implementation of `fastapi_core::ResponseModelAliases` using
+/// `#[serde(rename = ...)]` and `#[serde(rename_all = ...)]` attributes.
+#[proc_macro_derive(ResponseModelAliases, attributes(serde))]
+pub fn derive_response_model_aliases(input: TokenStream) -> TokenStream {
+    response_model::derive_response_model_aliases_impl(input)
 }

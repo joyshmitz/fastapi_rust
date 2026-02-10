@@ -314,7 +314,7 @@ mod response_model_validation {
             "password": "secret"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("id").is_some());
         assert!(filtered.get("name").is_some());
@@ -341,7 +341,7 @@ mod response_model_validation {
             "secret_key": "abc123"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("id").is_some());
         assert!(filtered.get("name").is_some());
@@ -366,7 +366,7 @@ mod response_model_validation {
             "suffix": null
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("id").is_some());
         assert!(filtered.get("name").is_some());
@@ -398,7 +398,7 @@ mod response_model_validation {
             "password": "secret"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("id").is_some());
         assert!(filtered.get("name").is_some());
@@ -545,7 +545,7 @@ mod response_model_validation {
             "password": "secret"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("user").is_some());
         assert!(filtered["user"]["id"] == 1);
@@ -562,7 +562,7 @@ mod response_model_validation {
             "metadata": "should be excluded"
         });
 
-        let filtered = config.filter_json(value);
+        let filtered = config.filter_json(value).unwrap();
 
         assert!(filtered.get("items").is_some());
         assert_eq!(filtered["items"].as_array().unwrap().len(), 3);
@@ -1589,15 +1589,15 @@ mod edge_cases {
 
         // Filtering a non-object should return it unchanged
         let array = serde_json::json!([1, 2, 3]);
-        let filtered = config.filter_json(array.clone());
+        let filtered = config.filter_json(array.clone()).unwrap();
         assert_eq!(filtered, serde_json::json!([1, 2, 3]));
 
         let scalar = serde_json::json!(42);
-        let filtered = config.filter_json(scalar);
+        let filtered = config.filter_json(scalar).unwrap();
         assert_eq!(filtered, serde_json::json!(42));
 
         let null = serde_json::json!(null);
-        let filtered = config.filter_json(null);
+        let filtered = config.filter_json(null).unwrap();
         assert_eq!(filtered, serde_json::json!(null));
     }
 

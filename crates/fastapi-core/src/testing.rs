@@ -334,8 +334,7 @@ impl<H: Handler + 'static> TestClient<H> {
         let ctx =
             RequestContext::with_overrides(cx, request_id, Arc::clone(&self.dependency_overrides));
 
-        // Execute handler synchronously for testing
-        // In a real async context, this would be awaited
+        // The TestClient API is synchronous; run the async handler to completion.
         let response = futures_executor::block_on(self.handler.call(&ctx, &mut request));
 
         // Extract cookies from response
@@ -1536,7 +1535,7 @@ impl TestChaosStats {
 /// // Advance virtual time by 5 seconds
 /// mock_time.advance(Duration::from_secs(5));
 ///
-/// // Check that timer would have expired
+/// // Check that timer has expired
 /// assert!(mock_time.elapsed() >= Duration::from_secs(5));
 /// ```
 #[derive(Debug, Clone)]
