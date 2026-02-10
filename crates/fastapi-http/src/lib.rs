@@ -74,6 +74,7 @@ pub mod range;
 mod response;
 mod server;
 pub mod streaming;
+pub mod websocket;
 
 pub use body::{
     AsyncChunkedStream, AsyncContentLengthStream, BodyConfig, BodyError, ChunkedReader,
@@ -115,4 +116,8 @@ pub use multipart::{
 pub use streaming::{
     CancelAwareStream, ChunkedBytes, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_BUFFER_SIZE, FileStream,
     StreamConfig, StreamError, StreamingResponseExt,
+};
+pub use websocket::{
+    CloseCode, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE, Message, Opcode, WebSocket,
+    WebSocketConfig, WebSocketError, accept_key, build_accept_response, validate_upgrade_request,
 };
