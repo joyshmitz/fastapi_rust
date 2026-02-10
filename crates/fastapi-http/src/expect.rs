@@ -58,6 +58,7 @@
 //! After sending this, the server proceeds to read the request body.
 
 use fastapi_core::{Request, Response, ResponseBody, StatusCode};
+use std::sync::Arc;
 
 /// The raw bytes for an HTTP/1.1 100 Continue response.
 ///
@@ -284,9 +285,21 @@ pub trait PreBodyValidator: Send + Sync {
 }
 
 /// A collection of pre-body validators.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PreBodyValidators {
-    validators: Vec<Box<dyn PreBodyValidator>>,
+    validators: Vec<Arc<dyn PreBodyValidator>>,
+}
+
+impl std::fmt::Debug for PreBodyValidators {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreBodyValidators")
+            .field("len", &self.validators.len())
+            .field(
+                "validators",
+                &self.validators.iter().map(|v| v.name()).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl PreBodyValidators {
@@ -298,7 +311,7 @@ impl PreBodyValidators {
 
     /// Add a validator to the collection.
     pub fn add<V: PreBodyValidator + 'static>(&mut self, validator: V) {
-        self.validators.push(Box::new(validator));
+        self.validators.push(Arc::new(validator));
     }
 
     /// Add a validator and return self for chaining.

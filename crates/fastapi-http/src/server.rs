@@ -3,8 +3,9 @@
 //! This module provides a TCP server that uses asupersync for structured
 //! concurrency and cancel-correct request handling.
 //!
-// NOTE: This module is scaffolding for Phase 1 TCP server implementation.
-// Most types are defined but not yet wired into the main application.
+// NOTE: This server implementation is used by `serve`/`serve_with_config` and is
+// intentionally asupersync-only (no tokio). Some ancillary types are still
+// evolving as the runtime's I/O surface matures.
 #![allow(dead_code)]
 //!
 //! # Architecture
@@ -45,7 +46,9 @@
 //! ```
 
 use crate::connection::should_keep_alive;
-use crate::expect::{CONTINUE_RESPONSE, ExpectHandler, ExpectResult};
+use crate::expect::{
+    CONTINUE_RESPONSE, ExpectHandler, ExpectResult, PreBodyValidator, PreBodyValidators,
+};
 use crate::parser::{ParseError, ParseLimits, ParseStatus, Parser, StatefulParser};
 use crate::response::{ResponseWrite, ResponseWriter};
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -156,6 +159,11 @@ pub struct ServerConfig {
     /// Drain timeout (time to wait for in-flight requests on shutdown).
     /// After this timeout, connections are forcefully closed.
     pub drain_timeout: Duration,
+    /// Pre-body validation hooks (run after parsing headers but before any body is read).
+    ///
+    /// This is used to gate `Expect: 100-continue` and to reject requests early based on
+    /// headers alone (auth/content-type/content-length/etc).
+    pub pre_body_validators: PreBodyValidators,
 }
 
 impl ServerConfig {
@@ -174,6 +182,7 @@ impl ServerConfig {
             keep_alive_timeout: Duration::from_secs(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
             max_requests_per_connection: DEFAULT_MAX_REQUESTS_PER_CONNECTION,
             drain_timeout: Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS),
+            pre_body_validators: PreBodyValidators::new(),
         }
     }
 
@@ -251,6 +260,20 @@ impl ServerConfig {
     #[must_use]
     pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
         self.tcp_nodelay = enabled;
+        self
+    }
+
+    /// Replace all configured pre-body validators.
+    #[must_use]
+    pub fn with_pre_body_validators(mut self, validators: PreBodyValidators) -> Self {
+        self.pre_body_validators = validators;
+        self
+    }
+
+    /// Add a pre-body validator.
+    #[must_use]
+    pub fn with_pre_body_validator<V: PreBodyValidator + 'static>(mut self, validator: V) -> Self {
+        self.pre_body_validators.add(validator);
         self
     }
 
@@ -673,6 +696,14 @@ where
             return Ok(());
         }
 
+        // Run header-only validators before honoring Expect: 100-continue or reading any body bytes.
+        if let Err(response) = config.pre_body_validators.validate_all(&request) {
+            let response = response.header("connection", b"close".to_vec());
+            let response_write = response_writer.write(response);
+            write_response(&mut stream, response_write).await?;
+            return Ok(());
+        }
+
         // Handle Expect: 100-continue
         // RFC 7231 Section 5.1.1: If the server receives a request with Expect: 100-continue,
         // it should either send 100 Continue (to proceed) or a final status code (to reject).
@@ -683,8 +714,6 @@ where
             ExpectResult::ExpectsContinue => {
                 // Expect: 100-continue present
                 // Send 100 Continue to tell client to proceed with body
-                // Pre-body validation hooks (auth/content-type/content-length gating) are not yet
-                // implemented here; callers should validate inside handlers/middleware.
                 ctx.trace("Sending 100 Continue for Expect: 100-continue");
                 write_raw_response(&mut stream, CONTINUE_RESPONSE).await?;
             }

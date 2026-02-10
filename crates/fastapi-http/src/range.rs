@@ -91,7 +91,7 @@ pub enum RangeError {
         /// The size of the resource.
         resource_size: u64,
     },
-    /// Multiple ranges requested (not yet supported).
+    /// Too many ranges requested (limit exceeded).
     MultipleRangesNotSupported,
 }
 
@@ -106,7 +106,7 @@ impl fmt::Display for RangeError {
                     "range not satisfiable for resource of size {resource_size}"
                 )
             }
-            Self::MultipleRangesNotSupported => write!(f, "multiple ranges not supported"),
+            Self::MultipleRangesNotSupported => write!(f, "too many ranges requested"),
         }
     }
 }
@@ -173,13 +173,14 @@ impl RangeSpec {
 /// - `bytes=500-999` - Bytes 500-999
 /// - `bytes=500-` - From byte 500 to end
 /// - `bytes=-500` - Last 500 bytes
+/// - `bytes=0-0, 500-999` - Multiple ranges
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The syntax is invalid
 /// - The unit is not "bytes"
-/// - Multiple ranges are specified (not yet supported)
+/// - Too many ranges are specified (limit exceeded)
 /// - The range is not satisfiable for the given resource size
 ///
 /// # Examples
@@ -188,34 +189,52 @@ impl RangeSpec {
 /// use fastapi_http::range::parse_range_header;
 ///
 /// // First 500 bytes of a 1000-byte resource
-/// let range = parse_range_header("bytes=0-499", 1000).unwrap();
-/// assert_eq!(range.start, 0);
-/// assert_eq!(range.end, 499);
-/// assert_eq!(range.len(), 500);
+/// let ranges = parse_range_header("bytes=0-499", 1000).unwrap();
+/// assert_eq!(ranges[0].start, 0);
+/// assert_eq!(ranges[0].end, 499);
+/// assert_eq!(ranges[0].len(), 500);
 ///
 /// // Last 100 bytes
-/// let range = parse_range_header("bytes=-100", 1000).unwrap();
-/// assert_eq!(range.start, 900);
-/// assert_eq!(range.end, 999);
+/// let ranges = parse_range_header("bytes=-100", 1000).unwrap();
+/// assert_eq!(ranges[0].start, 900);
+/// assert_eq!(ranges[0].end, 999);
 ///
 /// // From byte 500 to end
-/// let range = parse_range_header("bytes=500-", 1000).unwrap();
-/// assert_eq!(range.start, 500);
-/// assert_eq!(range.end, 999);
+/// let ranges = parse_range_header("bytes=500-", 1000).unwrap();
+/// assert_eq!(ranges[0].start, 500);
+/// assert_eq!(ranges[0].end, 999);
 /// ```
-pub fn parse_range_header(header: &str, resource_size: u64) -> Result<ByteRange, RangeError> {
-    let spec = parse_range_spec(header)?;
-    spec.resolve(resource_size)
+pub fn parse_range_header(header: &str, resource_size: u64) -> Result<Vec<ByteRange>, RangeError> {
+    let specs = parse_range_spec(header)?;
+
+    let mut ranges = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec.resolve(resource_size) {
+            Ok(r) => ranges.push(r),
+            Err(RangeError::NotSatisfiable { .. }) => {
+                // Ignore individual unsatisfiable ranges; if none overlap at all,
+                // return a 416 for the full request.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if ranges.is_empty() {
+        return Err(RangeError::NotSatisfiable { resource_size });
+    }
+
+    normalize_ranges(&mut ranges);
+    Ok(ranges)
 }
 
-/// Parse a Range header into a `RangeSpec` without validating against resource size.
+/// Parse a Range header into `RangeSpec` entries without validating against resource size.
 ///
 /// This is useful when you want to parse the header before knowing the resource size.
 ///
 /// # Errors
 ///
-/// Returns an error if the syntax is invalid or multiple ranges are specified.
-pub fn parse_range_spec(header: &str) -> Result<RangeSpec, RangeError> {
+/// Returns an error if the syntax is invalid or too many ranges are specified.
+pub fn parse_range_spec(header: &str) -> Result<Vec<RangeSpec>, RangeError> {
     let header = header.trim();
 
     // Split on '='
@@ -231,13 +250,21 @@ pub fn parse_range_spec(header: &str) -> Result<RangeSpec, RangeError> {
         return Err(RangeError::UnsupportedUnit(unit.to_string()));
     }
 
-    // Check for multiple ranges (comma-separated)
-    if range_set.contains(',') {
-        return Err(RangeError::MultipleRangesNotSupported);
+    const MAX_RANGES: usize = 16;
+
+    let mut specs = Vec::new();
+    for part in range_set.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(RangeError::InvalidSyntax("empty range".to_string()));
+        }
+        specs.push(parse_single_range(part)?);
+        if specs.len() > MAX_RANGES {
+            return Err(RangeError::MultipleRangesNotSupported);
+        }
     }
 
-    // Parse single range: start-end, start-, or -suffix
-    parse_single_range(range_set)
+    Ok(specs)
 }
 
 /// Parse a single range specification (without the unit prefix).
@@ -279,6 +306,26 @@ fn parse_single_range(range: &str) -> Result<RangeSpec, RangeError> {
             .map_err(|_| RangeError::InvalidSyntax(format!("invalid end: {end_str}")))?;
         Ok(RangeSpec::FromTo { start, end })
     }
+}
+
+fn normalize_ranges(ranges: &mut Vec<ByteRange>) {
+    ranges.sort_by_key(|r| r.start);
+
+    let mut out: Vec<ByteRange> = Vec::with_capacity(ranges.len());
+    for r in ranges.drain(..) {
+        match out.last_mut() {
+            None => out.push(r),
+            Some(last) => {
+                // Merge overlapping or adjacent ranges (e.g., 0-10 and 11-20).
+                if r.start <= last.end.saturating_add(1) {
+                    last.end = last.end.max(r.end);
+                } else {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    *ranges = out;
 }
 
 /// Check if a request supports range requests based on Accept-Ranges.
@@ -554,31 +601,35 @@ mod tests {
 
     #[test]
     fn parse_range_from_to() {
-        let range = parse_range_header("bytes=0-499", 1000).unwrap();
-        assert_eq!(range.start, 0);
-        assert_eq!(range.end, 499);
-        assert_eq!(range.len(), 500);
+        let ranges = parse_range_header("bytes=0-499", 1000).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end, 499);
+        assert_eq!(ranges[0].len(), 500);
     }
 
     #[test]
     fn parse_range_from() {
-        let range = parse_range_header("bytes=500-", 1000).unwrap();
-        assert_eq!(range.start, 500);
-        assert_eq!(range.end, 999);
+        let ranges = parse_range_header("bytes=500-", 1000).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 500);
+        assert_eq!(ranges[0].end, 999);
     }
 
     #[test]
     fn parse_range_suffix() {
-        let range = parse_range_header("bytes=-100", 1000).unwrap();
-        assert_eq!(range.start, 900);
-        assert_eq!(range.end, 999);
+        let ranges = parse_range_header("bytes=-100", 1000).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 900);
+        assert_eq!(ranges[0].end, 999);
     }
 
     #[test]
     fn parse_range_with_spaces() {
-        let range = parse_range_header("  bytes = 0 - 499  ", 1000).unwrap();
-        assert_eq!(range.start, 0);
-        assert_eq!(range.end, 499);
+        let ranges = parse_range_header("  bytes = 0 - 499  ", 1000).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end, 499);
     }
 
     #[test]
@@ -588,8 +639,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_range_multiple_not_supported() {
-        let err = parse_range_header("bytes=0-10, 20-30", 100).unwrap_err();
+    fn parse_range_multiple_ranges() {
+        let ranges = parse_range_header("bytes=0-10, 20-30", 100).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], ByteRange::new(0, 10));
+        assert_eq!(ranges[1], ByteRange::new(20, 30));
+    }
+
+    #[test]
+    fn parse_range_too_many_ranges_rejected() {
+        let header = (0..17)
+            .map(|i| format!("{i}-{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let header = format!("bytes={header}");
+        let err = parse_range_header(&header, 1000).unwrap_err();
         assert_eq!(err, RangeError::MultipleRangesNotSupported);
     }
 
@@ -662,7 +726,7 @@ mod tests {
         assert!(format!("{err}").contains("range not satisfiable"));
 
         let err = RangeError::MultipleRangesNotSupported;
-        assert!(format!("{err}").contains("multiple ranges not supported"));
+        assert!(format!("{err}").contains("too many ranges requested"));
     }
 
     // =========================================================================
