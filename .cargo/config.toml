@@ -3,5 +3,7 @@
 # CI and publishing use the crates.io versions from Cargo.toml.
 
 [patch.crates-io]
-asupersync = { path = "../asupersync" }
 rich_rust = { path = "../rich_rust" }
+
+[patch."https://github.com/Dicklesworthstone/asupersync.git"]
+asupersync = { path = "../asupersync" }

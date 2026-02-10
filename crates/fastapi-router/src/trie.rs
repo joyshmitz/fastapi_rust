@@ -44,10 +44,9 @@
 //! Wildcards must be the final segment in a route pattern.
 
 use crate::r#match::{AllowedMethods, RouteLookup, RouteMatch};
-use fastapi_core::{Handler, Method};
+use fastapi_types::Method;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 /// Path parameter type converter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -390,6 +389,29 @@ pub fn extract_path_params(path: &str) -> Vec<ParamInfo> {
         .collect()
 }
 
+/// Sanitize an identifier fragment for use in OpenAPI `operationId`.
+///
+/// The output is lowercase, alphanumeric/underscore only, and never empty.
+fn sanitize_operation_id(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "root".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Response declaration for OpenAPI documentation.
 ///
 /// Describes a possible response from a route, including status code,
@@ -464,18 +486,19 @@ impl RouteSecurityRequirement {
     }
 }
 
-/// A route definition with handler for request processing.
+/// A route definition used for routing and (optionally) metadata.
 ///
-/// Routes are created with a path pattern, HTTP method, and a handler function.
-/// The handler is stored as a type-erased `Arc<dyn Handler>` for dynamic dispatch.
+/// Routes are created with a path pattern and HTTP method. The router crate is
+/// intentionally pure routing/metadata and does not store framework handler
+/// objects (to avoid dependency cycles with `fastapi-core`).
 ///
 /// # Example
 ///
 /// ```ignore
 /// use fastapi_router::Route;
-/// use fastapi_core::{Method, Handler, RequestContext, Request, Response};
+/// use fastapi_types::Method;
 ///
-/// let route = Route::new(Method::Get, "/users/{id}", my_handler);
+/// let route = Route::new(Method::Get, "/users/{id}");
 /// ```
 pub struct Route {
     /// Route path pattern (e.g., "/users/{id}").
@@ -509,8 +532,6 @@ pub struct Route {
     ///
     /// Each response specifies a status code, schema type, and description.
     pub responses: Vec<RouteResponse>,
-    /// Handler function that processes matching requests.
-    handler: Arc<dyn Handler>,
 }
 
 impl fmt::Debug for Route {
@@ -549,7 +570,7 @@ impl fmt::Debug for Route {
         if !self.responses.is_empty() {
             s.field("responses", &self.responses);
         }
-        s.field("handler", &"<handler>").finish()
+        s.finish()
     }
 }
 
@@ -644,28 +665,28 @@ impl From<InvalidRouteError> for RouteAddError {
 }
 
 impl Route {
-    /// Create a new route with a handler.
+    /// Create a new route.
     ///
     /// # Arguments
     ///
     /// * `method` - HTTP method for this route
     /// * `path` - Path pattern (e.g., "/users/{id}")
-    /// * `handler` - Handler that processes matching requests
     ///
     /// # Example
     ///
     /// ```ignore
     /// use fastapi_router::Route;
-    /// use fastapi_core::Method;
+    /// use fastapi_types::Method;
     ///
-    /// let route = Route::new(Method::Get, "/users/{id}", my_handler);
+    /// let route = Route::new(Method::Get, "/users/{id}");
     /// ```
-    pub fn new<H>(method: Method, path: impl Into<String>, handler: H) -> Self
-    where
-        H: Handler + 'static,
-    {
+    pub fn new(method: Method, path: impl Into<String>) -> Self {
         let path = path.into();
-        let operation_id = path.replace('/', "_").replace(['{', '}'], "");
+        // Operation IDs must be stable and unique across methods for the same path.
+        // Keep this pure (no core deps) while producing a safe identifier for OpenAPI.
+        let method_prefix = method.as_str().to_ascii_lowercase();
+        let path_part = sanitize_operation_id(&path);
+        let operation_id = format!("{method_prefix}_{path_part}");
         let path_params = extract_path_params(&path);
         Self {
             path,
@@ -681,55 +702,16 @@ impl Route {
             request_body_required: false,
             security: Vec::new(),
             responses: Vec::new(),
-            handler: Arc::new(handler),
         }
     }
 
-    /// Create a new route with a pre-wrapped Arc handler.
-    ///
-    /// Useful when the handler is already wrapped in an Arc for sharing.
-    pub fn with_arc_handler(
-        method: Method,
-        path: impl Into<String>,
-        handler: Arc<dyn Handler>,
-    ) -> Self {
-        let path = path.into();
-        let operation_id = path.replace('/', "_").replace(['{', '}'], "");
-        let path_params = extract_path_params(&path);
-        Self {
-            path,
-            method,
-            operation_id,
-            summary: None,
-            description: None,
-            tags: Vec::new(),
-            deprecated: false,
-            path_params,
-            request_body_schema: None,
-            request_body_content_type: None,
-            request_body_required: false,
-            security: Vec::new(),
-            responses: Vec::new(),
-            handler,
-        }
-    }
-
-    /// Get a reference to the handler.
-    #[must_use]
-    pub fn handler(&self) -> &Arc<dyn Handler> {
-        &self.handler
-    }
-
-    /// Create a route with a placeholder handler.
+    /// Create a route intended for compile-time route discovery.
     ///
     /// This is used by the route registration macros during compile-time route
-    /// discovery. The placeholder handler panics if invoked.
-    ///
-    /// **Note**: Routes created with this method should have their handlers
-    /// replaced before being used to handle actual requests.
+    /// discovery.
     #[must_use]
     pub fn with_placeholder_handler(method: Method, path: impl Into<String>) -> Self {
-        Self::new(method, path, PlaceholderHandler)
+        Self::new(method, path)
     }
 
     /// Set the summary for OpenAPI documentation.
@@ -801,7 +783,7 @@ impl Route {
     ///
     /// ```ignore
     /// use fastapi_router::Route;
-    /// use fastapi_core::Method;
+    /// use fastapi_types::Method;
     ///
     /// // Route requires bearer token authentication
     /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
@@ -830,7 +812,7 @@ impl Route {
     ///
     /// ```ignore
     /// use fastapi_router::Route;
-    /// use fastapi_core::Method;
+    /// use fastapi_types::Method;
     ///
     /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
     ///     .security_scheme("api_key");
@@ -856,7 +838,7 @@ impl Route {
     ///
     /// ```ignore
     /// use fastapi_router::Route;
-    /// use fastapi_core::Method;
+    /// use fastapi_types::Method;
     ///
     /// let route = Route::with_placeholder_handler(Method::Get, "/users/{id}")
     ///     .response(200, "User", "User found")
@@ -896,27 +878,6 @@ impl Route {
     #[must_use]
     pub fn has_security(&self) -> bool {
         !self.security.is_empty()
-    }
-}
-
-/// A placeholder handler used for macro-time route registration.
-///
-/// This exists to allow building metadata-rich `Route` values without
-/// wiring up a real handler. It must never be used for request handling.
-struct PlaceholderHandler;
-
-impl Handler for PlaceholderHandler {
-    fn call<'a>(
-        &'a self,
-        _ctx: &'a fastapi_core::RequestContext,
-        _req: &'a mut fastapi_core::Request,
-    ) -> fastapi_core::BoxFuture<'a, fastapi_core::Response> {
-        Box::pin(async {
-            panic!(
-                "fastapi_router::Route placeholder handler invoked: this Route was created for \
-                 discovery/OpenAPI metadata and must not be used for request handling"
-            );
-        })
     }
 }
 
@@ -1075,7 +1036,7 @@ impl Router {
     ///
     /// ```ignore
     /// use fastapi_router::Router;
-    /// use fastapi_core::Method;
+    /// use fastapi_types::Method;
     ///
     /// let api = Router::new()
     ///     .route(get_users)   // /users
@@ -1128,7 +1089,6 @@ impl Router {
                 request_body_required: route.request_body_required,
                 security: route.security,
                 responses: route.responses,
-                handler: route.handler,
             };
 
             self.add(mounted)?;
@@ -1422,25 +1382,10 @@ fn paths_conflict(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastapi_core::{BoxFuture, Request, RequestContext, Response};
 
-    /// Test handler that returns a 200 OK response.
-    /// Used for testing route matching without needing real handlers.
-    struct TestHandler;
-
-    impl Handler for TestHandler {
-        fn call<'a>(
-            &'a self,
-            _ctx: &'a RequestContext,
-            _req: &'a mut Request,
-        ) -> BoxFuture<'a, Response> {
-            Box::pin(async { Response::ok() })
-        }
-    }
-
-    /// Helper to create a route with a test handler.
+    /// Helper to create a route.
     fn route(method: Method, path: &str) -> Route {
-        Route::new(method, path, TestHandler)
+        Route::new(method, path)
     }
 
     #[test]
@@ -3738,7 +3683,7 @@ mod tests {
         for i in 0..50 {
             for method in &methods {
                 router
-                    .add(Route::new(*method, &format!("/resource{}", i), TestHandler))
+                    .add(Route::new(*method, &format!("/resource{}", i)))
                     .unwrap();
             }
         }

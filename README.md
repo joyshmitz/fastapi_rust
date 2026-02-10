@@ -54,7 +54,7 @@ serde = { version = "1", features = ["derive"] }
 | **Compile-time route validation** | Invalid routes fail at build time via proc macros, not at runtime |
 | **Structured concurrency** | Request handlers run in regions; cancellation is automatic and correct |
 | **Type-driven extractors** | Declare parameter types; framework extracts and validates automatically |
-| **Minimal dependencies** | Only `asupersync` + `serde` - no Tokio, no Tower, no hidden layers |
+| **Dependency discipline** | No Tokio/Hyper/Tower/Axum; direct deps kept small with a bias toward removal |
 | **Deterministic testing** | Lab runtime for reproducible concurrent request tests |
 | **FastAPI-compatible errors** | Validation errors match FastAPI's JSON format exactly |
 
@@ -175,7 +175,7 @@ Response Sent (only after region quiescent)
 
 **No orphaned tasks.** Client disconnect -> cancel region -> all tasks cleaned up.
 
-### 4. Minimal Dependencies
+### 4. Dependency Discipline
 
 | Crate | Purpose | Why |
 |-------|---------|-----|
@@ -183,7 +183,11 @@ Response Sent (only after region quiescent)
 | `serde` | Serialization traits | Zero-cost, industry standard |
 | `serde_json` | JSON parsing | Fast, well-optimized |
 
-**Explicitly avoided:** Tokio, Hyper, Axum, Tower, runtime-reflection crates. Total dependency count: 3 crates vs. 80+ for Axum.
+**Explicitly avoided:** Tokio, Hyper, Axum, Tower, and runtime-reflection/schema-building crates.
+
+Note: Some workspace crates currently use additional small utility/test/proc-macro dependencies
+where it meaningfully improves safety or developer experience. Shrinking this further is an active
+goal tracked in Beads (see `bd-uz2s`).
 
 ---
 
@@ -198,7 +202,7 @@ Response Sent (only after region quiescent)
 | Dependency injection | **Native + cache** | State only | Data only | Managed |
 | OpenAPI generation | **Compile-time** | External | External | External |
 | Deterministic testing | **Lab runtime** | No | No | No |
-| Dependencies | **3 crates** | ~80+ | ~60+ | ~50+ |
+| Direct deps (core runtime crates) | **Low (single digits)** | ~80+ | ~60+ | ~50+ |
 | FastAPI-style errors | **Yes (422 format)** | No | No | No |
 
 ### When to Use fastapi_rust
@@ -225,7 +229,7 @@ Response Sent (only after region quiescent)
 ```toml
 [dependencies]
 fastapi_rust = { package = "fastapi-rust", version = "0.1.2" }
-asupersync = "0.1.0"
+asupersync = "0.1.1"
 serde = { version = "1", features = ["derive"] }
 ```
 
@@ -643,63 +647,29 @@ TestClient::with_seed(app, failing_seed)
 
 ---
 
-## Limitations
+## Parity Status (Goal: 100% FastAPI Coverage)
 
-### What fastapi_rust Doesn't Do (Yet)
+This project is intended to reach **100% feature-for-feature, behavior-for-behavior parity** with
+the legacy Python FastAPI library.
 
-| Feature | Status | Target Phase |
-|---------|--------|--------------|
-| TCP server | Scaffolding complete | Phase 1 (asupersync I/O) |
-| WebSocket support | Not started | Phase 2 |
-| File uploads / multipart | Not started | Phase 6 |
-| HTTP/2 | Not planned | Post-v1.0 |
-| Production deployment | Early development | Post-v1.0 |
+Current parity status and the concrete gap list are tracked in:
+- `PROPOSED_RUST_ARCHITECTURE.md` (Section 0: Parity Matrix)
+- Beads (`br ready`, `br show <id>`) with the top-level epic `bd-uz2s`
 
-### Known Constraints
+### Known Gaps (As Of 2026-02-10)
 
-- **Requires asupersync**: Won't work with Tokio (by design)
-- **Rust 1.85+**: Uses 2024 edition features
-- **Early development**: API will change before v1.0
-- **No ecosystem**: Can't use Tower middleware or Axum extractors
+- **OpenAPI generation**: currently minimal; needs real operation/schema mapping from route metadata.
+- **TCP server integration/hardening**: `fastapi-http` has a server implementation, but the end-to-end
+  surface is still evolving.
+- **WebSockets**: not implemented.
+- **Multipart/form/file uploads**: not implemented.
+- **HTTP/2**: not implemented.
 
----
+### Non-Negotiables / Constraints
 
-## Development Status
-
-```
-Phase 0: [DONE] Foundation
-         - Core types (Request, Response, Error)
-         - Zero-copy HTTP parser
-         - Extractor system
-         - Middleware abstraction
-
-Phase 1: [IN PROGRESS] TCP Server
-         - asupersync I/O integration
-         - Connection handling
-         - Request lifecycle
-
-Phase 2: [PLANNED] Router + Params
-         - Radix trie routing
-         - Path parameter extraction
-         - Route conflict detection
-
-Phase 3: [PLANNED] Validation
-         - Derive macros
-         - Error formatting
-
-Phase 4: [PARTIAL] Dependency Injection
-         - Basic DI working
-         - Need: scopes, overrides
-
-Phase 5: [PARTIAL] OpenAPI
-         - Spec types defined
-         - Need: generation from routes
-
-Phase 6: [PLANNED] Advanced Features
-         - File uploads
-         - Streaming responses
-         - Background tasks
-```
+- **Requires asupersync**: no Tokio support (by design).
+- **Rust 1.85+**: uses Rust 2024 edition features.
+- **Early development**: API will change before v1.0.
 
 ---
 
@@ -731,7 +701,7 @@ Yes, fully. All handlers, middleware, and extractors are async-native, built on 
 
 ### Why the minimal dependency approach?
 
-Each dependency is a maintenance burden, security surface, and compile-time cost. By keeping dependencies to 3 crates, we:
+Each dependency is a maintenance burden, security surface, and compile-time cost. By keeping dependencies small and intentional, we:
 - Reduce build times significantly
 - Have full control over behavior
 - Avoid dependency conflicts

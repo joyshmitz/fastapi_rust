@@ -197,15 +197,24 @@ pub fn is_valid_url(value: &str) -> bool {
 /// ```
 #[must_use]
 pub fn matches_pattern(value: &str, pattern: &str) -> bool {
-    // Simple pattern matching without regex crate
-    // For full regex support, users should use the regex crate directly
+    // Pattern matching without pulling in a full regex engine.
+    //
+    // This intentionally supports a small, practical subset used by our derive
+    // tests and common validation cases:
+    // - anchors: ^ and $
+    // - literals and '.' wildcard
+    // - escapes: \\d (digit)
+    // - character classes: [a-z0-9-] with ranges and literals
+    // - quantifiers: +, *, ?, and {n}
+    //
+    // Anything outside this subset returns false (no match).
 
-    // Handle common simple patterns
+    // Handle common simple patterns.
     if pattern.is_empty() {
         return true;
     }
 
-    // Exact match patterns
+    // Fast path: exact match patterns.
     if pattern.starts_with('^') && pattern.ends_with('$') {
         let inner = &pattern[1..pattern.len() - 1];
         // If no special chars, it's an exact match
@@ -214,80 +223,395 @@ pub fn matches_pattern(value: &str, pattern: &str) -> bool {
         }
     }
 
-    // For complex patterns, we'd need the regex crate
-    // For now, do simple prefix/suffix matching
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let value_chars: Vec<char> = value.chars().collect();
+    let Ok(compiled) = SimpleRegex::compile(pattern) else {
+        return false;
+    };
 
-    simple_pattern_match(&pattern_chars, &value_chars)
+    compiled.is_match(value)
 }
 
-/// Simple pattern matcher for common cases.
-fn simple_pattern_match(pattern: &[char], value: &[char]) -> bool {
-    let mut p_idx = 0;
-    let mut v_idx = 0;
+/// Check if a string is a "reasonably formatted" phone number.
+///
+/// This is not a full E.164 validator. It is tuned to catch obvious bad input
+/// while allowing common human formats (spaces, parens, hyphens, dots).
+#[must_use]
+pub fn is_valid_phone(value: &str) -> bool {
+    let s = value.trim();
+    if s.is_empty() {
+        return false;
+    }
 
-    // Handle anchors
-    let anchored_start = pattern.first() == Some(&'^');
-    let anchored_end = pattern.last() == Some(&'$');
-
-    let pattern = if anchored_start {
-        &pattern[1..]
-    } else {
-        pattern
-    };
-    let pattern = if anchored_end {
-        &pattern[..pattern.len().saturating_sub(1)]
-    } else {
-        pattern
-    };
-
-    // Simple character-by-character match for non-regex patterns
-    // This is intentionally limited - for full regex, use the regex crate
-    while p_idx < pattern.len() && v_idx < value.len() {
-        let p = pattern[p_idx];
-        let v = value[v_idx];
-
-        match p {
-            '.' => {
-                // Matches any single character
-                p_idx += 1;
-                v_idx += 1;
-            }
-            '\\' if p_idx + 1 < pattern.len() => {
-                // Escaped character - match literally
-                p_idx += 1;
-                if pattern[p_idx] == v {
-                    p_idx += 1;
-                    v_idx += 1;
-                } else {
-                    return false;
-                }
-            }
-            _ if p == v => {
-                p_idx += 1;
-                v_idx += 1;
-            }
-            _ => {
-                if !anchored_start && v_idx == 0 {
-                    // Can skip characters at start if not anchored
-                    v_idx += 1;
-                } else {
-                    return false;
-                }
-            }
+    // '+' is allowed only at the beginning (and at most once).
+    if let Some(pos) = s.find('+') {
+        if pos != 0 {
+            return false;
+        }
+        if s[1..].contains('+') {
+            return false;
         }
     }
 
-    // Check remaining pattern (should be empty or all anchors consumed)
-    let pattern_done = p_idx >= pattern.len();
-    let value_done = v_idx >= value.len();
-
-    if anchored_end {
-        pattern_done && value_done
-    } else {
-        pattern_done
+    // Can't start or end with a separator (unless starting with '+').
+    let first = s.chars().next().unwrap();
+    if first != '+' && matches!(first, '-' | '.' | ' ') {
+        return false;
     }
+    let last = s.chars().last().unwrap();
+    if matches!(last, '-' | '.' | ' ') {
+        return false;
+    }
+
+    let mut digits = 0usize;
+    let mut open_parens = 0usize;
+    let mut last_sep: Option<char> = None; // only tracks '-' and '.'
+    let mut paren_digit_count: usize = 0; // digits since last '('
+
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '0'..='9' => {
+                digits += 1;
+                if open_parens > 0 {
+                    paren_digit_count += 1;
+                }
+                last_sep = None;
+            }
+            '+' => {
+                if i != 0 {
+                    return false;
+                }
+                last_sep = None;
+            }
+            ' ' => {
+                // Multiple spaces are allowed.
+                last_sep = None;
+            }
+            '-' | '.' => {
+                // No consecutive '-' or '.' (including mixed like "-.").
+                if let Some(prev) = last_sep {
+                    if matches!(prev, '-' | '.') {
+                        return false;
+                    }
+                }
+                last_sep = Some(c);
+            }
+            '(' => {
+                open_parens += 1;
+                paren_digit_count = 0;
+                last_sep = None;
+            }
+            ')' => {
+                if open_parens == 0 {
+                    return false;
+                }
+                // Disallow empty parentheses, e.g. "()".
+                if paren_digit_count == 0 {
+                    return false;
+                }
+                open_parens -= 1;
+                last_sep = None;
+            }
+            _ => return false, // letters or other punctuation
+        }
+    }
+
+    if open_parens != 0 {
+        return false;
+    }
+
+    // Practical minimum length: 10 digits.
+    digits >= 10
+}
+
+#[derive(Debug, Clone)]
+struct SimpleRegex {
+    anchored_start: bool,
+    anchored_end: bool,
+    tokens: Vec<Token>,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    atom: Atom,
+    min: usize,
+    max: Option<usize>, // None means unbounded
+}
+
+#[derive(Debug, Clone)]
+enum Atom {
+    Any,
+    Literal(char),
+    Digit,
+    CharClass(CharClass),
+}
+
+#[derive(Debug, Clone)]
+struct CharClass {
+    parts: Vec<CharClassPart>,
+}
+
+#[derive(Debug, Clone)]
+enum CharClassPart {
+    Single(char),
+    Range(char, char),
+}
+
+impl CharClass {
+    fn matches(&self, c: char) -> bool {
+        for part in &self.parts {
+            match *part {
+                CharClassPart::Single(x) if c == x => return true,
+                CharClassPart::Range(a, b) if a <= c && c <= b => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
+impl Atom {
+    fn matches(&self, c: char) -> bool {
+        match self {
+            Atom::Any => true,
+            Atom::Literal(x) => *x == c,
+            Atom::Digit => c.is_ascii_digit(),
+            Atom::CharClass(cc) => cc.matches(c),
+        }
+    }
+}
+
+impl SimpleRegex {
+    fn compile(pattern: &str) -> Result<Self, ()> {
+        let mut chars: Vec<char> = pattern.chars().collect();
+        let mut anchored_start = false;
+        let mut anchored_end = false;
+
+        if chars.first() == Some(&'^') {
+            anchored_start = true;
+            chars.remove(0);
+        }
+        if chars.last() == Some(&'$') {
+            anchored_end = true;
+            chars.pop();
+        }
+
+        let mut i = 0usize;
+        let mut tokens = Vec::<Token>::new();
+
+        while i < chars.len() {
+            let atom = match chars[i] {
+                '.' => {
+                    i += 1;
+                    Atom::Any
+                }
+                '\\' => {
+                    i += 1;
+                    if i >= chars.len() {
+                        return Err(());
+                    }
+                    let esc = chars[i];
+                    i += 1;
+                    match esc {
+                        'd' => Atom::Digit,
+                        other => Atom::Literal(other),
+                    }
+                }
+                '[' => {
+                    i += 1;
+                    let (cc, next) = parse_char_class(&chars, i)?;
+                    i = next;
+                    Atom::CharClass(cc)
+                }
+                c => {
+                    i += 1;
+                    Atom::Literal(c)
+                }
+            };
+
+            // Quantifier (optional).
+            let mut min = 1usize;
+            let mut max: Option<usize> = Some(1);
+
+            if i < chars.len() {
+                match chars[i] {
+                    '+' => {
+                        min = 1;
+                        max = None;
+                        i += 1;
+                    }
+                    '*' => {
+                        min = 0;
+                        max = None;
+                        i += 1;
+                    }
+                    '?' => {
+                        min = 0;
+                        max = Some(1);
+                        i += 1;
+                    }
+                    '{' => {
+                        i += 1;
+                        let (n, next) = parse_braced_number(&chars, i)?;
+                        i = next;
+                        min = n;
+                        max = Some(n);
+                    }
+                    _ => {}
+                }
+            }
+
+            tokens.push(Token { atom, min, max });
+        }
+
+        Ok(Self {
+            anchored_start,
+            anchored_end,
+            tokens,
+        })
+    }
+
+    fn is_match(&self, value: &str) -> bool {
+        let s: Vec<char> = value.chars().collect();
+
+        if self.anchored_start {
+            return self.is_match_at(&s, 0) && (!self.anchored_end || self.matches_end(&s));
+        }
+
+        // Unanchored: allow a match starting at any position.
+        for start in 0..=s.len() {
+            if self.is_match_at(&s, start) && (!self.anchored_end || self.matches_end(&s)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_end(&self, s: &[char]) -> bool {
+        // If anchored_end, we require a match that consumes to the end of the string.
+        // Our DP matcher returns true only for full consumption from the chosen start.
+        // So here we just return true and rely on is_match_at's end-check.
+        //
+        // This function exists to keep the calling logic clear if we later extend
+        // the matcher to support partial-consumption modes.
+        let _ = s;
+        true
+    }
+
+    fn is_match_at(&self, s: &[char], start: usize) -> bool {
+        use std::collections::HashMap;
+
+        fn dp(
+            tokens: &[Token],
+            s: &[char],
+            ti: usize,
+            si: usize,
+            memo: &mut HashMap<(usize, usize), bool>,
+        ) -> bool {
+            if let Some(&v) = memo.get(&(ti, si)) {
+                return v;
+            }
+
+            let ans = if ti == tokens.len() {
+                si == s.len()
+            } else {
+                let t = &tokens[ti];
+                let remaining = s.len().saturating_sub(si);
+                let max_rep = t.max.unwrap_or(remaining).min(remaining);
+
+                // Try all repetition counts in [min, max_rep].
+                let mut ok = false;
+                for rep in t.min..=max_rep {
+                    let mut good = true;
+                    for k in 0..rep {
+                        if !t.atom.matches(s[si + k]) {
+                            good = false;
+                            break;
+                        }
+                    }
+                    if good && dp(tokens, s, ti + 1, si + rep, memo) {
+                        ok = true;
+                        break;
+                    }
+                }
+                ok
+            };
+
+            memo.insert((ti, si), ans);
+            ans
+        }
+
+        // Match must consume to end of string if anchored_end is set; otherwise we accept
+        // consumption until token exhaustion (and ignore trailing chars) similar to a
+        // plain "find" match. Our tests always anchor with ^...$ so we keep strict
+        // behavior when anchored_end is true.
+        if self.anchored_end {
+            let mut memo = HashMap::new();
+            dp(&self.tokens, s, 0, start, &mut memo)
+        } else {
+            // Non-anchored end: accept any prefix match from start.
+            // Implement by checking dp and allowing trailing characters.
+            // We do this by running dp against all possible end positions.
+            for end in start..=s.len() {
+                let slice = &s[..end];
+                let mut memo = HashMap::new();
+                if dp(&self.tokens, slice, 0, start, &mut memo) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn parse_char_class(chars: &[char], mut i: usize) -> Result<(CharClass, usize), ()> {
+    let mut parts = Vec::<CharClassPart>::new();
+    if i >= chars.len() {
+        return Err(());
+    }
+
+    while i < chars.len() {
+        if chars[i] == ']' {
+            return Ok((CharClass { parts }, i + 1));
+        }
+
+        let first = chars[i];
+        i += 1;
+
+        if i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] != ']' {
+            // Range like a-z.
+            let second = chars[i + 1];
+            i += 2;
+            parts.push(CharClassPart::Range(first, second));
+        } else {
+            parts.push(CharClassPart::Single(first));
+        }
+    }
+
+    Err(())
+}
+
+fn parse_braced_number(chars: &[char], mut i: usize) -> Result<(usize, usize), ()> {
+    let mut n: usize = 0;
+    let mut saw_digit = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '}' {
+            if !saw_digit {
+                return Err(());
+            }
+            return Ok((n, i + 1));
+        }
+        if let Some(d) = c.to_digit(10) {
+            saw_digit = true;
+            n = n
+                .checked_mul(10)
+                .and_then(|x| x.checked_add(d as usize))
+                .ok_or(())?;
+            i += 1;
+        } else {
+            return Err(());
+        }
+    }
+    Err(())
 }
 
 #[cfg(test)]

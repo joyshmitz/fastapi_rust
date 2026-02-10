@@ -63,7 +63,7 @@ use fastapi_rust::core::{
 use serde::Serialize;
 
 /// The secret token used for authentication in this demo.
-/// In production, this would be generated per-user and stored securely.
+/// In production, generate per-user tokens and store them securely.
 const DEMO_BEARER_VALUE: &str = "demo-bearer-value";
 
 /// Login response body.
@@ -96,7 +96,7 @@ fn public_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Rea
 
 /// Handler for the login endpoint.
 ///
-/// In a real application, this would:
+/// In a real application:
 /// 1. Validate username/password against a database
 /// 2. Generate a unique token (JWT or random)
 /// 3. Store the token with associated user info
@@ -104,8 +104,8 @@ fn public_handler(_ctx: &RequestContext, _req: &mut Request) -> std::future::Rea
 ///
 /// For this demo, we accept any credentials and return a fixed token.
 fn login_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::Ready<Response> {
-    // In a real app, we would parse the JSON body and validate credentials.
-    // For this demo, we just check that it's a POST with some body.
+    // For this demo, we only check Content-Type and return a fixed token.
+    // Real applications should parse the body and validate credentials.
 
     // Check Content-Type
     let is_json = req
@@ -125,7 +125,7 @@ fn login_handler(_ctx: &RequestContext, req: &mut Request) -> std::future::Ready
     }
 
     // For demo purposes, we don't validate credentials - just return the token
-    // In production, you would:
+    // In production:
     // 1. Parse the request body as LoginRequest
     // 2. Verify username/password against your database
     // 3. Generate a unique, cryptographically secure token

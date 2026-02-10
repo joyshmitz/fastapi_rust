@@ -25,6 +25,12 @@ regex = { version = "1.12", optional = true }
 default = []
 # Enable regex support in testing assertions
 regex = ["dep:regex"]
+# Reserved for future use (avoids `unexpected_cfgs` warnings in code gated by this feature).
+compression = []
+
+[dev-dependencies]
+serial_test = "3.3.1"
+fastapi-macros = { workspace = true }
 
 [lints]
 workspace = true

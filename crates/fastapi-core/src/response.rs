@@ -5,8 +5,6 @@ use std::fmt;
 use std::pin::Pin;
 
 use asupersync::stream::Stream;
-
-use crate::extract::Cookie;
 #[cfg(test)]
 use asupersync::types::PanicPayload;
 use asupersync::types::{CancelKind, CancelReason, Outcome};
@@ -219,6 +217,180 @@ fn sanitize_header_value(value: Vec<u8>) -> Vec<u8> {
         .collect()
 }
 
+// ============================================================================
+// Set-Cookie Builder
+// ============================================================================
+
+/// SameSite cookie attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// Strict SameSite policy.
+    Strict,
+    /// Lax SameSite policy.
+    Lax,
+    /// None SameSite policy.
+    None,
+}
+
+impl SameSite {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "Strict",
+            Self::Lax => "Lax",
+            Self::None => "None",
+        }
+    }
+}
+
+/// Response cookie builder (serialized into a `Set-Cookie` header).
+#[derive(Debug, Clone)]
+pub struct SetCookie {
+    name: String,
+    value: String,
+    path: Option<String>,
+    domain: Option<String>,
+    max_age: Option<i64>,
+    http_only: bool,
+    secure: bool,
+    same_site: Option<SameSite>,
+}
+
+impl SetCookie {
+    /// Create a new cookie with `name=value`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            path: Some("/".to_string()),
+            domain: None,
+            max_age: None,
+            http_only: false,
+            secure: false,
+            same_site: None,
+        }
+    }
+
+    /// Set the cookie path.
+    #[must_use]
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Set the cookie domain.
+    #[must_use]
+    pub fn domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set Max-Age (in seconds). Use `0` to delete the cookie.
+    #[must_use]
+    pub fn max_age(mut self, seconds: i64) -> Self {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// Set HttpOnly flag.
+    #[must_use]
+    pub fn http_only(mut self, on: bool) -> Self {
+        self.http_only = on;
+        self
+    }
+
+    /// Set Secure flag.
+    #[must_use]
+    pub fn secure(mut self, on: bool) -> Self {
+        self.secure = on;
+        self
+    }
+
+    /// Set SameSite attribute.
+    #[must_use]
+    pub fn same_site(mut self, same_site: SameSite) -> Self {
+        self.same_site = Some(same_site);
+        self
+    }
+
+    /// Serialize into a `Set-Cookie` header value.
+    #[must_use]
+    pub fn to_header_value(&self) -> String {
+        // RFC6265-compatible formatting.
+        //
+        // Note: cookie name and value must use restricted character sets. We validate and
+        // omit invalid optional attributes rather than producing broken Set-Cookie headers.
+        fn is_valid_cookie_name(name: &str) -> bool {
+            // cookie-name is an HTTP token in RFC6265. Reuse our token validator.
+            is_valid_header_name(name)
+        }
+
+        fn is_valid_cookie_value(value: &str) -> bool {
+            // cookie-value = *cookie-octet
+            // cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+            value.is_empty()
+                || value.bytes().all(|b| {
+                    matches!(
+                        b,
+                        0x21
+                            | 0x23..=0x2B
+                            | 0x2D..=0x3A
+                            | 0x3C..=0x5B
+                            | 0x5D..=0x7E
+                    )
+                })
+        }
+
+        fn is_valid_attr_value(value: &str) -> bool {
+            // Keep this conservative: allow visible ASCII excluding ';' and ','.
+            value
+                .bytes()
+                .all(|b| (0x21..=0x7E).contains(&b) && b != b';' && b != b',')
+        }
+
+        if !is_valid_cookie_name(&self.name) || !is_valid_cookie_value(&self.value) {
+            // An invalid cookie name/value would generate a broken header; return empty so
+            // callers can choose to drop the header.
+            return String::new();
+        }
+
+        let mut out = String::new();
+        out.push_str(&self.name);
+        out.push('=');
+        out.push_str(&self.value);
+
+        if let Some(ref path) = self.path {
+            if is_valid_attr_value(path) {
+                out.push_str("; Path=");
+                out.push_str(path);
+            }
+        }
+        if let Some(ref domain) = self.domain {
+            if is_valid_attr_value(domain) {
+                out.push_str("; Domain=");
+                out.push_str(domain);
+            }
+        }
+        if let Some(max_age) = self.max_age {
+            out.push_str("; Max-Age=");
+            out.push_str(&max_age.to_string());
+        }
+        if let Some(same_site) = self.same_site {
+            out.push_str("; SameSite=");
+            out.push_str(same_site.as_str());
+        }
+        if self.http_only {
+            out.push_str("; HttpOnly");
+        }
+        if self.secure {
+            out.push_str("; Secure");
+        }
+
+        out
+    }
+}
+
 /// HTTP response.
 #[derive(Debug)]
 pub struct Response {
@@ -369,6 +541,16 @@ impl Response {
         self
     }
 
+    /// Remove all headers matching `name` (case-insensitive).
+    ///
+    /// This is useful for middleware that needs to suppress or replace headers
+    /// produced by handlers or other middleware.
+    #[must_use]
+    pub fn remove_header(mut self, name: &str) -> Self {
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self
+    }
+
     /// Set the body.
     #[must_use]
     pub fn body(mut self, body: ResponseBody) -> Self {
@@ -384,15 +566,19 @@ impl Response {
     /// # Example
     ///
     /// ```
-    /// use fastapi_core::{Response, Cookie, SameSite};
+    /// use fastapi_core::{Response, SameSite, SetCookie};
     ///
     /// let response = Response::ok()
-    ///     .set_cookie(Cookie::new("session", "abc123").http_only(true))
-    ///     .set_cookie(Cookie::new("prefs", "dark").same_site(SameSite::Lax));
+    ///     .set_cookie(SetCookie::new("session", "abc123").http_only(true))
+    ///     .set_cookie(SetCookie::new("prefs", "dark").same_site(SameSite::Lax));
     /// ```
     #[must_use]
-    pub fn set_cookie(self, cookie: Cookie) -> Self {
-        self.header("set-cookie", cookie.to_header_value().into_bytes())
+    pub fn set_cookie(self, cookie: SetCookie) -> Self {
+        let v = cookie.to_header_value();
+        if v.is_empty() {
+            return self;
+        }
+        self.header("set-cookie", v.into_bytes())
     }
 
     /// Delete a cookie by setting it to expire immediately.
@@ -411,7 +597,7 @@ impl Response {
     #[must_use]
     pub fn delete_cookie(self, name: &str) -> Self {
         // Create an expired cookie to delete it
-        let cookie = Cookie::new(name, "").max_age(0);
+        let cookie = SetCookie::new(name, "").max_age(0);
         self.set_cookie(cookie)
     }
 
@@ -1535,7 +1721,7 @@ fn strip_weak_prefix(etag: &str) -> &str {
 /// Either the original response or a 304/412 response as appropriate.
 pub fn apply_conditional(
     request_headers: &[(String, Vec<u8>)],
-    method: &crate::request::Method,
+    method: crate::request::Method,
     response: Response,
 ) -> Response {
     // Find the ETag from the response
@@ -1804,6 +1990,26 @@ impl fmt::Display for LinkHeader {
 mod tests {
     use super::*;
     use crate::error::HttpError;
+
+    #[test]
+    fn response_remove_header_removes_all_instances_case_insensitive() {
+        let resp = Response::ok()
+            .header("X-Test", b"1".to_vec())
+            .header("x-test", b"2".to_vec())
+            .header("Other", b"3".to_vec())
+            .remove_header("X-Test");
+
+        assert!(
+            resp.headers()
+                .iter()
+                .all(|(n, _)| !n.eq_ignore_ascii_case("x-test"))
+        );
+        assert!(
+            resp.headers()
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("other"))
+        );
+    }
 
     #[test]
     fn outcome_ok_maps_to_response() {
@@ -2161,9 +2367,7 @@ mod tests {
 
     #[test]
     fn response_set_cookie_adds_header() {
-        use crate::extract::Cookie;
-
-        let response = Response::ok().set_cookie(Cookie::new("session", "abc123"));
+        let response = Response::ok().set_cookie(SetCookie::new("session", "abc123"));
 
         let cookie_header = response
             .headers()
@@ -2178,10 +2382,8 @@ mod tests {
 
     #[test]
     fn response_set_cookie_with_attributes() {
-        use crate::extract::{Cookie, SameSite};
-
         let response = Response::ok().set_cookie(
-            Cookie::new("session", "token123")
+            SetCookie::new("session", "token123")
                 .http_only(true)
                 .secure(true)
                 .same_site(SameSite::Strict)
@@ -2206,11 +2408,9 @@ mod tests {
 
     #[test]
     fn response_set_multiple_cookies() {
-        use crate::extract::Cookie;
-
         let response = Response::ok()
-            .set_cookie(Cookie::new("session", "abc"))
-            .set_cookie(Cookie::new("prefs", "dark"));
+            .set_cookie(SetCookie::new("session", "abc"))
+            .set_cookie(SetCookie::new("prefs", "dark"));
 
         let cookie_headers: Vec<_> = response
             .headers()
@@ -2241,11 +2441,9 @@ mod tests {
 
     #[test]
     fn response_set_and_delete_cookies() {
-        use crate::extract::Cookie;
-
         // Set a new cookie and delete an old one in the same response
         let response = Response::ok()
-            .set_cookie(Cookie::new("new_session", "xyz"))
+            .set_cookie(SetCookie::new("new_session", "xyz"))
             .delete_cookie("old_session");
 
         let cookie_headers: Vec<_> = response
@@ -2866,7 +3064,7 @@ mod tests {
 
         let headers = vec![("If-None-Match".to_string(), b"\"abc123\"".to_vec())];
         let response = Response::ok().with_etag("\"abc123\"");
-        let result = apply_conditional(&headers, &Method::Get, response);
+        let result = apply_conditional(&headers, Method::Get, response);
         assert_eq!(result.status().as_u16(), 304);
     }
 
@@ -2876,7 +3074,7 @@ mod tests {
 
         let headers = vec![("If-None-Match".to_string(), b"\"old\"".to_vec())];
         let response = Response::ok().with_etag("\"new\"");
-        let result = apply_conditional(&headers, &Method::Get, response);
+        let result = apply_conditional(&headers, Method::Get, response);
         assert_eq!(result.status().as_u16(), 200);
     }
 
@@ -2886,7 +3084,7 @@ mod tests {
 
         let headers = vec![("If-Match".to_string(), b"\"old\"".to_vec())];
         let response = Response::ok().with_etag("\"new\"");
-        let result = apply_conditional(&headers, &Method::Put, response);
+        let result = apply_conditional(&headers, Method::Put, response);
         assert_eq!(result.status().as_u16(), 412);
     }
 
@@ -2896,7 +3094,7 @@ mod tests {
 
         let headers = vec![("If-Match".to_string(), b"\"current\"".to_vec())];
         let response = Response::ok().with_etag("\"current\"");
-        let result = apply_conditional(&headers, &Method::Put, response);
+        let result = apply_conditional(&headers, Method::Put, response);
         assert_eq!(result.status().as_u16(), 200);
     }
 
@@ -2906,7 +3104,7 @@ mod tests {
 
         let headers = vec![("If-None-Match".to_string(), b"\"abc\"".to_vec())];
         let response = Response::ok(); // No ETag
-        let result = apply_conditional(&headers, &Method::Get, response);
+        let result = apply_conditional(&headers, Method::Get, response);
         assert_eq!(result.status().as_u16(), 200);
     }
 

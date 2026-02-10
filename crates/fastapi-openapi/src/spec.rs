@@ -110,7 +110,11 @@ pub struct PathItem {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Operation {
     /// Operation ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "operationId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub operation_id: Option<String>,
     /// Summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,7 +129,11 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<Parameter>,
     /// Request body.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "requestBody",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub request_body: Option<RequestBody>,
     /// Responses.
     pub responses: HashMap<String, Response>,
@@ -424,6 +432,53 @@ pub struct Components {
     /// Schema definitions.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub schemas: HashMap<String, Schema>,
+}
+
+/// Schema registry for `#/components/schemas`.
+///
+/// This owns a schema map and provides `register()` helpers that return `$ref`s.
+#[derive(Debug, Default)]
+pub struct SchemaRegistry {
+    schemas: HashMap<String, Schema>,
+}
+
+impl SchemaRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schemas: HashMap::new(),
+        }
+    }
+
+    /// Register `schema` under `name` if it doesn't already exist, and return a `$ref`.
+    ///
+    /// This does **not** overwrite an existing entry, which enables stable deduplication.
+    pub fn register(&mut self, name: impl Into<String>, schema: Schema) -> Schema {
+        let name = name.into();
+        self.schemas.entry(name.clone()).or_insert(schema);
+        Schema::reference(&name)
+    }
+
+    /// Consume the registry and return the underlying schema map.
+    #[must_use]
+    pub fn into_schemas(self) -> HashMap<String, Schema> {
+        self.schemas
+    }
+}
+
+/// A mutable view into an existing component schema map.
+pub struct SchemaRegistryMut<'a> {
+    schemas: &'a mut HashMap<String, Schema>,
+}
+
+impl SchemaRegistryMut<'_> {
+    /// Register `schema` under `name` if it doesn't already exist, and return a `$ref`.
+    pub fn register(&mut self, name: impl Into<String>, schema: Schema) -> Schema {
+        let name = name.into();
+        self.schemas.entry(name.clone()).or_insert(schema);
+        Schema::reference(&name)
+    }
 }
 
 /// API tag.
@@ -815,6 +870,141 @@ impl OpenApiBuilder {
         self
     }
 
+    /// Access the component schema registry for in-place registration.
+    pub fn registry(&mut self) -> SchemaRegistryMut<'_> {
+        SchemaRegistryMut {
+            schemas: &mut self.components.schemas,
+        }
+    }
+
+    /// Add a metadata-rich route (from `fastapi-router`) as an OpenAPI operation.
+    ///
+    /// This is a convenience bridge used by integration tests and by higher-level crates.
+    #[allow(clippy::too_many_lines)]
+    pub fn add_route(&mut self, route: &fastapi_router::Route) {
+        use fastapi_router::Converter as RouteConverter;
+
+        fn param_schema(conv: RouteConverter) -> Schema {
+            match conv {
+                RouteConverter::Str | RouteConverter::Path => Schema::string(),
+                RouteConverter::Int => Schema::integer(Some("int64")),
+                RouteConverter::Float => Schema::number(Some("double")),
+                RouteConverter::Uuid => Schema::Primitive(crate::schema::PrimitiveSchema {
+                    schema_type: crate::schema::SchemaType::String,
+                    format: Some("uuid".to_string()),
+                    nullable: false,
+                }),
+            }
+        }
+
+        let mut op = Operation {
+            operation_id: if route.operation_id.is_empty() {
+                None
+            } else {
+                Some(route.operation_id.clone())
+            },
+            summary: route.summary.clone(),
+            description: route.description.clone(),
+            tags: route.tags.clone(),
+            deprecated: route.deprecated,
+            ..Default::default()
+        };
+
+        // Path parameters.
+        for p in &route.path_params {
+            let mut examples = HashMap::new();
+            for (name, value) in &p.examples {
+                examples.insert(
+                    name.clone(),
+                    Example {
+                        summary: None,
+                        description: None,
+                        value: Some(value.clone()),
+                        external_value: None,
+                    },
+                );
+            }
+
+            op.parameters.push(Parameter {
+                name: p.name.clone(),
+                location: ParameterLocation::Path,
+                required: true,
+                schema: Some(param_schema(p.converter)),
+                title: p.title.clone(),
+                description: p.description.clone(),
+                deprecated: p.deprecated,
+                example: p.example.clone(),
+                examples,
+            });
+        }
+
+        // Request body.
+        if let Some(schema_name) = &route.request_body_schema {
+            let content_type = route
+                .request_body_content_type
+                .clone()
+                .unwrap_or_else(|| "application/json".to_string());
+            let mut content = HashMap::new();
+            content.insert(
+                content_type,
+                MediaType {
+                    schema: Some(Schema::reference(schema_name)),
+                },
+            );
+            op.request_body = Some(RequestBody {
+                required: route.request_body_required,
+                content,
+                description: None,
+            });
+        }
+
+        // Responses.
+        let mut responses = HashMap::new();
+        if route.responses.is_empty() {
+            responses = default_responses();
+        } else {
+            for r in &route.responses {
+                let mut content = HashMap::new();
+                content.insert(
+                    "application/json".to_string(),
+                    MediaType {
+                        schema: Some(Schema::reference(&r.schema_name)),
+                    },
+                );
+                responses.insert(
+                    r.status.to_string(),
+                    Response {
+                        description: r.description.clone(),
+                        content,
+                    },
+                );
+            }
+        }
+        op.responses = responses;
+
+        let path_item = self.paths.entry(route.path.clone()).or_default();
+        match route.method.as_str() {
+            "GET" => path_item.get = Some(op),
+            "POST" => path_item.post = Some(op),
+            "PUT" => path_item.put = Some(op),
+            "DELETE" => path_item.delete = Some(op),
+            "PATCH" => path_item.patch = Some(op),
+            "OPTIONS" => path_item.options = Some(op),
+            "HEAD" => path_item.head = Some(op),
+            _ => {}
+        }
+    }
+
+    /// Add multiple routes.
+    pub fn add_routes<'a, I>(&mut self, routes: I)
+    where
+        I: IntoIterator<Item = &'a fastapi_router::Route>,
+    {
+        for r in routes {
+            self.add_route(r);
+        }
+    }
+
     /// Add a path operation (GET, POST, etc.).
     ///
     /// This is the primary method for registering routes with OpenAPI.
@@ -862,11 +1052,16 @@ impl OpenApiBuilder {
     /// Add a simple GET endpoint with default 200 response.
     #[must_use]
     pub fn get(self, path: impl Into<String>, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
         self.operation(
             "GET",
             path,
             Operation {
-                operation_id: Some(operation_id.into()),
+                operation_id: if operation_id.is_empty() {
+                    None
+                } else {
+                    Some(operation_id)
+                },
                 responses: default_responses(),
                 ..Default::default()
             },
@@ -876,11 +1071,16 @@ impl OpenApiBuilder {
     /// Add a simple POST endpoint with default 200 response.
     #[must_use]
     pub fn post(self, path: impl Into<String>, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
         self.operation(
             "POST",
             path,
             Operation {
-                operation_id: Some(operation_id.into()),
+                operation_id: if operation_id.is_empty() {
+                    None
+                } else {
+                    Some(operation_id)
+                },
                 responses: default_responses(),
                 ..Default::default()
             },
@@ -890,11 +1090,16 @@ impl OpenApiBuilder {
     /// Add a simple PUT endpoint with default 200 response.
     #[must_use]
     pub fn put(self, path: impl Into<String>, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
         self.operation(
             "PUT",
             path,
             Operation {
-                operation_id: Some(operation_id.into()),
+                operation_id: if operation_id.is_empty() {
+                    None
+                } else {
+                    Some(operation_id)
+                },
                 responses: default_responses(),
                 ..Default::default()
             },
@@ -904,11 +1109,16 @@ impl OpenApiBuilder {
     /// Add a simple DELETE endpoint with default 200 response.
     #[must_use]
     pub fn delete(self, path: impl Into<String>, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
         self.operation(
             "DELETE",
             path,
             Operation {
-                operation_id: Some(operation_id.into()),
+                operation_id: if operation_id.is_empty() {
+                    None
+                } else {
+                    Some(operation_id)
+                },
                 responses: default_responses(),
                 ..Default::default()
             },
@@ -918,11 +1128,16 @@ impl OpenApiBuilder {
     /// Add a simple PATCH endpoint with default 200 response.
     #[must_use]
     pub fn patch(self, path: impl Into<String>, operation_id: impl Into<String>) -> Self {
+        let operation_id = operation_id.into();
         self.operation(
             "PATCH",
             path,
             Operation {
-                operation_id: Some(operation_id.into()),
+                operation_id: if operation_id.is_empty() {
+                    None
+                } else {
+                    Some(operation_id)
+                },
                 responses: default_responses(),
                 ..Default::default()
             },

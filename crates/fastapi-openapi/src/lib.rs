@@ -43,5 +43,6 @@ pub use schema::{
 };
 pub use spec::{
     Components, Example, HasParamMeta, Info, MediaType, OpenApi, OpenApiBuilder, Operation,
-    ParamMeta, Parameter, ParameterLocation, PathItem, RequestBody, Response, Server, Tag,
+    ParamMeta, Parameter, ParameterLocation, PathItem, RequestBody, Response, SchemaRegistry,
+    SchemaRegistryMut, Server, Tag,
 };

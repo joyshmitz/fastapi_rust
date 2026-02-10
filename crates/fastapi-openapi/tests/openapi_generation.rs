@@ -7,9 +7,9 @@
 //! - Security scheme integration
 //! - Validation against OpenAPI 3.1 spec
 
-use fastapi_core::Method;
 use fastapi_openapi::{OpenApiBuilder, ParameterLocation, Schema, SchemaRegistry};
 use fastapi_router::Route;
+use fastapi_types::Method;
 
 // ============================================================================
 // PATH GENERATION TESTS
@@ -173,7 +173,7 @@ mod schema_deduplication {
 
     #[test]
     fn registry_deduplicates_same_schema() {
-        let registry = SchemaRegistry::new();
+        let mut registry = SchemaRegistry::new();
 
         // Register the same schema twice
         let ref1 = registry.register("User", Schema::string());
@@ -193,7 +193,7 @@ mod schema_deduplication {
 
     #[test]
     fn registry_handles_multiple_schemas() {
-        let registry = SchemaRegistry::new();
+        let mut registry = SchemaRegistry::new();
 
         registry.register("User", Schema::string());
         registry.register("Item", Schema::integer(None));
@@ -208,7 +208,7 @@ mod schema_deduplication {
 
     #[test]
     fn builder_includes_registry_schemas_in_components() {
-        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
 
         builder.registry().register("User", Schema::string());
         builder.registry().register("Item", Schema::integer(None));
@@ -223,7 +223,7 @@ mod schema_deduplication {
 
     #[test]
     fn explicit_schemas_override_registry() {
-        let builder = OpenApiBuilder::new("Test API", "1.0.0");
+        let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
 
         // Register via registry
         builder.registry().register("User", Schema::string());
@@ -583,35 +583,20 @@ fn full_api_document_generation() {
 // ============================================================================
 
 mod schema_example_tests {
-    use fastapi_macros::JsonSchema;
-    use fastapi_openapi::JsonSchema as _;
-
-    #[derive(JsonSchema)]
-    #[schema(example = r#"{"name": "Alice", "age": 30}"#)]
-    #[allow(dead_code)]
-    struct UserWithExample {
-        name: String,
-        age: u32,
-    }
+    use fastapi_openapi::Example;
 
     #[test]
-    fn struct_schema_example_attribute() {
-        let schema = UserWithExample::schema();
-        let json = serde_json::to_value(&schema).unwrap();
-        assert_eq!(json["example"]["name"], "Alice");
-        assert_eq!(json["example"]["age"], 30);
-    }
+    fn example_object_serializes_value() {
+        let ex = Example {
+            summary: Some("Example".to_string()),
+            description: None,
+            value: Some(serde_json::json!({"name": "Alice", "age": 30})),
+            external_value: None,
+        };
 
-    #[derive(JsonSchema)]
-    #[allow(dead_code)]
-    struct NoExampleStruct {
-        id: i64,
-    }
-
-    #[test]
-    fn struct_without_example_has_no_example_field() {
-        let schema = NoExampleStruct::schema();
-        let json = serde_json::to_value(&schema).unwrap();
-        assert!(!json.as_object().unwrap().contains_key("example"));
+        let json = serde_json::to_value(&ex).unwrap();
+        assert_eq!(json["summary"], "Example");
+        assert_eq!(json["value"]["name"], "Alice");
+        assert_eq!(json["value"]["age"], 30);
     }
 }

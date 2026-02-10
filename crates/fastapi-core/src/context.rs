@@ -40,7 +40,7 @@ impl BodyLimitConfig {
 
     /// Returns the maximum body size in bytes.
     #[must_use]
-    pub fn max_size(&self) -> usize {
+    pub fn max_size(self) -> usize {
         self.max_size
     }
 }

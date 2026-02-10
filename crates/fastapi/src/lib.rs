@@ -6,7 +6,7 @@
 //! - **Dependency injection** — Composable, testable request handling
 //! - **Automatic OpenAPI** — Schema generation from type definitions
 //! - **First-class async** — Built on asupersync for structured concurrency
-//! - **Minimal dependencies** — Only asupersync + serde
+//! - **Dependency discipline** — No Tokio/Hyper/Tower/Axum; direct deps kept small
 //!
 //! # Role In The System
 //!
@@ -243,11 +243,11 @@ pub use fastapi_router as router;
 
 // Re-export commonly used types
 pub use fastapi_core::{
-    App, AppBuilder, AppConfig, ConfigError, Cors, CorsConfig, Cx, DefaultConfig,
-    DefaultDependencyConfig, DependencyOverrides, DependencyScope, Depends, DependsConfig,
-    FromDependency, FromRequest, HttpError, IntoResponse, Method, NoCache, Request, RequestId,
-    RequestIdConfig, RequestIdMiddleware, Response, ResponseBody, StateContainer, StatusCode,
-    ValidationError, ValidationErrors,
+    App, AppBuilder, AppConfig, Cors, CorsConfig, Cx, DefaultConfig, DefaultDependencyConfig,
+    DependencyOverrides, DependencyScope, Depends, DependsConfig, FromDependency, FromRequest,
+    HttpError, IntoResponse, Method, NoCache, Request, RequestId, RequestIdConfig,
+    RequestIdMiddleware, Response, ResponseBody, StateContainer, StatusCode, ValidationError,
+    ValidationErrors,
 };
 
 // Re-export extractors
@@ -259,7 +259,6 @@ pub use fastapi_core::{
     Authorization,
     // Background tasks
     BackgroundTasks,
-    BackgroundTasksInner,
     // Auth extractors
     BasicAuth,
     BasicAuthError,
@@ -268,8 +267,6 @@ pub use fastapi_core::{
     ContentType,
     // Cookies
     Cookie,
-    CookiePrefix,
-    CookiePrefixError,
     DEFAULT_PAGE,
     DEFAULT_PER_PAGE,
     // Headers
@@ -299,12 +296,6 @@ pub use fastapi_core::{
     QueryExtractError,
     QueryParams,
     RequestContext,
-    RequestCookies,
-    // Request utilities
-    RequestRef,
-    // Response mutations
-    ResponseMut,
-    ResponseMutations,
     SameSite,
     // State
     State,
@@ -351,7 +342,6 @@ pub mod prelude {
         // Auth
         BasicAuth,
         BearerToken,
-        ConfigError,
         Cookie,
         Cors,
         CorsConfig,
@@ -420,8 +410,8 @@ pub mod extractors {
     pub use fastapi_core::{
         Accept, AppState, Authorization, BackgroundTasks, BasicAuth, BearerToken, ContentType,
         Cookie, Header, HeaderValues, Host, Json, JsonConfig, NamedHeader, OAuth2PasswordBearer,
-        Page, Pagination, PaginationConfig, Path, PathParams, Query, QueryParams, RequestRef,
-        ResponseMut, ResponseMutations, State, UserAgent, XRequestId,
+        Page, Pagination, PaginationConfig, Path, PathParams, Query, QueryParams, State, UserAgent,
+        XRequestId,
     };
 }
 

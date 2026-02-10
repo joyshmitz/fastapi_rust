@@ -54,12 +54,15 @@
 pub mod app;
 mod context;
 mod dependency;
+pub mod docs;
 pub mod error;
 mod extract;
 pub mod logging;
 pub mod middleware;
+mod password;
 mod request;
 mod response;
+pub mod routing;
 pub mod shutdown;
 pub mod testing;
 pub mod validation;
@@ -67,36 +70,55 @@ pub mod validation;
 pub use context::{CancelledError, IntoOutcome, RequestContext};
 pub use dependency::{
     DefaultConfig, DefaultDependencyConfig, DependencyCache, DependencyOverrides, DependencyScope,
-    Depends, DependsConfig, FromDependency, NoCache,
+    Depends, DependsCleanup, DependsConfig, FromDependency, FromDependencyWithCleanup, NoCache,
 };
 pub use error::{HttpError, LocItem, ValidationError, ValidationErrors};
 pub use extract::{
     Accept, ApiKey, ApiKeyConfig, ApiKeyError, ApiKeyErrorKind, ApiKeyLocation, AppState,
-    Authorization, BasicAuth, BasicAuthError, BasicAuthErrorKind, ContentType, Cookie,
-    CookieExtractError, CookieExtractErrorKind, CookieName, CsrfToken, DEFAULT_JSON_LIMIT, Form,
-    FormExtractError, FormExtractErrorKind, FromHeaderValue, FromRequest, Header,
+    Authorization, BasicAuth, BasicAuthError, BasicAuthErrorKind, BearerToken, BearerTokenError,
+    BearerTokenErrorKind, ContentType, Cookie, CookieExtractError, CookieExtractErrorKind,
+    CookieName, CsrfToken, CsrfTokenCookie, DEFAULT_JSON_LIMIT, DEFAULT_PAGE, DEFAULT_PER_PAGE,
+    Form, FormExtractError, FormExtractErrorKind, FromHeaderValue, FromRequest, Header,
     HeaderExtractError, HeaderName, HeaderValues, Host, Json, JsonConfig, JsonExtractError,
-    NamedHeader, OAuth2BearerError, OAuth2BearerErrorKind, OAuth2PasswordBearer,
-    OAuth2PasswordBearerConfig, Path, PathExtractError, PathParams, Query, QueryExtractError,
-    QueryParams, SessionId, State, StateExtractError, UserAgent, Valid, ValidExtractError,
-    Validate, XRequestId, snake_to_header_case,
+    MAX_PER_PAGE, NamedHeader, OAuth2BearerError, OAuth2BearerErrorKind, OAuth2PasswordBearer,
+    OAuth2PasswordBearerConfig, Page, Pagination, PaginationConfig, Path, PathExtractError,
+    PathParams, Query, QueryExtractError, QueryParams, SessionId, State, StateExtractError,
+    UserAgent, Valid, ValidExtractError, Validate, XRequestId, snake_to_header_case,
 };
 pub use middleware::{
     AddResponseHeader, BoxFuture, ControlFlow, Cors, CorsConfig, Handler, Layer, Layered,
-    Middleware, MiddlewareStack, NoopMiddleware, OriginPattern, PathPrefixFilter, RequestId,
-    RequestIdConfig, RequestIdMiddleware, RequestResponseLogger, RequireHeader,
+    Middleware, MiddlewareStack, NoopMiddleware, OriginPattern, PathPrefixFilter, ReferrerPolicy,
+    RequestId, RequestIdConfig, RequestIdMiddleware, RequestResponseLogger, RequireHeader,
+    SecurityHeaders, SecurityHeadersConfig, XFrameOptions,
 };
-pub use request::{Body, Headers, Method, Request};
+pub use request::{
+    BackgroundTasks, BackgroundTasksInner, Body, Headers, HttpVersion, Method, Request,
+    RequestBodyStream, RequestBodyStreamError,
+};
 pub use response::{
-    BodyStream, FileResponse, Html, IntoResponse, NoContent, Redirect, Response, ResponseBody,
-    StatusCode, Text, mime_type_for_extension,
+    Binary, BodyStream, FileResponse, Html, IntoResponse, Link, LinkHeader, LinkRel, NoContent,
+    Redirect, Response, ResponseBody, ResponseModelConfig, ResponseProduces, SameSite, SetCookie,
+    StatusCode, Text, ValidatedResponse, apply_conditional, check_if_match, check_if_none_match,
+    exclude_fields, include_fields, mime_type_for_extension,
+};
+
+// Re-export interactive docs helpers.
+pub use docs::{
+    DocsConfig, oauth2_redirect_html, oauth2_redirect_response, redoc_html, redoc_response,
+    swagger_ui_html, swagger_ui_response,
 };
 
 // Re-export key asupersync types for convenience
 pub use asupersync::{Budget, Cx, Outcome, RegionId, TaskId};
 
+// Re-export security helpers
+pub use password::{Algorithm, HashConfig, PasswordHasher, SecureCompare, constant_time_eq};
+
 // Re-export testing utilities
-pub use testing::{CookieJar, RequestBuilder, TestClient, TestResponse, json_contains};
+pub use testing::{
+    CookieJar, FixtureGuard, IntegrationTest, RequestBuilder, TestClient, TestFixture,
+    TestResponse, json_contains,
+};
 
 // Re-export assertion macros (defined via #[macro_export] in testing module)
 // Note: The macros assert_status!, assert_header!, assert_body_contains!,

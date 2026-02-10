@@ -11,6 +11,7 @@
 //! - multiple_of - Divisibility check
 
 // Allow clippy lints that arise from derive macro generated code or test conventions
+#![allow(dead_code)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::trivially_copy_pass_by_ref)]
 #![allow(clippy::ref_option_ref)]

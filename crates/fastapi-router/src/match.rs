@@ -1,6 +1,7 @@
 //! Route matching result.
 
 use crate::trie::Route;
+use crate::trie::{Converter, ParamInfo};
 use fastapi_types::Method;
 
 /// A matched route with extracted parameters.
@@ -20,6 +21,63 @@ impl<'a> RouteMatch<'a> {
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, v)| *v)
+    }
+
+    /// Number of extracted parameters.
+    #[must_use]
+    pub fn param_count(&self) -> usize {
+        self.params.len()
+    }
+
+    /// Returns true if there are no extracted parameters.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    /// Iterate over extracted parameters as `(name, value)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.params.iter().map(|(k, v)| (*k, *v))
+    }
+
+    /// Returns true if the route declares the given param as a UUID converter.
+    #[must_use]
+    pub fn is_param_uuid(&self, name: &str) -> Option<bool> {
+        self.route
+            .path_params
+            .iter()
+            .find(|p: &&ParamInfo| p.name == name)
+            .map(|p| p.converter == Converter::Uuid)
+    }
+
+    /// Parse a parameter as i64.
+    pub fn get_param_int(&self, name: &str) -> Option<Result<i64, std::num::ParseIntError>> {
+        self.get_param(name).map(str::parse::<i64>)
+    }
+
+    /// Parse a parameter as i32.
+    pub fn get_param_i32(&self, name: &str) -> Option<Result<i32, std::num::ParseIntError>> {
+        self.get_param(name).map(str::parse::<i32>)
+    }
+
+    /// Parse a parameter as u64.
+    pub fn get_param_u64(&self, name: &str) -> Option<Result<u64, std::num::ParseIntError>> {
+        self.get_param(name).map(str::parse::<u64>)
+    }
+
+    /// Parse a parameter as u32.
+    pub fn get_param_u32(&self, name: &str) -> Option<Result<u32, std::num::ParseIntError>> {
+        self.get_param(name).map(str::parse::<u32>)
+    }
+
+    /// Parse a parameter as f64.
+    pub fn get_param_float(&self, name: &str) -> Option<Result<f64, std::num::ParseFloatError>> {
+        self.get_param(name).map(str::parse::<f64>)
+    }
+
+    /// Parse a parameter as f32.
+    pub fn get_param_f32(&self, name: &str) -> Option<Result<f32, std::num::ParseFloatError>> {
+        self.get_param(name).map(str::parse::<f32>)
     }
 }
 

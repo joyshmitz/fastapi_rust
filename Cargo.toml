@@ -16,6 +16,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
+repository = "https://github.com/Dicklesworthstone/fastapi_rust"
+homepage = "https://github.com/Dicklesworthstone/fastapi_rust"
 
 [workspace.dependencies]
 # Runtime (our own) - uses git for CI; override with path in .cargo/config.toml for local dev

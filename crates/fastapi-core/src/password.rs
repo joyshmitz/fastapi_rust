@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```
-//! use fastapi_core::password::{PasswordHasher, HashConfig, Algorithm};
+//! use fastapi_core::{Algorithm, HashConfig, PasswordHasher};
 //!
 //! let hasher = PasswordHasher::new(HashConfig::default());
 //! let hash = hasher.hash_password("secret123");
@@ -357,7 +357,7 @@ fn fallback_salt(_len: usize) -> Vec<u8> {
 }
 
 /// Timing-safe byte comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -366,6 +366,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Trait providing a timing-safe equality check (`secure_eq`) for common types.
+///
+/// This is intentionally tiny (no extra dependencies) and is used by auth and
+/// security-sensitive middleware.
+pub trait SecureCompare<Rhs: ?Sized = Self> {
+    /// Timing-safe equality check.
+    fn secure_eq(&self, other: &Rhs) -> bool;
+}
+
+impl SecureCompare for [u8] {
+    fn secure_eq(&self, other: &[u8]) -> bool {
+        constant_time_eq(self, other)
+    }
+}
+
+impl SecureCompare for str {
+    fn secure_eq(&self, other: &str) -> bool {
+        constant_time_eq(self.as_bytes(), other.as_bytes())
+    }
 }
 
 /// Simple base64 encode (standard alphabet, no padding).

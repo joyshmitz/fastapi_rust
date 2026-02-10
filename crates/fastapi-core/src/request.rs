@@ -2,9 +2,66 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
 
 // Re-export Method from fastapi-types
 pub use fastapi_types::Method;
+
+use asupersync::stream::Stream;
+
+/// Error yielded by streaming request bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestBodyStreamError {
+    /// The body exceeded the configured maximum size.
+    TooLarge { received: usize, max: usize },
+    /// The connection closed before the full body was read.
+    ConnectionClosed,
+    /// An I/O error occurred while reading the body.
+    Io(String),
+}
+
+impl fmt::Display for RequestBodyStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { received, max } => write!(
+                f,
+                "request body too large: received {received} bytes (max {max})"
+            ),
+            Self::ConnectionClosed => write!(f, "connection closed while reading request body"),
+            Self::Io(e) => write!(f, "I/O error while reading request body: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestBodyStreamError {}
+
+/// Streamed request body type (yields chunks or a streaming error).
+pub type RequestBodyStream =
+    Pin<Box<dyn Stream<Item = Result<Vec<u8>, RequestBodyStreamError>> + Send>>;
+
+/// HTTP protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpVersion {
+    /// HTTP/1.0
+    Http10,
+    /// HTTP/1.1
+    Http11,
+}
+
+impl HttpVersion {
+    /// Parse an HTTP version string like "HTTP/1.1".
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "HTTP/1.0" => Some(Self::Http10),
+            "HTTP/1.1" => Some(Self::Http11),
+            _ => None,
+        }
+    }
+}
 
 /// HTTP headers collection.
 #[derive(Debug, Default)]
@@ -27,10 +84,29 @@ impl Headers {
             .map(Vec::as_slice)
     }
 
+    /// Returns true if a header is present (case-insensitive).
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner.contains_key(&name.to_ascii_lowercase())
+    }
+
     /// Insert a header.
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) {
         self.inner
             .insert(name.into().to_ascii_lowercase(), value.into());
+    }
+
+    /// Insert a header from borrowed name/value slices.
+    ///
+    /// This is a convenience for parsers that already have `&str`/`&[u8]` and want
+    /// to avoid constructing intermediate owned buffers.
+    pub fn insert_from_slice(&mut self, name: &str, value: &[u8]) {
+        self.inner.insert(name.to_ascii_lowercase(), value.to_vec());
+    }
+
+    /// Remove a header value by name (case-insensitive).
+    pub fn remove(&mut self, name: &str) -> Option<Vec<u8>> {
+        self.inner.remove(&name.to_ascii_lowercase())
     }
 
     /// Iterate over all headers as (name, value) pairs.
@@ -54,29 +130,163 @@ impl Headers {
 }
 
 /// Request body.
-#[derive(Debug)]
 pub enum Body {
     /// Empty body.
     Empty,
     /// Bytes body.
     Bytes(Vec<u8>),
-    // TODO: Stream variant for large bodies
+    /// Streaming body, optionally with a known content length.
+    Stream {
+        /// Streamed chunks.
+        stream: Mutex<RequestBodyStream>,
+        /// Known content length, if available.
+        content_length: Option<usize>,
+    },
+}
+
+impl fmt::Debug for Body {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.debug_tuple("Empty").finish(),
+            Self::Bytes(b) => f.debug_tuple("Bytes").field(b).finish(),
+            Self::Stream { content_length, .. } => f
+                .debug_struct("Stream")
+                .field("content_length", content_length)
+                .finish(),
+        }
+    }
 }
 
 impl Body {
+    /// Create a streaming body.
+    #[must_use]
+    pub fn streaming<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Vec<u8>, RequestBodyStreamError>> + Send + 'static,
+    {
+        Self::Stream {
+            stream: Mutex::new(Box::pin(stream)),
+            content_length: None,
+        }
+    }
+
+    /// Create a streaming body with a known content length.
+    #[must_use]
+    pub fn streaming_with_size<S>(stream: S, content_length: usize) -> Self
+    where
+        S: Stream<Item = Result<Vec<u8>, RequestBodyStreamError>> + Send + 'static,
+    {
+        Self::Stream {
+            stream: Mutex::new(Box::pin(stream)),
+            content_length: Some(content_length),
+        }
+    }
+
     /// Get body as bytes, consuming it.
+    ///
+    /// Note: streaming bodies cannot be synchronously collected; this returns
+    /// an empty vector for `Body::Stream`.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
             Self::Empty => Vec::new(),
             Self::Bytes(b) => b,
+            Self::Stream { .. } => Vec::new(),
         }
     }
 
     /// Check if body is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty) || matches!(self, Self::Bytes(b) if b.is_empty())
+        matches!(self, Self::Empty)
+            || matches!(self, Self::Bytes(b) if b.is_empty())
+            || matches!(
+                self,
+                Self::Stream {
+                    content_length: Some(0),
+                    ..
+                }
+            )
+    }
+
+    /// Take ownership of the inner stream, if this is a streaming body.
+    pub fn into_stream(self) -> Option<(RequestBodyStream, Option<usize>)> {
+        match self {
+            Self::Stream {
+                stream,
+                content_length,
+            } => Some((
+                stream.into_inner().unwrap_or_else(|e| e.into_inner()),
+                content_length,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Request-scoped background tasks to execute after the response is sent.
+///
+/// This is inspired by FastAPI's `BackgroundTasks`. Handlers can enqueue work
+/// that is executed by the server after the main response completes.
+pub type BackgroundTasksInner = Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>;
+
+pub struct BackgroundTasks {
+    tasks: BackgroundTasksInner,
+}
+
+impl fmt::Debug for BackgroundTasks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BackgroundTasks").finish_non_exhaustive()
+    }
+}
+
+impl BackgroundTasks {
+    /// Create an empty background task set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Add a synchronous task to run after the response is written.
+    ///
+    /// This matches FastAPI's `BackgroundTasks.add_task(...)` UX: you enqueue work
+    /// and the server runs it after the response is sent.
+    pub fn add<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.add_async(async move { f() });
+    }
+
+    /// Add an async task (future) to run after the response is written.
+    pub fn add_async<Fut>(&self, fut: Fut)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(Box::pin(fut));
+    }
+
+    /// Execute all background tasks sequentially.
+    pub async fn execute_all(self) {
+        let tasks = self
+            .tasks
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for t in tasks {
+            t.await;
+        }
+    }
+}
+
+impl Default for BackgroundTasks {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -84,6 +294,7 @@ impl Body {
 #[derive(Debug)]
 pub struct Request {
     method: Method,
+    version: HttpVersion,
     path: String,
     query: Option<String>,
     headers: Headers,
@@ -99,6 +310,7 @@ impl Request {
     pub fn new(method: Method, path: impl Into<String>) -> Self {
         Self {
             method,
+            version: HttpVersion::Http11,
             path: path.into(),
             query: None,
             headers: Headers::new(),
@@ -107,10 +319,29 @@ impl Request {
         }
     }
 
+    /// Create a new request with an explicit HTTP version.
+    #[must_use]
+    pub fn with_version(method: Method, path: impl Into<String>, version: HttpVersion) -> Self {
+        let mut req = Self::new(method, path);
+        req.version = version;
+        req
+    }
+
     /// Get the HTTP method.
     #[must_use]
     pub fn method(&self) -> Method {
         self.method
+    }
+
+    /// Get the HTTP version.
+    #[must_use]
+    pub fn version(&self) -> HttpVersion {
+        self.version
+    }
+
+    /// Set the HTTP version.
+    pub fn set_version(&mut self, version: HttpVersion) {
+        self.version = version;
     }
 
     /// Get the request path.
@@ -175,5 +406,25 @@ impl Request {
         self.extensions
             .get_mut(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_mut::<T>())
+    }
+
+    /// Remove and return a typed extension value.
+    pub fn take_extension<T: Any + Send + Sync>(&mut self) -> Option<T> {
+        self.extensions
+            .remove(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .map(|boxed| *boxed)
+    }
+
+    /// Access (and lazily create) the request-scoped background tasks container.
+    pub fn background_tasks(&mut self) -> &BackgroundTasks {
+        if !self
+            .extensions
+            .contains_key(&TypeId::of::<BackgroundTasks>())
+        {
+            self.insert_extension(BackgroundTasks::new());
+        }
+        self.get_extension::<BackgroundTasks>()
+            .expect("BackgroundTasks extension should exist")
     }
 }

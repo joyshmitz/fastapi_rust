@@ -477,6 +477,16 @@ pub struct AppConfig {
     pub version: String,
     /// Enable debug mode.
     pub debug: bool,
+    /// Root path for proxied deployments (FastAPI's `root_path`).
+    ///
+    /// When set, URL generation and redirects should be prefixed with this path.
+    pub root_path: String,
+    /// Whether to include the `root_path` in OpenAPI `servers` entries.
+    pub root_path_in_servers: bool,
+    /// Trailing slash normalization mode for routing.
+    pub trailing_slash_mode: crate::routing::TrailingSlashMode,
+    /// Debug surface configuration (e.g. debug endpoints / debug auth).
+    pub debug_config: crate::error::DebugConfig,
     /// Maximum request body size in bytes.
     pub max_body_size: usize,
     /// Default request timeout in milliseconds.
@@ -489,6 +499,10 @@ impl Default for AppConfig {
             name: String::from("fastapi_rust"),
             version: String::from("0.1.0"),
             debug: false,
+            root_path: String::new(),
+            root_path_in_servers: false,
+            trailing_slash_mode: crate::routing::TrailingSlashMode::Strict,
+            debug_config: crate::error::DebugConfig::default(),
             max_body_size: 1024 * 1024, // 1MB
             request_timeout_ms: 30_000, // 30 seconds
         }
@@ -520,6 +534,34 @@ impl AppConfig {
     #[must_use]
     pub fn debug(mut self, debug: bool) -> Self {
         self.debug = debug;
+        self
+    }
+
+    /// Set the root path for proxied deployments.
+    #[must_use]
+    pub fn root_path(mut self, root_path: impl Into<String>) -> Self {
+        self.root_path = root_path.into();
+        self
+    }
+
+    /// Control whether `root_path` is included in OpenAPI servers.
+    #[must_use]
+    pub fn root_path_in_servers(mut self, enabled: bool) -> Self {
+        self.root_path_in_servers = enabled;
+        self
+    }
+
+    /// Configure trailing slash normalization for routing.
+    #[must_use]
+    pub fn trailing_slash_mode(mut self, mode: crate::routing::TrailingSlashMode) -> Self {
+        self.trailing_slash_mode = mode;
+        self
+    }
+
+    /// Configure debug behavior.
+    #[must_use]
+    pub fn debug_config(mut self, config: crate::error::DebugConfig) -> Self {
+        self.debug_config = config;
         self
     }
 
@@ -683,6 +725,7 @@ pub struct AppBuilder {
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send>>,
     async_shutdown_hooks: Vec<Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
     openapi_config: Option<OpenApiConfig>,
+    docs_config: Option<crate::docs::DocsConfig>,
 }
 
 impl Default for AppBuilder {
@@ -697,6 +740,7 @@ impl Default for AppBuilder {
             shutdown_hooks: Vec::new(),
             async_shutdown_hooks: Vec::new(),
             openapi_config: None,
+            docs_config: None,
         }
     }
 }
@@ -733,6 +777,41 @@ impl AppBuilder {
     #[must_use]
     pub fn openapi(mut self, config: OpenApiConfig) -> Self {
         self.openapi_config = Some(config);
+        self
+    }
+
+    /// Enables and configures interactive API documentation endpoints.
+    ///
+    /// This wires [`crate::docs::DocsConfig`] into the application build and ensures an
+    /// OpenAPI JSON endpoint is served at `config.openapi_path` unless overridden later.
+    ///
+    /// Notes:
+    /// - Docs endpoints are appended during `build()` so they don't appear in the OpenAPI spec.
+    /// - If OpenAPI is already configured, its `openapi_path` is updated to match `DocsConfig`.
+    #[must_use]
+    pub fn enable_docs(mut self, mut config: crate::docs::DocsConfig) -> Self {
+        // If the user didn't customize the docs title, default it to the app name.
+        if config.title == crate::docs::DocsConfig::default().title {
+            config.title.clone_from(&self.config.name);
+        }
+
+        // Keep OpenAPI + docs in sync on the OpenAPI JSON path.
+        match self.openapi_config.take() {
+            Some(mut openapi) => {
+                openapi.openapi_path.clone_from(&config.openapi_path);
+                self.openapi_config = Some(openapi);
+            }
+            None => {
+                self.openapi_config = Some(
+                    OpenApiConfig::new()
+                        .title(self.config.name.clone())
+                        .version(self.config.version.clone())
+                        .path(config.openapi_path.clone()),
+                );
+            }
+        }
+
+        self.docs_config = Some(config);
         self
     }
 
@@ -1051,6 +1130,57 @@ impl AppBuilder {
             ));
         }
 
+        // Add interactive docs endpoints (Swagger UI / ReDoc) if configured and OpenAPI is enabled.
+        //
+        // These are appended after OpenAPI generation so they do not appear in the OpenAPI spec.
+        if let (Some(openapi_url), Some(docs_config)) = (openapi_path.clone(), self.docs_config) {
+            let docs_config = Arc::new(docs_config);
+            let openapi_url = Arc::new(openapi_url);
+
+            if let Some(docs_path) = docs_config.docs_path.clone() {
+                let cfg = Arc::clone(&docs_config);
+                let url = Arc::clone(&openapi_url);
+                self.routes.push(RouteEntry::new(
+                    Method::Get,
+                    docs_path.clone(),
+                    move |_ctx: &RequestContext, _req: &mut Request| {
+                        let cfg = Arc::clone(&cfg);
+                        let url = Arc::clone(&url);
+                        async move { crate::docs::swagger_ui_response(&cfg, &url) }
+                    },
+                ));
+
+                // FastAPI uses `/docs/oauth2-redirect` by default, relative to docs_path.
+                let docs_prefix = docs_path.trim_end_matches('/');
+                let oauth2_redirect_path = if docs_prefix.is_empty() {
+                    "/oauth2-redirect".to_string()
+                } else {
+                    format!("{docs_prefix}/oauth2-redirect")
+                };
+                self.routes.push(RouteEntry::new(
+                    Method::Get,
+                    oauth2_redirect_path,
+                    |_ctx: &RequestContext, _req: &mut Request| async move {
+                        crate::docs::oauth2_redirect_response()
+                    },
+                ));
+            }
+
+            if let Some(redoc_path) = docs_config.redoc_path.clone() {
+                let cfg = Arc::clone(&docs_config);
+                let url = Arc::clone(&openapi_url);
+                self.routes.push(RouteEntry::new(
+                    Method::Get,
+                    redoc_path,
+                    move |_ctx: &RequestContext, _req: &mut Request| {
+                        let cfg = Arc::clone(&cfg);
+                        let url = Arc::clone(&url);
+                        async move { crate::docs::redoc_response(&cfg, &url) }
+                    },
+                ));
+            }
+        }
+
         let mut middleware_stack = MiddlewareStack::with_capacity(self.middleware.len());
         for mw in self.middleware {
             middleware_stack.push_arc(mw);
@@ -1072,6 +1202,7 @@ impl AppBuilder {
             middleware: middleware_stack,
             state: Arc::new(self.state),
             exception_handlers: Arc::new(self.exception_handlers),
+            dependency_overrides: Arc::new(crate::dependency::DependencyOverrides::new()),
             startup_hooks: parking_lot::Mutex::new(self.startup_hooks),
             shutdown_hooks: parking_lot::Mutex::new(self.shutdown_hooks),
             async_shutdown_hooks: parking_lot::Mutex::new(self.async_shutdown_hooks),
@@ -1164,6 +1295,7 @@ pub struct App {
     middleware: MiddlewareStack,
     state: Arc<StateContainer>,
     exception_handlers: Arc<ExceptionHandlers>,
+    dependency_overrides: Arc<crate::dependency::DependencyOverrides>,
     startup_hooks: parking_lot::Mutex<Vec<StartupHook>>,
     shutdown_hooks: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     async_shutdown_hooks: parking_lot::Mutex<
@@ -1178,6 +1310,24 @@ impl App {
     #[must_use]
     pub fn builder() -> AppBuilder {
         AppBuilder::new()
+    }
+
+    /// Create an in-process test client for this app.
+    ///
+    /// This takes `Arc<Self>` so tests can keep using shared `Arc<App>` values
+    /// without extra boilerplate.
+    #[must_use]
+    pub fn test_client(self: Arc<Self>) -> crate::testing::TestClient<Arc<Self>> {
+        crate::testing::TestClient::new(self)
+    }
+
+    /// Create an in-process test client with a deterministic seed.
+    #[must_use]
+    pub fn test_client_with_seed(
+        self: Arc<Self>,
+        seed: u64,
+    ) -> crate::testing::TestClient<Arc<Self>> {
+        crate::testing::TestClient::with_seed(self, seed)
     }
 
     /// Returns the application configuration.
@@ -1234,6 +1384,30 @@ impl App {
         &self.exception_handlers
     }
 
+    /// Register a fixed override value for a dependency type.
+    ///
+    /// This is a test-focused convenience API; production code typically wires
+    /// dependencies via [`crate::dependency::FromDependency`] implementations.
+    pub fn override_dependency_value<T>(&self, value: T)
+    where
+        T: crate::dependency::FromDependency,
+    {
+        self.dependency_overrides.insert_value(value);
+    }
+
+    /// Clear all registered dependency overrides.
+    pub fn clear_dependency_overrides(&self) {
+        self.dependency_overrides.clear();
+    }
+
+    /// Take request-scoped background tasks (if any) from a request.
+    ///
+    /// The HTTP server calls this after writing the response so any deferred work
+    /// runs outside the main request handler path.
+    pub fn take_background_tasks(req: &mut Request) -> Option<crate::request::BackgroundTasks> {
+        req.take_extension::<crate::request::BackgroundTasks>()
+    }
+
     /// Handles an error using registered exception handlers.
     ///
     /// If a handler is registered for the error type, it will be invoked.
@@ -1288,9 +1462,20 @@ impl App {
                 self.middleware.execute(&handler, ctx, req).await
             }
             RouteLookup::MethodNotAllowed { allowed } => {
-                // Return 405 with Allow header listing permitted methods
-                Response::with_status(StatusCode::METHOD_NOT_ALLOWED)
-                    .header("allow", allowed.header_value().as_bytes().to_vec())
+                // Auto-handle `OPTIONS` by returning 204 with an `Allow` header.
+                // For other methods, return 405 with the `Allow` header.
+                if req.method() == Method::Options {
+                    let mut methods = allowed.methods().to_vec();
+                    if !methods.contains(&Method::Options) {
+                        methods.push(Method::Options);
+                    }
+                    let allow = fastapi_router::AllowedMethods::new(methods);
+                    Response::with_status(StatusCode::NO_CONTENT)
+                        .header("allow", allow.header_value().as_bytes().to_vec())
+                } else {
+                    Response::with_status(StatusCode::METHOD_NOT_ALLOWED)
+                        .header("allow", allowed.header_value().as_bytes().to_vec())
+                }
             }
             RouteLookup::NotFound => Response::with_status(StatusCode::NOT_FOUND),
         }
@@ -1414,6 +1599,21 @@ impl std::fmt::Debug for App {
             .field("startup_hooks", &self.startup_hooks.lock().len())
             .field("shutdown_hooks", &self.pending_shutdown_hooks())
             .finish()
+    }
+}
+
+// Allow `App` to be used anywhere a middleware `Handler` is expected (e.g. TestClient).
+impl Handler for App {
+    fn call<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move { self.handle(ctx, req).await })
+    }
+
+    fn dependency_overrides(&self) -> Option<Arc<crate::dependency::DependencyOverrides>> {
+        Some(Arc::clone(&self.dependency_overrides))
     }
 }
 

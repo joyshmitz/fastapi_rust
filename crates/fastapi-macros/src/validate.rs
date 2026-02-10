@@ -9,32 +9,55 @@
 //! - `#[validate(email)]` - Email format validation
 //! - `#[validate(url)]` - URL format validation
 //! - `#[validate(regex = "pattern")]` - Regex pattern matching
-//! - `#[validate(custom = "function_name")]` - Custom validation function
+//! - `#[validate(phone)]` - Phone number validation
+//! - `#[validate(contains = "substr")]` - Substring containment
+//! - `#[validate(starts_with = "prefix")]` - Prefix matching
+//! - `#[validate(ends_with = "suffix")]` - Suffix matching
+//! - `#[validate(multiple_of = N)]` - Numeric divisibility
+//! - `#[validate(nested)]` - Nested struct validation (calls `Validate` on the field)
+//! - `#[validate(custom = path::to::fn_name)]` - Custom validation function
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
-use syn::{Attribute, Data, DeriveInput, Fields, Ident, Lit, Type, parse_macro_input};
+use quote::quote;
+use syn::{Attribute, Data, DeriveInput, Expr, Fields, Ident, Lit, Type, parse_macro_input};
 
 /// Validation constraint parsed from attributes.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct FieldValidation {
     /// Minimum string length.
     length_min: Option<usize>,
     /// Maximum string length.
     length_max: Option<usize>,
-    /// Minimum numeric value.
-    range_min: Option<f64>,
-    /// Maximum numeric value.
-    range_max: Option<f64>,
+    /// Numeric range: >= bound.
+    range_ge: Option<f64>,
+    /// Numeric range: > bound.
+    range_gt: Option<f64>,
+    /// Numeric range: <= bound.
+    range_le: Option<f64>,
+    /// Numeric range: < bound.
+    range_lt: Option<f64>,
     /// Email format validation.
     email: bool,
     /// URL format validation.
     url: bool,
     /// Regex pattern.
     regex: Option<String>,
-    /// Custom validation function name.
-    custom: Option<String>,
+    /// Phone format validation.
+    phone: bool,
+    /// Value must contain substring.
+    contains: Option<String>,
+    /// Value must start with prefix.
+    starts_with: Option<String>,
+    /// Value must end with suffix.
+    ends_with: Option<String>,
+    /// Divisibility constraint.
+    multiple_of: Option<Expr>,
+    /// Nested struct validation (delegates to `Validate`).
+    nested: bool,
+    /// Custom validation function.
+    custom: Option<syn::Path>,
 }
 
 pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
@@ -42,7 +65,10 @@ pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
     let name = &input.ident;
 
     let validations = match &input.data {
-        Data::Struct(data) => generate_struct_validations(&data.fields),
+        Data::Struct(data) => match generate_struct_validations(&data.fields) {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        },
         Data::Enum(_) => {
             return syn::Error::new_spanned(&input, "Validate can only be derived for structs")
                 .to_compile_error()
@@ -56,13 +82,13 @@ pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        impl #name {
+        impl fastapi_core::validation::Validate for #name {
             /// Validate this value against all field constraints.
             ///
             /// # Errors
             ///
             /// Returns `ValidationErrors` if any constraints are violated.
-            pub fn validate(&self) -> Result<(), fastapi_core::ValidationErrors> {
+            fn validate(&self) -> Result<(), Box<fastapi_core::ValidationErrors>> {
                 use fastapi_core::error::{ValidationError, ValidationErrors, LocItem};
 
                 let mut errors = ValidationErrors::new();
@@ -72,8 +98,18 @@ pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
                 if errors.is_empty() {
                     Ok(())
                 } else {
-                    Err(errors)
+                    Err(Box::new(errors))
                 }
+            }
+        }
+
+        impl #name {
+            /// Validate this value against all field constraints.
+            ///
+            /// This is a convenience inherent wrapper so callers do not need to import
+            /// the [`fastapi_core::validation::Validate`] trait to call `.validate()`.
+            pub fn validate(&self) -> Result<(), Box<fastapi_core::ValidationErrors>> {
+                <Self as fastapi_core::validation::Validate>::validate(self)
             }
         }
     };
@@ -81,7 +117,7 @@ pub fn derive_validate_impl(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-fn generate_struct_validations(fields: &Fields) -> TokenStream2 {
+fn generate_struct_validations(fields: &Fields) -> Result<TokenStream2, syn::Error> {
     let mut validations = Vec::new();
 
     match fields {
@@ -91,7 +127,7 @@ fn generate_struct_validations(fields: &Fields) -> TokenStream2 {
                 let field_name_str = field_name.to_string();
                 let field_type = &field.ty;
 
-                let validation = parse_validation_attrs(&field.attrs);
+                let validation = parse_validation_attrs(&field.attrs)?;
                 let field_validations =
                     generate_field_validation(field_name, &field_name_str, field_type, &validation);
 
@@ -105,12 +141,10 @@ fn generate_struct_validations(fields: &Fields) -> TokenStream2 {
         }
     }
 
-    quote! {
-        #(#validations)*
-    }
+    Ok(quote! { #(#validations)* })
 }
 
-fn parse_validation_attrs(attrs: &[Attribute]) -> FieldValidation {
+fn parse_validation_attrs(attrs: &[Attribute]) -> Result<FieldValidation, syn::Error> {
     let mut validation = FieldValidation::default();
 
     for attr in attrs {
@@ -118,12 +152,16 @@ fn parse_validation_attrs(attrs: &[Attribute]) -> FieldValidation {
             continue;
         }
 
-        // Parse using syn 2.x's parse_nested_meta
-        let _ = attr.parse_nested_meta(|meta| {
+        // Parse using syn 2.x's parse_nested_meta.
+        attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("email") {
                 validation.email = true;
+            } else if meta.path.is_ident("phone") {
+                validation.phone = true;
             } else if meta.path.is_ident("url") {
                 validation.url = true;
+            } else if meta.path.is_ident("nested") {
+                validation.nested = true;
             } else if meta.path.is_ident("length") {
                 // Parse length(min = N, max = M)
                 meta.parse_nested_meta(|nested| {
@@ -133,58 +171,56 @@ fn parse_validation_attrs(attrs: &[Attribute]) -> FieldValidation {
                     } else if nested.path.is_ident("max") {
                         let value: syn::LitInt = nested.value()?.parse()?;
                         validation.length_max = Some(value.base10_parse()?);
+                    } else {
+                        return Err(nested.error("unsupported length validator key"));
                     }
                     Ok(())
                 })?;
             } else if meta.path.is_ident("range") {
-                // Parse range(min = N, max = M)
-                #[allow(clippy::cast_precision_loss)]
+                // Parse range(ge/gt/le/lt = N). For backwards-compat, also accept min/max.
                 meta.parse_nested_meta(|nested| {
-                    if nested.path.is_ident("min") {
-                        let value: syn::Lit = nested.value()?.parse()?;
-                        match value {
-                            Lit::Int(lit_int) => {
-                                if let Ok(v) = lit_int.base10_parse::<i64>() {
-                                    validation.range_min = Some(v as f64);
-                                }
-                            }
-                            Lit::Float(lit_float) => {
-                                if let Ok(v) = lit_float.base10_parse::<f64>() {
-                                    validation.range_min = Some(v);
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if nested.path.is_ident("max") {
-                        let value: syn::Lit = nested.value()?.parse()?;
-                        match value {
-                            Lit::Int(lit_int) => {
-                                if let Ok(v) = lit_int.base10_parse::<i64>() {
-                                    validation.range_max = Some(v as f64);
-                                }
-                            }
-                            Lit::Float(lit_float) => {
-                                if let Ok(v) = lit_float.base10_parse::<f64>() {
-                                    validation.range_max = Some(v);
-                                }
-                            }
-                            _ => {}
-                        }
+                    let expr: Expr = nested.value()?.parse()?;
+                    let val = parse_number_expr_to_f64(&expr)?;
+
+                    if nested.path.is_ident("ge") || nested.path.is_ident("min") {
+                        validation.range_ge = Some(val);
+                    } else if nested.path.is_ident("gt") {
+                        validation.range_gt = Some(val);
+                    } else if nested.path.is_ident("le") || nested.path.is_ident("max") {
+                        validation.range_le = Some(val);
+                    } else if nested.path.is_ident("lt") {
+                        validation.range_lt = Some(val);
+                    } else {
+                        return Err(nested.error("unsupported range validator key"));
                     }
                     Ok(())
                 })?;
             } else if meta.path.is_ident("regex") || meta.path.is_ident("pattern") {
                 let value: syn::LitStr = meta.value()?.parse()?;
                 validation.regex = Some(value.value());
-            } else if meta.path.is_ident("custom") {
+            } else if meta.path.is_ident("contains") {
                 let value: syn::LitStr = meta.value()?.parse()?;
-                validation.custom = Some(value.value());
+                validation.contains = Some(value.value());
+            } else if meta.path.is_ident("starts_with") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                validation.starts_with = Some(value.value());
+            } else if meta.path.is_ident("ends_with") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                validation.ends_with = Some(value.value());
+            } else if meta.path.is_ident("multiple_of") {
+                let value: Expr = meta.value()?.parse()?;
+                validation.multiple_of = Some(value);
+            } else if meta.path.is_ident("custom") {
+                let value: syn::Path = meta.value()?.parse()?;
+                validation.custom = Some(value);
+            } else {
+                return Err(meta.error("unsupported validate() attribute"));
             }
             Ok(())
-        });
+        })?;
     }
 
-    validation
+    Ok(validation)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -248,20 +284,21 @@ fn generate_field_validation(
     }
 
     // Range validation (for numeric types)
-    if let Some(min) = validation.range_min {
+    #[allow(clippy::cast_precision_loss)]
+    if let Some(ge) = validation.range_ge {
         let check = if is_optional {
             quote! {
-                if let Some(val) = self.#field_name {
-                    if (val as f64) < #min {
-                        errors.push(ValidationError::greater_than_equal(#loc, #min)
+                if let Some(ref val) = self.#field_name {
+                    if (*val as f64) < #ge {
+                        errors.push(ValidationError::greater_than_equal(#loc, #ge)
                             .with_input(serde_json::json!(val)));
                     }
                 }
             }
         } else {
             quote! {
-                if (self.#field_name as f64) < #min {
-                    errors.push(ValidationError::greater_than_equal(#loc, #min)
+                if (self.#field_name as f64) < #ge {
+                    errors.push(ValidationError::greater_than_equal(#loc, #ge)
                         .with_input(serde_json::json!(self.#field_name)));
                 }
             }
@@ -269,20 +306,65 @@ fn generate_field_validation(
         checks.push(check);
     }
 
-    if let Some(max) = validation.range_max {
+    #[allow(clippy::cast_precision_loss)]
+    if let Some(gt) = validation.range_gt {
         let check = if is_optional {
             quote! {
-                if let Some(val) = self.#field_name {
-                    if (val as f64) > #max {
-                        errors.push(ValidationError::less_than_equal(#loc, #max)
+                if let Some(ref val) = self.#field_name {
+                    if (*val as f64) <= #gt {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should be greater than {}", #gt))
                             .with_input(serde_json::json!(val)));
                     }
                 }
             }
         } else {
             quote! {
-                if (self.#field_name as f64) > #max {
-                    errors.push(ValidationError::less_than_equal(#loc, #max)
+                if (self.#field_name as f64) <= #gt {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should be greater than {}", #gt))
+                        .with_input(serde_json::json!(self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    if let Some(le) = validation.range_le {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if (*val as f64) > #le {
+                        errors.push(ValidationError::less_than_equal(#loc, #le)
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if (self.#field_name as f64) > #le {
+                    errors.push(ValidationError::less_than_equal(#loc, #le)
+                        .with_input(serde_json::json!(self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    if let Some(lt) = validation.range_lt {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if (*val as f64) >= #lt {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should be less than {}", #lt))
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if (self.#field_name as f64) >= #lt {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should be less than {}", #lt))
                         .with_input(serde_json::json!(self.#field_name)));
                 }
             }
@@ -334,6 +416,28 @@ fn generate_field_validation(
         checks.push(check);
     }
 
+    // Phone validation
+    if validation.phone {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if !fastapi_core::validation::is_valid_phone(val) {
+                        errors.push(ValidationError::value_error(#loc, "Invalid phone number")
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if !fastapi_core::validation::is_valid_phone(&self.#field_name) {
+                    errors.push(ValidationError::value_error(#loc, "Invalid phone number")
+                        .with_input(serde_json::json!(&self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
     // Regex pattern validation
     if let Some(ref pattern) = validation.regex {
         let check = if is_optional {
@@ -356,24 +460,132 @@ fn generate_field_validation(
         checks.push(check);
     }
 
-    // Custom validation function
-    if let Some(ref func_name) = validation.custom {
-        let func_ident = format_ident!("{}", func_name);
+    // contains / starts_with / ends_with
+    if let Some(ref needle) = validation.contains {
         let check = if is_optional {
             quote! {
                 if let Some(ref val) = self.#field_name {
-                    if let Err(msg) = #func_ident(val) {
-                        errors.push(ValidationError::value_error(#loc, msg)
+                    if !val.contains(#needle) {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should contain '{}'", #needle))
                             .with_input(serde_json::json!(val)));
                     }
                 }
             }
         } else {
             quote! {
-                if let Err(msg) = #func_ident(&self.#field_name) {
-                    errors.push(ValidationError::value_error(#loc, msg)
+                if !self.#field_name.contains(#needle) {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should contain '{}'", #needle))
                         .with_input(serde_json::json!(&self.#field_name)));
                 }
+            }
+        };
+        checks.push(check);
+    }
+
+    if let Some(ref prefix) = validation.starts_with {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if !val.starts_with(#prefix) {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should start with '{}'", #prefix))
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if !self.#field_name.starts_with(#prefix) {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should start with '{}'", #prefix))
+                        .with_input(serde_json::json!(&self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    if let Some(ref suffix) = validation.ends_with {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if !val.ends_with(#suffix) {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should end with '{}'", #suffix))
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if !self.#field_name.ends_with(#suffix) {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should end with '{}'", #suffix))
+                        .with_input(serde_json::json!(&self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    // multiple_of
+    if let Some(ref multiple_of) = validation.multiple_of {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if *val % (#multiple_of) != 0 {
+                        errors.push(ValidationError::value_error(#loc, format!("Input should be a multiple of {}", #multiple_of))
+                            .with_input(serde_json::json!(val)));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if self.#field_name % (#multiple_of) != 0 {
+                    errors.push(ValidationError::value_error(#loc, format!("Input should be a multiple of {}", #multiple_of))
+                        .with_input(serde_json::json!(self.#field_name)));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    // nested
+    if validation.nested {
+        let check = if is_optional {
+            quote! {
+                if let Some(ref val) = self.#field_name {
+                    if let Err(err) = fastapi_core::validation::Validate::validate(val) {
+                        let mut err = *err;
+                        for e in &mut err.errors {
+                            if e.loc.first().and_then(LocItem::as_str) == Some("body") {
+                                e.loc.remove(0);
+                            }
+                        }
+                        let prefix = vec![LocItem::field("body"), LocItem::field(#field_name_str)];
+                        errors.merge(err.with_loc_prefix(prefix));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let Err(err) = fastapi_core::validation::Validate::validate(&self.#field_name) {
+                    let mut err = *err;
+                    for e in &mut err.errors {
+                        if e.loc.first().and_then(LocItem::as_str) == Some("body") {
+                            e.loc.remove(0);
+                        }
+                    }
+                    let prefix = vec![LocItem::field("body"), LocItem::field(#field_name_str)];
+                    errors.merge(err.with_loc_prefix(prefix));
+                }
+            }
+        };
+        checks.push(check);
+    }
+
+    // Custom validation function
+    if let Some(ref func_path) = validation.custom {
+        let check = quote! {
+            if let Err(msg) = #func_path(&self.#field_name) {
+                errors.push(ValidationError::value_error(#loc, msg)
+                    .with_input(serde_json::json!(&self.#field_name)));
             }
         };
         checks.push(check);
@@ -398,4 +610,23 @@ fn extract_option_inner(ty: &Type) -> (bool, Option<&Type>) {
         }
     }
     (false, None)
+}
+
+fn parse_number_expr_to_f64(expr: &Expr) -> Result<f64, syn::Error> {
+    match expr {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Int(i) => {
+                let v: i64 = i.base10_parse()?;
+                #[allow(clippy::cast_precision_loss)]
+                Ok(v as f64)
+            }
+            Lit::Float(f) => Ok(f.base10_parse()?),
+            _ => Err(syn::Error::new_spanned(expr, "expected numeric literal")),
+        },
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            let v = parse_number_expr_to_f64(&unary.expr)?;
+            Ok(-v)
+        }
+        _ => Err(syn::Error::new_spanned(expr, "expected numeric literal")),
+    }
 }

@@ -18,7 +18,6 @@ use fastapi_core::{
     Binary,
     // Context and types
     BoxFuture,
-    Cookie,
     FileResponse,
     Handler,
     Html,
@@ -31,6 +30,7 @@ use fastapi_core::{
     ResponseBody,
     ResponseModelConfig,
     SameSite,
+    SetCookie,
     StatusCode,
     // Testing
     TestClient,
@@ -259,7 +259,7 @@ mod response_builder {
         assert_eq!(content_type, Some("application/json".to_string()));
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             assert_eq!(parsed["id"], 42);
             assert_eq!(parsed["name"], "test");
         }
@@ -288,7 +288,7 @@ mod response_builder {
         let response = Response::json(&data).expect("JSON serialization failed");
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
             assert_eq!(parsed["metadata"]["key"], "value");
         }
@@ -458,7 +458,7 @@ mod response_model_validation {
             .into_response();
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             assert!(parsed.get("id").is_some());
             assert!(parsed.get("name").is_some());
             assert!(
@@ -491,7 +491,7 @@ mod response_model_validation {
         let response = exclude_fields(record, &["internal_id"]).into_response();
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             assert!(parsed.get("public_id").is_some());
             assert!(parsed.get("data").is_some());
             assert!(
@@ -523,7 +523,7 @@ mod response_model_validation {
         let response = include_fields(profile, &["id", "username"]).into_response();
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             assert!(parsed.get("id").is_some());
             assert!(parsed.get("username").is_some());
             assert!(parsed.get("email").is_none());
@@ -839,7 +839,7 @@ mod response_types {
         let response = binary.into_response();
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            assert_eq!(bytes, &data);
+            assert_eq!(bytes.as_slice(), data.as_slice());
         }
     }
 
@@ -976,7 +976,7 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_adds_header() {
-        let response = Response::ok().set_cookie(Cookie::new("session", "abc123"));
+        let response = Response::ok().set_cookie(SetCookie::new("session", "abc123"));
 
         let cookie_header = response
             .headers()
@@ -990,7 +990,8 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_with_http_only() {
-        let response = Response::ok().set_cookie(Cookie::new("session", "token").http_only(true));
+        let response =
+            Response::ok().set_cookie(SetCookie::new("session", "token").http_only(true));
 
         let cookie_header = response
             .headers()
@@ -1004,7 +1005,7 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_with_secure() {
-        let response = Response::ok().set_cookie(Cookie::new("session", "token").secure(true));
+        let response = Response::ok().set_cookie(SetCookie::new("session", "token").secure(true));
 
         let cookie_header = response
             .headers()
@@ -1018,8 +1019,8 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_with_same_site_strict() {
-        let response =
-            Response::ok().set_cookie(Cookie::new("session", "token").same_site(SameSite::Strict));
+        let response = Response::ok()
+            .set_cookie(SetCookie::new("session", "token").same_site(SameSite::Strict));
 
         let cookie_header = response
             .headers()
@@ -1034,7 +1035,7 @@ mod cookie_setting {
     #[test]
     fn set_cookie_with_same_site_lax() {
         let response =
-            Response::ok().set_cookie(Cookie::new("session", "token").same_site(SameSite::Lax));
+            Response::ok().set_cookie(SetCookie::new("session", "token").same_site(SameSite::Lax));
 
         let cookie_header = response
             .headers()
@@ -1048,7 +1049,7 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_with_max_age() {
-        let response = Response::ok().set_cookie(Cookie::new("session", "token").max_age(3600));
+        let response = Response::ok().set_cookie(SetCookie::new("session", "token").max_age(3600));
 
         let cookie_header = response
             .headers()
@@ -1062,7 +1063,7 @@ mod cookie_setting {
 
     #[test]
     fn set_cookie_with_path() {
-        let response = Response::ok().set_cookie(Cookie::new("session", "token").path("/api"));
+        let response = Response::ok().set_cookie(SetCookie::new("session", "token").path("/api"));
 
         let cookie_header = response
             .headers()
@@ -1077,7 +1078,7 @@ mod cookie_setting {
     #[test]
     fn set_cookie_with_domain() {
         let response =
-            Response::ok().set_cookie(Cookie::new("session", "token").domain("example.com"));
+            Response::ok().set_cookie(SetCookie::new("session", "token").domain("example.com"));
 
         let cookie_header = response
             .headers()
@@ -1092,7 +1093,7 @@ mod cookie_setting {
     #[test]
     fn set_cookie_with_all_attributes() {
         let response = Response::ok().set_cookie(
-            Cookie::new("session", "token123")
+            SetCookie::new("session", "token123")
                 .http_only(true)
                 .secure(true)
                 .same_site(SameSite::Strict)
@@ -1120,9 +1121,9 @@ mod cookie_setting {
     #[test]
     fn set_multiple_cookies() {
         let response = Response::ok()
-            .set_cookie(Cookie::new("session", "abc"))
-            .set_cookie(Cookie::new("preferences", "dark"))
-            .set_cookie(Cookie::new("locale", "en-US"));
+            .set_cookie(SetCookie::new("session", "abc"))
+            .set_cookie(SetCookie::new("preferences", "dark"))
+            .set_cookie(SetCookie::new("locale", "en-US"));
 
         let cookie_headers: Vec<_> = response
             .headers()
@@ -1151,7 +1152,7 @@ mod cookie_setting {
     #[test]
     fn set_and_delete_cookies_together() {
         let response = Response::ok()
-            .set_cookie(Cookie::new("new_session", "xyz"))
+            .set_cookie(SetCookie::new("new_session", "xyz"))
             .delete_cookie("old_session");
 
         let cookie_headers: Vec<String> = response
@@ -1575,7 +1576,7 @@ mod edge_cases {
         let response = Response::json(&data).unwrap();
 
         if let ResponseBody::Bytes(bytes) = response.body_ref() {
-            let parsed: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(bytes.as_slice()).unwrap();
             // JSON escaping should work correctly
             assert!(parsed["text"].as_str().unwrap().contains("\"world\""));
         }
@@ -1634,7 +1635,7 @@ mod edge_cases {
     #[test]
     fn cookie_with_special_value_characters() {
         // Cookie values can contain some special chars
-        let response = Response::ok().set_cookie(Cookie::new("data", "a=b&c=d"));
+        let response = Response::ok().set_cookie(SetCookie::new("data", "a=b&c=d"));
 
         let cookie_header = response
             .headers()
@@ -1718,7 +1719,8 @@ mod test_client_integration {
 
     #[test]
     fn test_client_cookie_persistence() {
-        let handler = sync_handler(|| Response::ok().set_cookie(Cookie::new("session", "abc123")));
+        let handler =
+            sync_handler(|| Response::ok().set_cookie(SetCookie::new("session", "abc123")));
 
         let client = TestClient::new(handler);
 
@@ -1731,7 +1733,7 @@ mod test_client_integration {
 
     #[test]
     fn test_client_clear_cookies() {
-        let handler = sync_handler(|| Response::ok().set_cookie(Cookie::new("test", "value")));
+        let handler = sync_handler(|| Response::ok().set_cookie(SetCookie::new("test", "value")));
 
         let client = TestClient::new(handler);
         let _ = client.get("/").send();

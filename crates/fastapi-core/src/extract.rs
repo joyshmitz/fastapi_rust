@@ -5,7 +5,7 @@
 
 use crate::context::RequestContext;
 use crate::error::{HttpError, ValidationError, ValidationErrors};
-use crate::request::{Body, Request};
+use crate::request::{Body, Request, RequestBodyStreamError};
 use crate::response::IntoResponse;
 use serde::de::{
     self, DeserializeOwned, Deserializer, IntoDeserializer, MapAccess, SeqAccess, Visitor,
@@ -13,6 +13,64 @@ use serde::de::{
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::task::Context;
+
+async fn collect_body_limited(
+    ctx: &RequestContext,
+    body: Body,
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyStreamError> {
+    match body {
+        Body::Empty => Ok(Vec::new()),
+        Body::Bytes(b) => {
+            if b.len() > limit {
+                Err(RequestBodyStreamError::TooLarge {
+                    received: b.len(),
+                    max: limit,
+                })
+            } else {
+                Ok(b)
+            }
+        }
+        Body::Stream {
+            stream,
+            content_length,
+        } => {
+            let mut stream = stream.into_inner().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = content_length {
+                if n > limit {
+                    return Err(RequestBodyStreamError::TooLarge {
+                        received: n,
+                        max: limit,
+                    });
+                }
+            }
+
+            // Poll the stream without requiring Unpin.
+            let mut out = Vec::with_capacity(content_length.unwrap_or(0).min(limit));
+            let mut seen = 0usize;
+            loop {
+                let next =
+                    std::future::poll_fn(|cx: &mut Context<'_>| stream.as_mut().poll_next(cx))
+                        .await;
+                let Some(chunk) = next else {
+                    break;
+                };
+                let chunk = chunk?;
+                seen = seen.saturating_add(chunk.len());
+                if seen > limit {
+                    return Err(RequestBodyStreamError::TooLarge {
+                        received: seen,
+                        max: limit,
+                    });
+                }
+                out.extend_from_slice(&chunk);
+                let _ = ctx.checkpoint();
+            }
+            Ok(out)
+        }
+    }
+}
 
 /// Trait for types that can be extracted from a request.
 ///
@@ -196,6 +254,11 @@ pub enum JsonExtractError {
         /// The configured limit.
         limit: usize,
     },
+    /// Failed to read the request body (stream error).
+    ReadError {
+        /// The body read error message.
+        message: String,
+    },
     /// JSON deserialization failed.
     DeserializeError {
         /// The serde_json error message.
@@ -223,6 +286,7 @@ impl std::fmt::Display for JsonExtractError {
                     "Request body too large: {size} bytes exceeds {limit} byte limit"
                 )
             }
+            Self::ReadError { message } => write!(f, "Failed to read request body: {message}"),
             Self::DeserializeError {
                 message,
                 line,
@@ -257,6 +321,9 @@ impl IntoResponse for JsonExtractError {
                 .with_detail(format!(
                     "Request body too large: {size} bytes exceeds {limit} byte limit"
                 ))
+                .into_response(),
+            Self::ReadError { message } => HttpError::bad_request()
+                .with_detail(format!("Failed to read request body: {message}"))
                 .into_response(),
             Self::DeserializeError {
                 message,
@@ -306,19 +373,20 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {
 
         // Get body bytes
         let body = req.take_body();
-        let bytes = match body {
-            Body::Empty => Vec::new(),
-            Body::Bytes(b) => b,
-        };
-
-        // Check size limit (using default for now - could be made configurable)
         let limit = DEFAULT_JSON_LIMIT;
-        if bytes.len() > limit {
-            return Err(JsonExtractError::PayloadTooLarge {
-                size: bytes.len(),
-                limit,
-            });
-        }
+        let bytes = collect_body_limited(ctx, body, limit)
+            .await
+            .map_err(|e| match e {
+                RequestBodyStreamError::TooLarge { received, .. } => {
+                    JsonExtractError::PayloadTooLarge {
+                        size: received,
+                        limit,
+                    }
+                }
+                other => JsonExtractError::ReadError {
+                    message: other.to_string(),
+                },
+            })?;
 
         // Check cancellation before deserialization
         let _ = ctx.checkpoint();
@@ -1999,6 +2067,178 @@ impl<T: DeserializeOwned> FromRequest for Query<T> {
         let value = T::deserialize(QueryDeserializer::new(&params))?;
 
         Ok(Query(value))
+    }
+}
+
+// ============================================================================
+// Pagination
+// ============================================================================
+
+/// Default page number used when `page` is not provided.
+pub const DEFAULT_PAGE: u64 = 1;
+/// Default items-per-page used when `per_page` is not provided.
+pub const DEFAULT_PER_PAGE: u64 = 20;
+/// Maximum allowed `per_page` value.
+pub const MAX_PER_PAGE: u64 = 100;
+
+/// Pagination extractor configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaginationConfig {
+    default_page: u64,
+    default_per_page: u64,
+    max_per_page: u64,
+}
+
+impl Default for PaginationConfig {
+    fn default() -> Self {
+        Self {
+            default_page: DEFAULT_PAGE,
+            default_per_page: DEFAULT_PER_PAGE,
+            max_per_page: MAX_PER_PAGE,
+        }
+    }
+}
+
+impl PaginationConfig {
+    /// Create a config with defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the default page.
+    #[must_use]
+    pub fn default_page(mut self, page: u64) -> Self {
+        self.default_page = page;
+        self
+    }
+
+    /// Set the default per-page.
+    #[must_use]
+    pub fn default_per_page(mut self, per_page: u64) -> Self {
+        self.default_per_page = per_page;
+        self
+    }
+
+    /// Set the maximum per-page.
+    #[must_use]
+    pub fn max_per_page(mut self, max: u64) -> Self {
+        self.max_per_page = max;
+        self
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PaginationParams {
+    page: Option<u64>,
+    per_page: Option<u64>,
+}
+
+/// Pagination extractor: reads `?page=` and `?per_page=` from the query string.
+///
+/// Defaults:
+/// - `page`: 1
+/// - `per_page`: 20
+/// - `per_page` max: 100
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pagination {
+    page: u64,
+    per_page: u64,
+}
+
+impl Pagination {
+    #[must_use]
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    #[must_use]
+    pub fn per_page(&self) -> u64 {
+        self.per_page
+    }
+
+    /// Alias for `per_page()` for common DB APIs.
+    #[must_use]
+    pub fn limit(&self) -> u64 {
+        self.per_page
+    }
+
+    /// Zero-based offset (`(page - 1) * per_page`).
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.page.saturating_sub(1).saturating_mul(self.per_page)
+    }
+}
+
+impl FromRequest for Pagination {
+    type Error = QueryExtractError;
+
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        // Allow users/middleware to install an override per-request.
+        let config = req
+            .get_extension::<PaginationConfig>()
+            .copied()
+            .unwrap_or_default();
+
+        let Query(params) = Query::<PaginationParams>::from_request(ctx, req).await?;
+
+        let page = params.page.unwrap_or(config.default_page);
+        if page == 0 {
+            return Err(QueryExtractError::InvalidValue {
+                name: "page".to_string(),
+                value: "0".to_string(),
+                expected: "u64",
+                message: "must be >= 1".to_string(),
+            });
+        }
+
+        let per_page = params.per_page.unwrap_or(config.default_per_page);
+        if per_page == 0 {
+            return Err(QueryExtractError::InvalidValue {
+                name: "per_page".to_string(),
+                value: "0".to_string(),
+                expected: "u64",
+                message: "must be >= 1".to_string(),
+            });
+        }
+        if per_page > config.max_per_page {
+            return Err(QueryExtractError::InvalidValue {
+                name: "per_page".to_string(),
+                value: per_page.to_string(),
+                expected: "u64",
+                message: format!("must be <= {}", config.max_per_page),
+            });
+        }
+
+        Ok(Self { page, per_page })
+    }
+}
+
+/// Generic paginated response payload.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+impl<T> Page<T> {
+    #[must_use]
+    pub fn new(items: Vec<T>, total: u64, page: u64, per_page: u64) -> Self {
+        let total_pages = if per_page == 0 {
+            0
+        } else {
+            total.div_ceil(per_page)
+        };
+        Self {
+            items,
+            total,
+            page,
+            per_page,
+            total_pages,
+        }
     }
 }
 
@@ -4347,24 +4587,16 @@ impl FromRequest for OAuth2PasswordBearer {
             .get("authorization")
             .ok_or_else(OAuth2BearerError::missing_header)?;
 
-        // Convert to string
         let auth_str =
             std::str::from_utf8(auth_header).map_err(|_| OAuth2BearerError::invalid_scheme())?;
 
-        // Check for "Bearer " prefix (case-insensitive)
-        const BEARER_PREFIX: &str = "Bearer ";
-        const BEARER_PREFIX_LOWER: &str = "bearer ";
-
-        let token = if auth_str.starts_with(BEARER_PREFIX) {
-            &auth_str[BEARER_PREFIX.len()..]
-        } else if auth_str.starts_with(BEARER_PREFIX_LOWER) {
-            &auth_str[BEARER_PREFIX_LOWER.len()..]
-        } else {
+        let mut parts = auth_str.split_whitespace();
+        let scheme = parts.next().ok_or_else(OAuth2BearerError::invalid_scheme)?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
             return Err(OAuth2BearerError::invalid_scheme());
-        };
+        }
 
-        // Check token isn't empty
-        let token = token.trim();
+        let token = parts.next().unwrap_or("");
         if token.is_empty() {
             return Err(OAuth2BearerError::empty_token());
         }
@@ -4606,23 +4838,161 @@ impl FromRequest for BasicAuth {
         let auth_str =
             std::str::from_utf8(auth_header).map_err(|_| BasicAuthError::invalid_encoding())?;
 
-        // Check for "Basic " prefix (case-insensitive)
-        const BASIC_PREFIX: &str = "Basic ";
-        const BASIC_PREFIX_LOWER: &str = "basic ";
-
-        let encoded = if auth_str.starts_with(BASIC_PREFIX) {
-            &auth_str[BASIC_PREFIX.len()..]
-        } else if auth_str.starts_with(BASIC_PREFIX_LOWER) {
-            &auth_str[BASIC_PREFIX_LOWER.len()..]
-        } else {
+        let mut parts = auth_str.split_whitespace();
+        let scheme = parts.next().ok_or_else(BasicAuthError::invalid_scheme)?;
+        if !scheme.eq_ignore_ascii_case("basic") {
             return Err(BasicAuthError::invalid_scheme());
-        };
+        }
+
+        let encoded = parts.next().unwrap_or("");
+        if encoded.is_empty() {
+            return Err(BasicAuthError::invalid_format());
+        }
 
         // Decode and parse credentials
         let (username, password) = BasicAuth::decode_credentials(encoded.trim())
             .ok_or_else(BasicAuthError::invalid_format)?;
 
         Ok(BasicAuth::new(username, password))
+    }
+}
+
+// ============================================================================
+// Bearer Token Extractor
+// ============================================================================
+
+/// Bearer token extractor for `Authorization: Bearer <token>`.
+///
+/// This is a lightweight alternative to the OAuth2-specific extractor when you
+/// just want a token string and will validate it yourself (e.g. JWT).
+#[derive(Debug, Clone)]
+pub struct BearerToken {
+    token: String,
+}
+
+impl BearerToken {
+    /// Create a new bearer token wrapper.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
+    }
+
+    /// Access the token string (without the `Bearer ` prefix).
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// Error when bearer token extraction fails.
+#[derive(Debug, Clone)]
+pub struct BearerTokenError {
+    /// The kind of error that occurred.
+    pub kind: BearerTokenErrorKind,
+}
+
+/// The specific kind of bearer token error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerTokenErrorKind {
+    /// Authorization header is missing.
+    MissingHeader,
+    /// Authorization header isn't valid UTF-8.
+    InvalidUtf8,
+    /// Authorization header doesn't use the Bearer scheme.
+    InvalidScheme,
+    /// Authorization header has `Bearer` but no token value.
+    EmptyToken,
+}
+
+impl BearerTokenError {
+    #[must_use]
+    pub fn missing_header() -> Self {
+        Self {
+            kind: BearerTokenErrorKind::MissingHeader,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_utf8() -> Self {
+        Self {
+            kind: BearerTokenErrorKind::InvalidUtf8,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_scheme() -> Self {
+        Self {
+            kind: BearerTokenErrorKind::InvalidScheme,
+        }
+    }
+
+    #[must_use]
+    pub fn empty_token() -> Self {
+        Self {
+            kind: BearerTokenErrorKind::EmptyToken,
+        }
+    }
+}
+
+impl fmt::Display for BearerTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            BearerTokenErrorKind::MissingHeader => write!(f, "Missing Authorization header"),
+            BearerTokenErrorKind::InvalidUtf8 => write!(f, "Invalid Authorization header encoding"),
+            BearerTokenErrorKind::InvalidScheme => {
+                write!(f, "Authorization header must use Bearer scheme")
+            }
+            BearerTokenErrorKind::EmptyToken => write!(f, "Bearer token is empty"),
+        }
+    }
+}
+
+impl IntoResponse for BearerTokenError {
+    fn into_response(self) -> crate::response::Response {
+        use crate::response::{Response, ResponseBody, StatusCode};
+
+        // Match FastAPI's typical shape for auth failures: 401 + WWW-Authenticate.
+        let detail = match self.kind {
+            BearerTokenErrorKind::MissingHeader => "Not authenticated",
+            BearerTokenErrorKind::InvalidUtf8 => "Invalid authentication credentials",
+            BearerTokenErrorKind::InvalidScheme => "Invalid authentication credentials",
+            BearerTokenErrorKind::EmptyToken => "Invalid authentication credentials",
+        };
+
+        let body = serde_json::json!({ "detail": detail });
+        Response::with_status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", b"Bearer".to_vec())
+            .header("content-type", b"application/json".to_vec())
+            .body(ResponseBody::Bytes(body.to_string().into_bytes()))
+    }
+}
+
+impl FromRequest for BearerToken {
+    type Error = BearerTokenError;
+
+    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .ok_or_else(BearerTokenError::missing_header)?;
+
+        let auth_str =
+            std::str::from_utf8(auth_header).map_err(|_| BearerTokenError::invalid_utf8())?;
+
+        let mut parts = auth_str.split_whitespace();
+        let scheme = parts.next().ok_or_else(BearerTokenError::invalid_scheme)?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(BearerTokenError::invalid_scheme());
+        }
+
+        let token = parts.next().unwrap_or("").trim();
+        if token.is_empty() {
+            return Err(BearerTokenError::empty_token());
+        }
+
+        Ok(BearerToken::new(token.to_string()))
     }
 }
 
@@ -5101,6 +5471,12 @@ impl CookieName for CsrfToken {
     const NAME: &'static str = "csrf_token";
 }
 
+/// CSRF token cookie marker (compat alias used by some middleware/tests).
+pub struct CsrfTokenCookie;
+impl CookieName for CsrfTokenCookie {
+    const NAME: &'static str = "csrf_token";
+}
+
 // ============================================================================
 // Form Data Extractor
 // ============================================================================
@@ -5187,6 +5563,8 @@ pub enum FormExtractErrorKind {
     },
     /// Failed to read body.
     ReadError(String),
+    /// Body exceeds configured limit.
+    PayloadTooLarge { size: usize, limit: usize },
     /// Failed to deserialize.
     DeserializeError(String),
 }
@@ -5205,6 +5583,14 @@ impl FormExtractError {
     pub fn read_error(msg: impl Into<String>) -> Self {
         Self {
             kind: FormExtractErrorKind::ReadError(msg.into()),
+        }
+    }
+
+    /// Create a payload-too-large error.
+    #[must_use]
+    pub fn payload_too_large(size: usize, limit: usize) -> Self {
+        Self {
+            kind: FormExtractErrorKind::PayloadTooLarge { size, limit },
         }
     }
 
@@ -5237,6 +5623,12 @@ impl fmt::Display for FormExtractError {
             FormExtractErrorKind::ReadError(msg) => {
                 write!(f, "Failed to read form body: {}", msg)
             }
+            FormExtractErrorKind::PayloadTooLarge { size, limit } => {
+                write!(
+                    f,
+                    "Request body too large: {size} bytes exceeds {limit} byte limit"
+                )
+            }
             FormExtractErrorKind::DeserializeError(msg) => {
                 write!(f, "Failed to deserialize form data: {}", msg)
             }
@@ -5253,6 +5645,9 @@ impl IntoResponse for FormExtractError {
                 (StatusCode::UNSUPPORTED_MEDIA_TYPE, self.to_string())
             }
             FormExtractErrorKind::ReadError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            FormExtractErrorKind::PayloadTooLarge { .. } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, self.to_string())
+            }
             FormExtractErrorKind::DeserializeError(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, msg.clone())
             }
@@ -5318,7 +5713,7 @@ where
 {
     type Error = FormExtractError;
 
-    async fn from_request(_ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
+    async fn from_request(ctx: &RequestContext, req: &mut Request) -> Result<Self, Self::Error> {
         // Check content type
         let content_type = req
             .headers()
@@ -5339,7 +5734,15 @@ where
         }
 
         // Read body
-        let body = req.take_body().into_bytes();
+        let limit = DEFAULT_JSON_LIMIT;
+        let body = collect_body_limited(ctx, req.take_body(), limit)
+            .await
+            .map_err(|e| match e {
+                RequestBodyStreamError::TooLarge { received, .. } => {
+                    FormExtractError::payload_too_large(received, limit)
+                }
+                other => FormExtractError::read_error(other.to_string()),
+            })?;
         let body_str = std::str::from_utf8(&body)
             .map_err(|e| FormExtractError::read_error(format!("Invalid UTF-8: {}", e)))?;
 
@@ -5477,7 +5880,7 @@ pub enum ValidExtractError<E> {
     /// Inner extraction failed.
     Extract(E),
     /// Validation failed.
-    Validation(ValidationErrors),
+    Validation(Box<ValidationErrors>),
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for ValidExtractError<E> {
@@ -5493,7 +5896,7 @@ impl<E: std::error::Error + 'static> std::error::Error for ValidExtractError<E> 
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Extract(e) => Some(e),
-            Self::Validation(e) => Some(e),
+            Self::Validation(e) => Some(&**e),
         }
     }
 }
@@ -5502,7 +5905,7 @@ impl<E: IntoResponse> IntoResponse for ValidExtractError<E> {
     fn into_response(self) -> crate::response::Response {
         match self {
             Self::Extract(e) => e.into_response(),
-            Self::Validation(e) => e.into_response(),
+            Self::Validation(e) => (*e).into_response(),
         }
     }
 }
@@ -7458,21 +7861,21 @@ mod valid_tests {
 
     // Implement Validate for String (for testing purposes)
     impl Validate for String {
-        fn validate(&self) -> Result<(), ValidationErrors> {
+        fn validate(&self) -> Result<(), Box<ValidationErrors>> {
             if self.is_empty() {
                 let mut errors = ValidationErrors::new();
                 errors.push(crate::error::ValidationError::new(
                     crate::error::error_types::STRING_TOO_SHORT,
                     crate::error::loc::body(),
                 ));
-                Err(errors)
+                Err(Box::new(errors))
             } else if self.len() > 100 {
                 let mut errors = ValidationErrors::new();
                 errors.push(crate::error::ValidationError::new(
                     crate::error::error_types::STRING_TOO_LONG,
                     crate::error::loc::body(),
                 ));
-                Err(errors)
+                Err(Box::new(errors))
             } else {
                 Ok(())
             }
@@ -7561,7 +7964,7 @@ mod valid_tests {
         assert!(display.contains("Extraction failed"));
 
         let validation_err: ValidExtractError<HttpError> =
-            ValidExtractError::Validation(ValidationErrors::new());
+            ValidExtractError::Validation(Box::new(ValidationErrors::new()));
         let display = format!("{}", validation_err);
         assert!(display.contains("validation error"));
     }

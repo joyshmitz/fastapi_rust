@@ -34,7 +34,7 @@ impl TestFixture for CounterFixture {
     }
 
     fn teardown(&mut self) {
-        // In a real test, this would clean up database records, etc.
+        // Example: clean up any external resources here (DB rows, temp files, etc.).
         assert!(self.setup_count > 0, "Teardown called without setup");
     }
 }
@@ -47,7 +47,7 @@ struct UserFixture {
 
 impl TestFixture for UserFixture {
     fn setup() -> Self {
-        // In a real test, this would create a user in a test database
+        // Example: create a user in a test database here.
         UserFixture {
             user_id: 42,
             username: "test_user".to_string(),
@@ -55,7 +55,7 @@ impl TestFixture for UserFixture {
     }
 
     fn teardown(&mut self) {
-        // In a real test, this would delete the test user
+        // Example: delete the test user from the test database here.
     }
 }
 

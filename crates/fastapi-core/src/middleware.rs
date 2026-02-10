@@ -236,6 +236,24 @@ where
     }
 }
 
+/// Delegate `Handler` to an `Arc`-wrapped handler.
+///
+/// This is a convenience for building apps behind `Arc` (common in tests and when
+/// cloning shared handlers).
+impl<H: Handler + ?Sized> Handler for Arc<H> {
+    fn call<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        req: &'a mut Request,
+    ) -> BoxFuture<'a, Response> {
+        (**self).call(ctx, req)
+    }
+
+    fn dependency_overrides(&self) -> Option<Arc<DependencyOverrides>> {
+        (**self).dependency_overrides()
+    }
+}
+
 /// A stack of middleware that wraps a handler.
 ///
 /// The stack executes middleware in order:
@@ -1296,7 +1314,7 @@ fn body_len(body: &Body) -> usize {
     match body {
         Body::Empty => 0,
         Body::Bytes(bytes) => bytes.len(),
-        Body::Stream(_) => 0, // Length unknown for streaming bodies
+        Body::Stream { content_length, .. } => content_length.unwrap_or(0),
     }
 }
 
@@ -1313,7 +1331,7 @@ fn preview_body(body: &Body, max_bytes: usize) -> Option<String> {
                 Some(format_bytes(bytes, max_bytes))
             }
         }
-        Body::Stream(_) => None, // Cannot preview streaming body
+        Body::Stream { .. } => None,
     }
 }
 
@@ -2287,7 +2305,7 @@ impl CsrfMiddleware {
                 match (header_token, cookie_token) {
                     (Some(header), Some(cookie))
                         if !header.is_empty()
-                            && crate::extract::constant_time_eq(
+                            && crate::password::constant_time_eq(
                                 header.as_bytes(),
                                 cookie.as_bytes(),
                             ) =>
@@ -3898,7 +3916,7 @@ impl Middleware for RequestInspectionMiddleware {
                 let body_preview = match req.body() {
                     Body::Empty => None,
                     Body::Bytes(bytes) => self.format_body_preview(bytes, content_type),
-                    Body::Stream(_) => Some("<streaming body>".to_string()),
+                    Body::Stream { .. } => None,
                 };
 
                 let mut output = format!("{request_line}{headers}");
@@ -6177,16 +6195,18 @@ impl ResponseInterceptor for HeaderTransformInterceptor {
 
             // Handle renames first - get values of headers to rename
             for (old_name, new_name) in &rename_headers {
-                let header_value = resp
+                let values: Vec<Vec<u8>> = resp
                     .headers()
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(old_name))
-                    .map(|(_, v)| v.clone());
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(old_name))
+                    .map(|(_, v)| v.clone())
+                    .collect();
 
-                if let Some(value) = header_value {
-                    resp = resp.header(new_name, value);
-                    // Note: We can't remove the old header without rebuild
-                    // so we just add the new one
+                if !values.is_empty() {
+                    resp = resp.remove_header(old_name);
+                    for v in values {
+                        resp = resp.header(new_name, v);
+                    }
                 }
             }
 
@@ -6195,9 +6215,10 @@ impl ResponseInterceptor for HeaderTransformInterceptor {
                 resp = resp.header(name, value);
             }
 
-            // Note: Header removal would require Response to support remove_header
-            // For now, this is a no-op but documented as a limitation
-            let _ = remove_headers;
+            // Remove headers (case-insensitive) after renames/additions.
+            for name in &remove_headers {
+                resp = resp.remove_header(name);
+            }
 
             resp
         })

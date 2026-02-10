@@ -37,7 +37,7 @@ This section is a living, high-level parity view against the legacy FastAPI beha
 |---|---|---|---|
 | HTTP request parsing (HTTP/1.1) | `crates/fastapi-http/src/parser.rs` | Implemented | Focus: zero-copy parse; security hardening tests exist. |
 | Request body (Content-Length, chunked) | `crates/fastapi-http/src/body.rs` | Implemented | Async chunked stream now consumes trailers and avoids keep-alive read-ahead. |
-| TCP server + keep-alive | `crates/fastapi-http/src/server.rs` | Implemented | Built on `asupersync::net`; production hardening ongoing. |
+| TCP server + keep-alive | `crates/fastapi-http/src/server.rs` | Partial | Server exists and uses `asupersync::net`, but the end-to-end surface is still evolving and hardening. |
 | Routing + conflict detection | `crates/fastapi-core/src/routing.rs`, `crates/fastapi-router/src/trie.rs` | Implemented | Path params + converters supported; 405/OPTIONS behaviors present. |
 | App builder + request pipeline | `crates/fastapi-core/src/app.rs` | Implemented | Mounting, middleware execution, response mutations, background tasks integration. |
 | Extractors: Path/Query/Header/Cookie/Auth | `crates/fastapi-core/src/extract.rs`, `crates/fastapi-core/src/dependency.rs` | Implemented | Large extractor surface; verify edge-case parity in spec as matrix expands. |
@@ -50,6 +50,7 @@ This section is a living, high-level parity view against the legacy FastAPI beha
 | OpenAPI schema/spec types | `crates/fastapi-openapi/src/*` | Implemented | OpenAPI 3.1 types and `JsonSchema` trait exist. |
 | OpenAPI generation (from routes/handlers) | `crates/fastapi-core/src/app.rs` (`OpenApiConfig`) | Stub/Partial | App serves an OpenAPI endpoint, but generation is currently a minimal stub; needs real operation/schema mapping. |
 | Docs pages (Swagger/ReDoc shells) | `crates/fastapi-core/src/docs.rs` | Implemented | HTML shells exist; assets expected via CDN/static hosting. |
+| Docs endpoints wiring (routes) | `crates/fastapi-core/src/app.rs` (`enable_docs`) | Implemented | `.enable_docs(DocsConfig)` mounts `/docs`, `/redoc`, and `/docs/oauth2-redirect` (paths configurable). |
 | Testing harness | `crates/fastapi-core/src/testing.rs` | Implemented | In-process TestClient + assertions. |
 | WebSockets | N/A | Missing | Not implemented yet. |
 | HTTP/2 | N/A | Missing | Not implemented (out of scope until HTTP/1.1 parity is locked down). |
