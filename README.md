@@ -662,7 +662,8 @@ Current parity status and the concrete gap list are tracked in:
 - **TCP server integration/hardening**: `fastapi-http` has a server implementation, but the end-to-end
   surface is still evolving.
 - **WebSockets**: missing (`bd-z09e`).
-- **Multipart/form/file uploads**: missing (`bd-3ess`).
+- **Multipart/form-data + file uploads**: partially implemented (core parser + `MultipartForm` extractor).
+  Full FastAPI/Starlette `UploadFile` semantics (streaming/spooled tempfiles/async file API) are tracked in `bd-3ess`.
 - **HTTP/2**: missing (`bd-2c9t`).
 
 ### Non-Negotiables / Constraints

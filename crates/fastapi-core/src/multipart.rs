@@ -232,17 +232,19 @@ impl UploadFile {
 ///
 /// Content-Type format: `multipart/form-data; boundary=----WebKitFormBoundary...`
 pub fn parse_boundary(content_type: &str) -> Result<String, MultipartError> {
-    let ct_lower = content_type.to_ascii_lowercase();
-    if !ct_lower.starts_with("multipart/form-data") {
+    let content_type = content_type.trim();
+    let main = content_type.split(';').next().unwrap_or("").trim();
+    if !main.eq_ignore_ascii_case("multipart/form-data") {
         return Err(MultipartError::InvalidBoundary);
     }
 
-    for part in content_type.split(';') {
+    for part in content_type.split(';').skip(1) {
         let part = part.trim();
-        if let Some(boundary) = part
-            .strip_prefix("boundary=")
-            .or_else(|| part.strip_prefix("BOUNDARY="))
-        {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("boundary") {
+            let boundary = v.trim();
             let boundary = boundary.trim_matches('"').trim_matches('\'');
             if boundary.is_empty() {
                 return Err(MultipartError::InvalidBoundary);
@@ -358,9 +360,26 @@ impl MultipartParser {
 
         let end = data.len() - boundary_len + 1;
         for i in start..end {
-            if data[i..].starts_with(boundary) {
-                return Ok(i);
+            if !data[i..].starts_with(boundary) {
+                continue;
             }
+
+            // Boundaries must occur at the start of the body or at the start of a CRLF-delimited
+            // line, and must be followed by either CRLF (next part) or `--` (final boundary).
+            if i != 0 && (i < 2 || data[i - 2..i] != *b"\r\n") {
+                continue;
+            }
+
+            let boundary_end = i + boundary_len;
+            if boundary_end + 2 > data.len() {
+                return Err(MultipartError::UnexpectedEof);
+            }
+            let suffix = &data[boundary_end..boundary_end + 2];
+            if suffix != b"\r\n" && suffix != b"--" {
+                continue;
+            }
+
+            return Ok(i);
         }
 
         Err(MultipartError::UnexpectedEof)
@@ -576,6 +595,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_boundary_case_insensitive_param_name() {
+        let ct = r#"multipart/form-data; Boundary="simple-boundary""#;
+        let boundary = parse_boundary(ct).unwrap();
+        assert_eq!(boundary, "simple-boundary");
+    }
+
+    #[test]
     fn test_parse_boundary_missing() {
         let ct = "multipart/form-data";
         let result = parse_boundary(ct);
@@ -695,5 +721,29 @@ mod tests {
         let f = form.get_file("avatar").unwrap();
         assert_eq!(f.filename, "photo.jpg");
         assert_eq!(f.content_type, "image/jpeg");
+    }
+
+    #[test]
+    fn test_boundary_like_sequence_in_part_body_does_not_terminate_part() {
+        // Ensure we do not treat an in-body "------boundaryX" as a boundary delimiter.
+        let boundary = "----boundary";
+        let body = concat!(
+            "------boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"data.bin\"\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "\r\n",
+            "line1\r\n",
+            "------boundaryX\r\n",
+            "line2\r\n",
+            "------boundary--\r\n"
+        );
+
+        let parser = MultipartParser::new(boundary, MultipartConfig::default());
+        let parts = parser.parse(body.as_bytes()).unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].name, "file");
+        assert!(parts[0].is_file());
+        assert_eq!(parts[0].data, b"line1\r\n------boundaryX\r\nline2".to_vec());
     }
 }

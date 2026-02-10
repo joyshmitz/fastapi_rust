@@ -194,8 +194,9 @@ impl FromRequest for multipart::MultipartForm {
             return Err(MultipartExtractError::UnsupportedMediaType { actual: None });
         };
 
-        let ct_lower = ct.to_ascii_lowercase();
-        if !ct_lower.starts_with("multipart/form-data") {
+        let ct = ct.trim();
+        let main = ct.split(';').next().unwrap_or("").trim();
+        if !main.eq_ignore_ascii_case("multipart/form-data") {
             return Err(MultipartExtractError::UnsupportedMediaType {
                 actual: Some(ct.to_string()),
             });
