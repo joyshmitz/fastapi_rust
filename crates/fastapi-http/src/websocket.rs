@@ -24,7 +24,8 @@
 //!                 ws.send_text(&text).await.unwrap();
 //!             }
 //!             Ok(Message::Close(_, _)) | Err(_) => break,
-//!             _ => {}
+//!             Ok(Message::Binary(_)) => {}
+//!             Ok(Message::Ping(_) | Message::Pong(_)) => unreachable!(),
 //!         }
 //!     }
 //! }
@@ -458,9 +459,15 @@ pub fn validate_upgrade_request(
     let key = find_header("sec-websocket-key").ok_or_else(|| {
         WebSocketError::HandshakeFailed("missing Sec-WebSocket-Key header".into())
     })?;
-    if key.trim().is_empty() {
+    let key = key.trim();
+    if key.is_empty() {
         return Err(WebSocketError::HandshakeFailed(
             "Sec-WebSocket-Key must not be empty".into(),
+        ));
+    }
+    if fastapi_core::websocket_accept_from_key(key).is_err() {
+        return Err(WebSocketError::HandshakeFailed(
+            "invalid Sec-WebSocket-Key (must be valid base64 with 16 decoded bytes)".into(),
         ));
     }
 
@@ -474,7 +481,7 @@ pub fn validate_upgrade_request(
         )));
     }
 
-    Ok(key)
+    Ok(key.to_string())
 }
 
 /// Build the HTTP 101 Switching Protocols response bytes for a WebSocket upgrade.
@@ -522,6 +529,12 @@ async fn read_frame(
     let opcode = Opcode::from_u8(header[0])?;
     let masked = (header[1] & 0x80) != 0;
     let payload_len_byte = header[1] & 0x7F;
+
+    if !masked {
+        return Err(WebSocketError::Protocol(
+            "client-to-server frames must be masked".into(),
+        ));
+    }
 
     // Determine actual payload length
     let payload_len: usize = match payload_len_byte {
@@ -655,8 +668,11 @@ async fn read_message(
                     let (code, reason) = parse_close_payload(&frame.payload);
                     return Ok(Message::Close(code, reason));
                 }
-                Opcode::Ping => return Ok(Message::Ping(frame.payload)),
-                Opcode::Pong => return Ok(Message::Pong(frame.payload)),
+                Opcode::Ping => {
+                    write_frame(stream, true, Opcode::Pong, &frame.payload).await?;
+                    continue;
+                }
+                Opcode::Pong => continue,
                 _ => unreachable!(),
             }
         }
@@ -781,11 +797,10 @@ enum WsState {
 ///             Message::Text(text) => {
 ///                 ws.send_text(&format!("echo: {text}")).await.unwrap();
 ///             }
-///             Message::Ping(data) => {
-///                 ws.pong(&data).await.unwrap();
-///             }
+///             Message::Binary(_data) => {}
+///             // receive() auto-replies to ping and does not surface pong.
+///             Message::Ping(_) | Message::Pong(_) => unreachable!(),
 ///             Message::Close(_, _) => break,
-///             _ => {}
 ///         }
 ///     }
 ///     ws.close(CloseCode::Normal, None).await.ok();
@@ -855,28 +870,21 @@ impl WebSocket {
     /// violation occurs.
     pub async fn receive(&mut self) -> Result<Message, WebSocketError> {
         self.ensure_open()?;
-
-        loop {
-            let msg = read_message(&mut self.stream, &self.config).await?;
-            match msg {
-                Message::Ping(ref data) => {
-                    // Auto-reply with pong
-                    write_frame(&mut self.stream, true, Opcode::Pong, data).await?;
+        let msg = read_message(&mut self.stream, &self.config).await?;
+        match msg {
+            Message::Close(code, reason) => {
+                // If we haven't sent close yet, echo it back
+                if self.state == WsState::Open {
+                    let close_code = code.unwrap_or(CloseCode::Normal);
+                    let payload = build_close_payload(close_code, reason.as_deref());
+                    write_frame(&mut self.stream, true, Opcode::Close, &payload)
+                        .await
+                        .ok(); // Best-effort
                 }
-                Message::Close(code, reason) => {
-                    // If we haven't sent close yet, echo it back
-                    if self.state == WsState::Open {
-                        let close_code = code.unwrap_or(CloseCode::Normal);
-                        let payload = build_close_payload(close_code, reason.as_deref());
-                        write_frame(&mut self.stream, true, Opcode::Close, &payload)
-                            .await
-                            .ok(); // Best-effort
-                    }
-                    self.state = WsState::Closed;
-                    return Ok(Message::Close(code, reason));
-                }
-                _ => return Ok(msg),
+                self.state = WsState::Closed;
+                Ok(Message::Close(code, reason))
             }
+            _ => Ok(msg),
         }
     }
 
@@ -1215,6 +1223,28 @@ mod tests {
                 b"dGhlIHNhbXBsZSBub25jZQ==".to_vec(),
             ),
             ("Sec-WebSocket-Version".into(), b"8".to_vec()),
+        ];
+        assert!(validate_upgrade_request("GET", &headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_upgrade_request_invalid_key_base64() {
+        let headers = vec![
+            ("Upgrade".into(), b"websocket".to_vec()),
+            ("Connection".into(), b"upgrade".to_vec()),
+            ("Sec-WebSocket-Key".into(), b"not-base64".to_vec()),
+            ("Sec-WebSocket-Version".into(), b"13".to_vec()),
+        ];
+        assert!(validate_upgrade_request("GET", &headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_upgrade_request_invalid_key_length() {
+        let headers = vec![
+            ("Upgrade".into(), b"websocket".to_vec()),
+            ("Connection".into(), b"upgrade".to_vec()),
+            ("Sec-WebSocket-Key".into(), b"Zm9v".to_vec()),
+            ("Sec-WebSocket-Version".into(), b"13".to_vec()),
         ];
         assert!(validate_upgrade_request("GET", &headers).is_err());
     }

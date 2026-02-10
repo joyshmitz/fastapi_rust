@@ -18,6 +18,7 @@ use std::task::Poll;
 
 /// The GUID used for computing `Sec-WebSocket-Accept`.
 pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_TEXT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// WebSocket handshake error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,12 +263,28 @@ impl WebSocket {
     /// - `Close` frames are replied to with a `Close` echo and return `Ok(None)`.
     /// - Any non-text data frame returns a protocol error (fragmentation is not supported yet).
     pub async fn read_text_or_close(&mut self) -> Result<Option<String>, WebSocketError> {
+        let mut text_fragments: Vec<u8> = Vec::new();
+        let mut collecting_text_fragments = false;
+
         loop {
             let frame = self.read_frame().await?;
             match frame.opcode {
                 OpCode::Text => {
-                    let s = std::str::from_utf8(&frame.payload)?;
-                    return Ok(Some(s.to_string()));
+                    if collecting_text_fragments {
+                        return Err(WebSocketError::Protocol(
+                            "new text frame before fragmented text completed",
+                        ));
+                    }
+                    if frame.fin {
+                        let s = std::str::from_utf8(&frame.payload)?;
+                        return Ok(Some(s.to_string()));
+                    }
+
+                    if frame.payload.len() > MAX_TEXT_MESSAGE_BYTES {
+                        return Err(WebSocketError::Protocol("text message too large"));
+                    }
+                    text_fragments.extend_from_slice(&frame.payload);
+                    collecting_text_fragments = true;
                 }
                 OpCode::Ping => {
                     self.send_pong(&frame.payload).await?;
@@ -283,11 +300,26 @@ impl WebSocket {
                     let _ = self.write_frame(&close).await;
                     return Ok(None);
                 }
-                OpCode::Binary => return Err(WebSocketError::Protocol("expected text frame")),
-                OpCode::Continuation => {
+                OpCode::Binary => {
                     return Err(WebSocketError::Protocol(
-                        "unexpected continuation frame (fragmentation not supported)",
+                        "expected text frame, got binary frame",
                     ));
+                }
+                OpCode::Continuation => {
+                    if !collecting_text_fragments {
+                        return Err(WebSocketError::Protocol("unexpected continuation frame"));
+                    }
+
+                    let next_size = text_fragments.len().saturating_add(frame.payload.len());
+                    if next_size > MAX_TEXT_MESSAGE_BYTES {
+                        return Err(WebSocketError::Protocol("text message too large"));
+                    }
+                    text_fragments.extend_from_slice(&frame.payload);
+
+                    if frame.fin {
+                        let s = std::str::from_utf8(&text_fragments)?;
+                        return Ok(Some(s.to_string()));
+                    }
                 }
             }
         }
@@ -446,7 +478,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
-    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut idx = 0;
     while idx + 3 <= data.len() {
         let b0 = u32::from(data[idx]);
@@ -454,10 +486,10 @@ fn base64_encode(data: &[u8]) -> String {
         let b2 = u32::from(data[idx + 2]);
         let word24 = (b0 << 16) | (b1 << 8) | b2;
 
-        out.push(B64[((word24 >> 18) & 0x3f) as usize]);
-        out.push(B64[((word24 >> 12) & 0x3f) as usize]);
-        out.push(B64[((word24 >> 6) & 0x3f) as usize]);
-        out.push(B64[(word24 & 0x3f) as usize]);
+        out.push(B64[((word24 >> 18) & 0x3f) as usize] as char);
+        out.push(B64[((word24 >> 12) & 0x3f) as usize] as char);
+        out.push(B64[((word24 >> 6) & 0x3f) as usize] as char);
+        out.push(B64[(word24 & 0x3f) as usize] as char);
         idx += 3;
     }
 
@@ -465,22 +497,21 @@ fn base64_encode(data: &[u8]) -> String {
     if rem == 1 {
         let b0 = u32::from(data[idx]);
         let word24 = b0 << 16;
-        out.push(B64[((word24 >> 18) & 0x3f) as usize]);
-        out.push(B64[((word24 >> 12) & 0x3f) as usize]);
-        out.push(b'=');
-        out.push(b'=');
+        out.push(B64[((word24 >> 18) & 0x3f) as usize] as char);
+        out.push(B64[((word24 >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
     } else if rem == 2 {
         let b0 = u32::from(data[idx]);
         let b1 = u32::from(data[idx + 1]);
         let word24 = (b0 << 16) | (b1 << 8);
-        out.push(B64[((word24 >> 18) & 0x3f) as usize]);
-        out.push(B64[((word24 >> 12) & 0x3f) as usize]);
-        out.push(B64[((word24 >> 6) & 0x3f) as usize]);
-        out.push(b'=');
+        out.push(B64[((word24 >> 18) & 0x3f) as usize] as char);
+        out.push(B64[((word24 >> 12) & 0x3f) as usize] as char);
+        out.push(B64[((word24 >> 6) & 0x3f) as usize] as char);
+        out.push('=');
     }
 
-    // ASCII-only; safe unwrap.
-    String::from_utf8(out).unwrap()
+    out
 }
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
