@@ -20,7 +20,7 @@ mod path_generation {
 
     #[test]
     fn static_path_generates_correct_path_item() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users")
+        let route = Route::new(Method::Get, "/users")
             .operation_id("list_users")
             .summary("List all users");
 
@@ -39,8 +39,8 @@ mod path_generation {
 
     #[test]
     fn path_with_string_parameter() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users/{username}")
-            .operation_id("get_user_by_username");
+        let route =
+            Route::new(Method::Get, "/users/{username}").operation_id("get_user_by_username");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -57,8 +57,7 @@ mod path_generation {
 
     #[test]
     fn path_with_integer_parameter() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users/{id:int}")
-            .operation_id("get_user_by_id");
+        let route = Route::new(Method::Get, "/users/{id:int}").operation_id("get_user_by_id");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -76,8 +75,7 @@ mod path_generation {
 
     #[test]
     fn path_with_uuid_parameter() {
-        let route = Route::with_placeholder_handler(Method::Get, "/items/{item_id:uuid}")
-            .operation_id("get_item");
+        let route = Route::new(Method::Get, "/items/{item_id:uuid}").operation_id("get_item");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -91,11 +89,8 @@ mod path_generation {
 
     #[test]
     fn path_with_multiple_parameters() {
-        let route = Route::with_placeholder_handler(
-            Method::Get,
-            "/users/{user_id:int}/posts/{post_id:int}",
-        )
-        .operation_id("get_user_post");
+        let route = Route::new(Method::Get, "/users/{user_id:int}/posts/{post_id:int}")
+            .operation_id("get_user_post");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -113,8 +108,7 @@ mod path_generation {
 
     #[test]
     fn wildcard_path_parameter() {
-        let route = Route::with_placeholder_handler(Method::Get, "/files/{*filepath}")
-            .operation_id("get_file");
+        let route = Route::new(Method::Get, "/files/{*filepath}").operation_id("get_file");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -131,14 +125,11 @@ mod path_generation {
 
     #[test]
     fn multiple_methods_on_same_path() {
-        let get_route =
-            Route::with_placeholder_handler(Method::Get, "/items").operation_id("list_items");
-        let post_route =
-            Route::with_placeholder_handler(Method::Post, "/items").operation_id("create_item");
-        let put_route = Route::with_placeholder_handler(Method::Put, "/items/{id:int}")
-            .operation_id("update_item");
-        let delete_route = Route::with_placeholder_handler(Method::Delete, "/items/{id:int}")
-            .operation_id("delete_item");
+        let get_route = Route::new(Method::Get, "/items").operation_id("list_items");
+        let post_route = Route::new(Method::Post, "/items").operation_id("create_item");
+        let put_route = Route::new(Method::Put, "/items/{id:int}").operation_id("update_item");
+        let delete_route =
+            Route::new(Method::Delete, "/items/{id:int}").operation_id("delete_item");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_routes(&[get_route, post_route, put_route, delete_route]);
@@ -249,7 +240,7 @@ mod request_body {
 
     #[test]
     fn route_with_json_request_body() {
-        let route = Route::with_placeholder_handler(Method::Post, "/users")
+        let route = Route::new(Method::Post, "/users")
             .operation_id("create_user")
             .request_body("CreateUserRequest", "application/json", true);
 
@@ -269,7 +260,7 @@ mod request_body {
 
     #[test]
     fn route_with_form_request_body() {
-        let route = Route::with_placeholder_handler(Method::Post, "/upload")
+        let route = Route::new(Method::Post, "/upload")
             .operation_id("upload_file")
             .request_body("FileUpload", "multipart/form-data", true);
 
@@ -285,7 +276,7 @@ mod request_body {
 
     #[test]
     fn route_with_optional_request_body() {
-        let route = Route::with_placeholder_handler(Method::Patch, "/users/{id:int}")
+        let route = Route::new(Method::Patch, "/users/{id:int}")
             .operation_id("update_user")
             .request_body("UpdateUserRequest", "application/json", false);
 
@@ -301,8 +292,7 @@ mod request_body {
 
     #[test]
     fn route_without_request_body() {
-        let route =
-            Route::with_placeholder_handler(Method::Get, "/users").operation_id("list_users");
+        let route = Route::new(Method::Get, "/users").operation_id("list_users");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -322,8 +312,7 @@ mod responses {
 
     #[test]
     fn default_200_response_is_added() {
-        let route =
-            Route::with_placeholder_handler(Method::Get, "/health").operation_id("health_check");
+        let route = Route::new(Method::Get, "/health").operation_id("health_check");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -344,7 +333,7 @@ mod metadata {
 
     #[test]
     fn route_tags_are_preserved() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users")
+        let route = Route::new(Method::Get, "/users")
             .operation_id("list_users")
             .tag("users")
             .tag("admin");
@@ -360,7 +349,7 @@ mod metadata {
 
     #[test]
     fn deprecated_flag_is_preserved() {
-        let route = Route::with_placeholder_handler(Method::Get, "/v1/users")
+        let route = Route::new(Method::Get, "/v1/users")
             .operation_id("list_users_v1")
             .deprecated();
 
@@ -374,7 +363,7 @@ mod metadata {
 
     #[test]
     fn empty_operation_id_becomes_none() {
-        let route = Route::with_placeholder_handler(Method::Get, "/test").operation_id("");
+        let route = Route::new(Method::Get, "/test").operation_id("");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -413,7 +402,7 @@ mod serialization {
 
     #[test]
     fn openapi_document_serializes_to_valid_json() {
-        let route = Route::with_placeholder_handler(Method::Get, "/users/{id:int}")
+        let route = Route::new(Method::Get, "/users/{id:int}")
             .operation_id("get_user")
             .summary("Get a user by ID")
             .description("Returns a single user")
@@ -439,7 +428,7 @@ mod serialization {
 
     #[test]
     fn operation_uses_camel_case_for_openapi_compliance() {
-        let route = Route::with_placeholder_handler(Method::Post, "/users")
+        let route = Route::new(Method::Post, "/users")
             .operation_id("create_user")
             .request_body("CreateUser", "application/json", true);
 
@@ -469,8 +458,7 @@ mod serialization {
 
     #[test]
     fn false_deprecated_is_omitted() {
-        let route =
-            Route::with_placeholder_handler(Method::Get, "/test").operation_id("test_endpoint");
+        let route = Route::new(Method::Get, "/test").operation_id("test_endpoint");
 
         let mut builder = OpenApiBuilder::new("Test API", "1.0.0");
         builder.add_route(&route);
@@ -490,25 +478,25 @@ mod serialization {
 fn full_api_document_generation() {
     // Create routes for a simple CRUD API
     let routes = vec![
-        Route::with_placeholder_handler(Method::Get, "/users")
+        Route::new(Method::Get, "/users")
             .operation_id("list_users")
             .summary("List all users")
             .tag("users"),
-        Route::with_placeholder_handler(Method::Post, "/users")
+        Route::new(Method::Post, "/users")
             .operation_id("create_user")
             .summary("Create a new user")
             .tag("users")
             .request_body("CreateUserRequest", "application/json", true),
-        Route::with_placeholder_handler(Method::Get, "/users/{id:int}")
+        Route::new(Method::Get, "/users/{id:int}")
             .operation_id("get_user")
             .summary("Get a user by ID")
             .tag("users"),
-        Route::with_placeholder_handler(Method::Put, "/users/{id:int}")
+        Route::new(Method::Put, "/users/{id:int}")
             .operation_id("update_user")
             .summary("Update a user")
             .tag("users")
             .request_body("UpdateUserRequest", "application/json", true),
-        Route::with_placeholder_handler(Method::Delete, "/users/{id:int}")
+        Route::new(Method::Delete, "/users/{id:int}")
             .operation_id("delete_user")
             .summary("Delete a user")
             .tag("users"),

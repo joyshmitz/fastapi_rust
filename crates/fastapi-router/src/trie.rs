@@ -788,11 +788,11 @@ impl Route {
     /// use fastapi_types::Method;
     ///
     /// // Route requires bearer token authentication
-    /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
+    /// let route = Route::new(Method::Get, "/protected")
     ///     .security("bearer", vec![]);
     ///
     /// // Route requires OAuth2 with specific scopes
-    /// let route = Route::with_placeholder_handler(Method::Post, "/users")
+    /// let route = Route::new(Method::Post, "/users")
     ///     .security("oauth2", vec!["write:users"]);
     /// ```
     #[must_use]
@@ -816,7 +816,7 @@ impl Route {
     /// use fastapi_router::Route;
     /// use fastapi_types::Method;
     ///
-    /// let route = Route::with_placeholder_handler(Method::Get, "/protected")
+    /// let route = Route::new(Method::Get, "/protected")
     ///     .security_scheme("api_key");
     /// ```
     #[must_use]
@@ -842,7 +842,7 @@ impl Route {
     /// use fastapi_router::Route;
     /// use fastapi_types::Method;
     ///
-    /// let route = Route::with_placeholder_handler(Method::Get, "/users/{id}")
+    /// let route = Route::new(Method::Get, "/users/{id}")
     ///     .response(200, "User", "User found")
     ///     .response(404, "ErrorResponse", "User not found");
     /// ```
