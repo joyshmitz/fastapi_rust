@@ -202,6 +202,11 @@ pub struct RouteEntry {
     pub method: Method,
     /// The path pattern for this route.
     pub path: String,
+    /// Optional router/OpenAPI metadata for this route.
+    ///
+    /// When routes are created by proc-macros, we preserve a full `fastapi_router::Route`
+    /// so OpenAPI generation can use stable operation IDs, tags, parameters, etc.
+    meta: Option<fastapi_router::Route>,
     /// The handler function.
     handler: Arc<BoxHandler>,
 }
@@ -224,8 +229,30 @@ impl RouteEntry {
         Self {
             method,
             path: path.into(),
+            meta: None,
             handler: Arc::new(handler),
         }
+    }
+
+    /// Creates a new route entry from a `fastapi_router::Route` metadata object.
+    ///
+    /// This is the preferred constructor for proc-macro generated routes, since it preserves
+    /// OpenAPI metadata (operation_id, tags, request body, etc).
+    pub fn from_route<H, Fut>(route: fastapi_router::Route, handler: H) -> Self
+    where
+        H: Fn(&RequestContext, &mut Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        let method = route.method;
+        let path = route.path.clone();
+        let mut entry = Self::new(method, path, handler);
+        entry.meta = Some(route);
+        entry
+    }
+
+    /// Returns the preserved route metadata, if any.
+    pub fn route_meta(&self) -> Option<&fastapi_router::Route> {
+        self.meta.as_ref()
     }
 
     /// Calls the handler with the given context and request.
@@ -239,6 +266,7 @@ impl std::fmt::Debug for RouteEntry {
         f.debug_struct("RouteEntry")
             .field("method", &self.method)
             .field("path", &self.path)
+            .field("meta", &self.meta.as_ref().map(|r| r.operation_id.as_str()))
             .finish_non_exhaustive()
     }
 }
@@ -1093,6 +1121,7 @@ impl AppBuilder {
     ///
     /// Panics if any routes conflict (same method + structurally identical path pattern).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn build(mut self) -> App {
         // Generate OpenAPI spec if configured
         let (openapi_spec, openapi_path) = if let Some(ref openapi_config) = self.openapi_config {
@@ -1189,7 +1218,10 @@ impl AppBuilder {
         // Build the trie-based router from registered routes
         let mut router = Router::new();
         for entry in &self.routes {
-            let route = Route::new(entry.method, &entry.path);
+            let route = entry
+                .route_meta()
+                .cloned()
+                .unwrap_or_else(|| Route::new(entry.method, &entry.path));
             router
                 .add(route)
                 .expect("route conflict during App::build()");
@@ -1234,6 +1266,11 @@ impl AppBuilder {
 
         // Add operations for each registered route
         for entry in &self.routes {
+            if let Some(route) = entry.route_meta() {
+                builder.add_route(route);
+                continue;
+            }
+
             // Create a basic operation with default response
             let mut responses = HashMap::new();
             responses.insert(

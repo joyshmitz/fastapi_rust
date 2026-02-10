@@ -500,6 +500,7 @@ impl RouteSecurityRequirement {
 ///
 /// let route = Route::new(Method::Get, "/users/{id}");
 /// ```
+#[derive(Clone)]
 pub struct Route {
     /// Route path pattern (e.g., "/users/{id}").
     pub path: String,

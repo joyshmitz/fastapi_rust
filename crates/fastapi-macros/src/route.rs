@@ -766,17 +766,14 @@ pub fn route_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenSt
                 v.into_response()
             }
 
-            fastapi_core::RouteEntry::new(
-                fastapi_core::Method::#method_ident,
-                #path_str,
-                |ctx, req| {
-                    Box::pin(async move {
-                        #(#arg_extracts)*
-                        let out = #call_handler;
-                        __into_response(out)
-                    }) as fastapi_core::BoxFuture<'_, fastapi_core::Response>
-                },
-            )
+            let __route = #route_fn_name();
+            fastapi_core::RouteEntry::from_route(__route, |ctx, req| {
+                Box::pin(async move {
+                    #(#arg_extracts)*
+                    let out = #call_handler;
+                    __into_response(out)
+                }) as fastapi_core::BoxFuture<'_, fastapi_core::Response>
+            })
         }
 
         // Static registration for route discovery

@@ -48,7 +48,7 @@ This section is a living, high-level parity view against the legacy FastAPI beha
 | Background tasks | `crates/fastapi-core/src/extract.rs` (BackgroundTasks) | Implemented | Server executes tasks after response in `crates/fastapi-http/src/server.rs`. |
 | Security primitives | `crates/fastapi-core/src/extract.rs` | Partial | Credential extractors exist; token validation logic is app-specific. |
 | OpenAPI schema/spec types | `crates/fastapi-openapi/src/*` | Implemented | OpenAPI 3.1 types and `JsonSchema` trait exist. |
-| OpenAPI generation (from routes/handlers) | `crates/fastapi-core/src/app.rs` (`OpenApiConfig`) | Stub/Partial | App serves an OpenAPI endpoint, but generation is currently a minimal stub; needs real operation/schema mapping. |
+| OpenAPI generation (from routes/handlers) | `crates/fastapi-core/src/app.rs` (`OpenApiConfig`) | Partial | `RouteEntry` now preserves `fastapi_router::Route` metadata for macro-generated routes, and OpenAPI generation uses that metadata when present; still missing full handler/type-to-schema mapping. |
 | Docs pages (Swagger/ReDoc shells) | `crates/fastapi-core/src/docs.rs` | Implemented | HTML shells exist; assets expected via CDN/static hosting. |
 | Docs endpoints wiring (routes) | `crates/fastapi-core/src/app.rs` (`enable_docs`) | Implemented | `.enable_docs(DocsConfig)` mounts `/docs`, `/redoc`, and `/docs/oauth2-redirect` (paths configurable). |
 | Testing harness | `crates/fastapi-core/src/testing.rs` | Implemented | In-process TestClient + assertions. |
