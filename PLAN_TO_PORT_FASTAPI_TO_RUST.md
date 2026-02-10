@@ -8,11 +8,11 @@
 
 **Source:** FastAPI v0.128.0 (~32K lines Python)
 
-**Target:** Native Rust library built directly on Tokio/Hyper with custom routing, zero-copy parsing, and compile-time code generation.
+**Target:** Native Rust library built on **asupersync** (structured concurrency) with a custom HTTP stack, custom routing, zero-copy parsing, and compile-time code generation.
 
 ## Design Philosophy: ULTRA OPTIMIZED
 
-1. **Minimal dependencies** — Only what we absolutely need (tokio, hyper, serde)
+1. **Minimal dependencies** — Only what we absolutely need (`asupersync`, `serde`, `serde_json`)
 2. **Zero-copy where possible** — Parse directly from request buffers
 3. **No runtime reflection** — Everything resolved at compile time via proc macros
 4. **Custom router** — Trie-based routing optimized for our use case
@@ -61,56 +61,14 @@ FastAPI (extends Starlette)
 
 ---
 
-## EXPLICIT EXCLUSIONS
+## Deliberate Differences (Rust vs Python)
 
-These features will NOT be ported:
+These are *implementation-level* differences from Python FastAPI that preserve user-facing behavior where possible:
 
-### 1. Python Runtime Introspection
-- Type hint analysis at runtime (`inspect.signature`, `get_type_hints`)
-- Forward reference resolution
-- **Rust alternative:** Procedural macros analyze types at compile time
-
-### 2. Pydantic-Specific Integration
-- Pydantic v1/v2 compatibility layers
-- `ModelField` wrapper classes
-- Pydantic-based JSON Schema generation
-- **Rust alternative:** `serde` for serialization, `validator`/`garde` for validation, `schemars` for JSON Schema
-
-### 3. Backward Compatibility
-- Deprecated parameter aliases (`regex` → `pattern`, `example` → `examples`)
-- Pydantic v1 migration helpers
-- Legacy OpenAPI 3.0 support (target 3.1 only)
-
-### 4. Built-in Documentation UIs
-- Bundled Swagger UI HTML/JS
-- Bundled ReDoc HTML/JS
-- **Rust alternative:** Serve static assets from CDN or separate crate
-
-### 5. CLI Tooling
-- `fastapi dev` / `fastapi run` commands
-- Cloud deployment integration
-- **Rust alternative:** Separate binary crate if needed
-
-### 6. TestClient
-- HTTPX-based test client
-- **Rust alternative:** Use `axum::test` or `tower::ServiceExt`
-
-### 7. Multipart Form Handling
-- python-multipart integration
-- **Rust alternative:** `multer` crate (already in Axum ecosystem)
-
-### 8. Background Tasks (Initial Phase)
-- `BackgroundTasks` with Starlette's task queue
-- **Rust alternative:** Tokio spawn, or defer to Phase 2
-
-### 9. WebSocket Support (Initial Phase)
-- WebSocket routing and handling
-- **Rust alternative:** Axum's WebSocket extractor, defer to Phase 2
-
-### 10. Middleware Stack
-- ASGI middleware chain
-- `BaseHTTPMiddleware` wrapper
-- **Rust alternative:** Tower middleware (`tower::Layer`)
+1. **No runtime reflection**: Python uses runtime inspection; Rust uses proc-macros and explicit traits.
+2. **No Starlette/Pydantic dependency**: We implement the relevant behaviors directly.
+3. **No Tokio/Hyper/Tower/Axum**: The runtime is **asupersync** and the HTTP stack is custom for control over allocations and cancel-correctness.
+4. **Docs UI assets**: We can serve Swagger/ReDoc HTML shells, but do not bundle full UI assets in-repo (prefer CDN/static hosting).
 
 ---
 

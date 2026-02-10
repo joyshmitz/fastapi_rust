@@ -10,6 +10,7 @@
 
 ## Table of Contents
 
+0. [Parity Matrix (As Of 2026-02-10)](#0-parity-matrix-as-of-2026-02-10)
 1. [Design Principles](#1-design-principles)
 2. [Asupersync Integration](#2-asupersync-integration)
 3. [Crate Structure](#3-crate-structure)
@@ -24,6 +25,40 @@
 12. [Application Builder](#12-application-builder)
 
 ---
+
+## 0. Parity Matrix (As Of 2026-02-10)
+
+This section is a living, high-level parity view against the legacy FastAPI behaviors described in `EXISTING_FASTAPI_STRUCTURE.md`. It is intended to answer two questions quickly:
+
+- What is implemented today, and where is it in the Rust codebase?
+- What are the highest-impact gaps to close next for FastAPI parity?
+
+| Subsystem | Rust Location(s) | Status | Notes / Gaps |
+|---|---|---|---|
+| HTTP request parsing (HTTP/1.1) | `crates/fastapi-http/src/parser.rs` | Implemented | Focus: zero-copy parse; security hardening tests exist. |
+| Request body (Content-Length, chunked) | `crates/fastapi-http/src/body.rs` | Implemented | Async chunked stream now consumes trailers and avoids keep-alive read-ahead. |
+| TCP server + keep-alive | `crates/fastapi-http/src/server.rs` | Implemented | Built on `asupersync::net`; production hardening ongoing. |
+| Routing + conflict detection | `crates/fastapi-core/src/routing.rs`, `crates/fastapi-router/src/trie.rs` | Implemented | Path params + converters supported; 405/OPTIONS behaviors present. |
+| App builder + request pipeline | `crates/fastapi-core/src/app.rs` | Implemented | Mounting, middleware execution, response mutations, background tasks integration. |
+| Extractors: Path/Query/Header/Cookie/Auth | `crates/fastapi-core/src/extract.rs`, `crates/fastapi-core/src/dependency.rs` | Implemented | Large extractor surface; verify edge-case parity in spec as matrix expands. |
+| Dependency injection | `crates/fastapi-core/src/dependency.rs` | Implemented | Type-based `Depends<T>` with caching/overrides/scopes; differs from Python callable-based dependency declaration. |
+| Validation errors (422 format) | `crates/fastapi-core/src/error.rs` | Implemented | JSON shape is designed to be FastAPI-compatible; keep expanding exact rule coverage vs spec. |
+| Validation derive | `crates/fastapi-core/src/validation.rs`, `crates/fastapi-macros/src/validate.rs` | Partial | Core plumbing exists; rule coverage is not yet a full FastAPI/Pydantic parity set. |
+| Responses (JSON/HTML/files) | `crates/fastapi-core/src/response.rs` | Partial | Core response types exist; advanced streaming/file semantics may need more parity work. |
+| Background tasks | `crates/fastapi-core/src/extract.rs` (BackgroundTasks) | Implemented | Server executes tasks after response in `crates/fastapi-http/src/server.rs`. |
+| Security primitives | `crates/fastapi-core/src/extract.rs` | Partial | Credential extractors exist; token validation logic is app-specific. |
+| OpenAPI schema/spec types | `crates/fastapi-openapi/src/*` | Implemented | OpenAPI 3.1 types and `JsonSchema` trait exist. |
+| OpenAPI generation (from routes/handlers) | `crates/fastapi-core/src/app.rs` (`OpenApiConfig`) | Stub/Partial | App serves an OpenAPI endpoint, but generation is currently a minimal stub; needs real operation/schema mapping. |
+| Docs pages (Swagger/ReDoc shells) | `crates/fastapi-core/src/docs.rs` | Implemented | HTML shells exist; assets expected via CDN/static hosting. |
+| Testing harness | `crates/fastapi-core/src/testing.rs` | Implemented | In-process TestClient + assertions. |
+| WebSockets | N/A | Missing | Not implemented yet. |
+| HTTP/2 | N/A | Missing | Not implemented (out of scope until HTTP/1.1 parity is locked down). |
+
+**Highest-leverage gaps (parity):**
+
+- OpenAPI generation: map handlers/extractors/types to operations/schemas (remove stub behavior).
+- Validation rules: expand `Validate` derive + runtime validation to match spec exactly.
+- Security: flesh out auth flows and error semantics to match legacy FastAPI expectations.
 
 ## 1. Design Principles
 
