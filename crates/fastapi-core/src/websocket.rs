@@ -176,6 +176,12 @@ impl WebSocket {
         let b1 = header[1];
 
         let fin = (b0 & 0x80) != 0;
+        let rsv = (b0 >> 4) & 0x07;
+        if rsv != 0 {
+            return Err(WebSocketError::Protocol(
+                "reserved bits must be 0 (no extensions negotiated)",
+            ));
+        }
         let opcode =
             OpCode::from_u8(b0 & 0x0f).ok_or(WebSocketError::Protocol("invalid opcode"))?;
         let masked = (b1 & 0x80) != 0;
@@ -261,7 +267,7 @@ impl WebSocket {
     /// - `Ping` frames are answered with `Pong` (same payload) and ignored.
     /// - `Pong` frames are ignored.
     /// - `Close` frames are replied to with a `Close` echo and return `Ok(None)`.
-    /// - Any non-text data frame returns a protocol error (fragmentation is not supported yet).
+    /// - Any non-text data frame returns a protocol error.
     pub async fn read_text_or_close(&mut self) -> Result<Option<String>, WebSocketError> {
         let mut text_fragments: Vec<u8> = Vec::new();
         let mut collecting_text_fragments = false;

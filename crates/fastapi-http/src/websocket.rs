@@ -250,7 +250,13 @@ pub enum CloseCode {
     MandatoryExtension,
     /// Internal server error (1011).
     InternalError,
-    /// Application-defined code in the 4000-4999 range.
+    /// Service restart (1012).
+    ServiceRestart,
+    /// Try again later (1013).
+    TryAgainLater,
+    /// Bad gateway (1014).
+    BadGateway,
+    /// Application-defined or registered code in the 3000-4999 range.
     Application(u16),
 }
 
@@ -269,6 +275,9 @@ impl CloseCode {
             Self::MessageTooBig => 1009,
             Self::MandatoryExtension => 1010,
             Self::InternalError => 1011,
+            Self::ServiceRestart => 1012,
+            Self::TryAgainLater => 1013,
+            Self::BadGateway => 1014,
             Self::Application(code) => code,
         }
     }
@@ -287,7 +296,10 @@ impl CloseCode {
             1009 => Self::MessageTooBig,
             1010 => Self::MandatoryExtension,
             1011 => Self::InternalError,
-            4000..=4999 => Self::Application(code),
+            1012 => Self::ServiceRestart,
+            1013 => Self::TryAgainLater,
+            1014 => Self::BadGateway,
+            3000..=4999 => Self::Application(code),
             _ => Self::ProtocolError,
         }
     }
@@ -665,7 +677,7 @@ async fn read_message(
         if frame.opcode.is_control() {
             match frame.opcode {
                 Opcode::Close => {
-                    let (code, reason) = parse_close_payload(&frame.payload);
+                    let (code, reason) = parse_close_payload(&frame.payload)?;
                     return Ok(Message::Close(code, reason));
                 }
                 Opcode::Ping => {
@@ -727,35 +739,64 @@ async fn read_message(
 }
 
 /// Parse a close frame payload into (code, reason).
-fn parse_close_payload(payload: &[u8]) -> (Option<CloseCode>, Option<String>) {
+fn parse_close_payload(
+    payload: &[u8],
+) -> Result<(Option<CloseCode>, Option<String>), WebSocketError> {
     if payload.len() < 2 {
-        return (None, None);
+        if payload.is_empty() {
+            return Ok((None, None));
+        }
+        return Err(WebSocketError::Protocol(
+            "close frame payload must be empty or at least 2 bytes".into(),
+        ));
     }
     let code_raw = u16::from_be_bytes([payload[0], payload[1]]);
+    if !is_valid_close_code(code_raw) {
+        return Err(WebSocketError::Protocol(format!(
+            "invalid close code in close frame: {code_raw}"
+        )));
+    }
     let code = CloseCode::from_u16(code_raw);
     let reason = if payload.len() > 2 {
-        String::from_utf8(payload[2..].to_vec()).ok()
+        Some(
+            std::str::from_utf8(&payload[2..])
+                .map_err(|_| WebSocketError::Protocol("close reason must be valid UTF-8".into()))?
+                .to_string(),
+        )
     } else {
         None
     };
-    (Some(code), reason)
+    Ok((Some(code), reason))
 }
 
 /// Build a close frame payload from code and reason.
-fn build_close_payload(code: CloseCode, reason: Option<&str>) -> Vec<u8> {
+fn build_close_payload(code: CloseCode, reason: Option<&str>) -> Result<Vec<u8>, WebSocketError> {
+    if !is_valid_close_code(code.to_u16()) {
+        return Err(WebSocketError::Protocol(format!(
+            "invalid close code for close frame: {}",
+            code.to_u16()
+        )));
+    }
     let mut payload = Vec::with_capacity(2 + reason.map_or(0, str::len));
     payload.extend_from_slice(&code.to_u16().to_be_bytes());
     if let Some(reason_str) = reason {
         // Truncate reason to fit in 125 bytes total
         let max_reason = 123; // 125 - 2 bytes for code
-        let truncated = if reason_str.len() > max_reason {
-            &reason_str[..max_reason]
-        } else {
-            reason_str
-        };
-        payload.extend_from_slice(truncated.as_bytes());
+        let mut end = reason_str.len().min(max_reason);
+        while end > 0 && !reason_str.is_char_boundary(end) {
+            end -= 1;
+        }
+        payload.extend_from_slice(&reason_str.as_bytes()[..end]);
     }
-    payload
+    Ok(payload)
+}
+
+fn is_valid_close_code(code: u16) -> bool {
+    matches!(
+        code,
+        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 1012 | 1013 | 1014 | 3000
+            ..=4999
+    )
 }
 
 // ============================================================================
@@ -875,8 +916,10 @@ impl WebSocket {
             Message::Close(code, reason) => {
                 // If we haven't sent close yet, echo it back
                 if self.state == WsState::Open {
-                    let close_code = code.unwrap_or(CloseCode::Normal);
-                    let payload = build_close_payload(close_code, reason.as_deref());
+                    let payload = match code {
+                        Some(close_code) => build_close_payload(close_code, reason.as_deref())?,
+                        None => Vec::new(),
+                    };
                     write_frame(&mut self.stream, true, Opcode::Close, &payload)
                         .await
                         .ok(); // Best-effort
@@ -971,7 +1014,7 @@ impl WebSocket {
             return Ok(());
         }
 
-        let payload = build_close_payload(code, reason);
+        let payload = build_close_payload(code, reason)?;
         write_frame(&mut self.stream, true, Opcode::Close, &payload).await?;
         self.state = WsState::CloseSent;
         Ok(())
@@ -1113,6 +1156,10 @@ mod tests {
             CloseCode::MessageTooBig,
             CloseCode::MandatoryExtension,
             CloseCode::InternalError,
+            CloseCode::ServiceRestart,
+            CloseCode::TryAgainLater,
+            CloseCode::BadGateway,
+            CloseCode::Application(3000),
             CloseCode::Application(4000),
             CloseCode::Application(4999),
         ];
@@ -1251,25 +1298,54 @@ mod tests {
 
     #[test]
     fn test_close_payload_roundtrip() {
-        let payload = build_close_payload(CloseCode::Normal, Some("goodbye"));
-        let (code, reason) = parse_close_payload(&payload);
+        let payload = build_close_payload(CloseCode::Normal, Some("goodbye")).unwrap();
+        let (code, reason) = parse_close_payload(&payload).unwrap();
         assert_eq!(code, Some(CloseCode::Normal));
         assert_eq!(reason, Some("goodbye".into()));
     }
 
     #[test]
     fn test_close_payload_no_reason() {
-        let payload = build_close_payload(CloseCode::GoingAway, None);
-        let (code, reason) = parse_close_payload(&payload);
+        let payload = build_close_payload(CloseCode::GoingAway, None).unwrap();
+        let (code, reason) = parse_close_payload(&payload).unwrap();
         assert_eq!(code, Some(CloseCode::GoingAway));
         assert_eq!(reason, None);
     }
 
     #[test]
     fn test_close_payload_empty() {
-        let (code, reason) = parse_close_payload(&[]);
+        let (code, reason) = parse_close_payload(&[]).unwrap();
         assert_eq!(code, None);
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn test_close_payload_len_one_is_invalid() {
+        let err = parse_close_payload(&[0x03]).expect_err("len=1 close payload must fail");
+        assert!(matches!(err, WebSocketError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_close_payload_invalid_code_is_rejected() {
+        let err = parse_close_payload(&[0x03, 0xEE]).expect_err("1006 must be rejected");
+        assert!(matches!(err, WebSocketError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_build_close_payload_rejects_unsendable_code() {
+        let err = build_close_payload(CloseCode::NoStatusReceived, None)
+            .expect_err("1005 must not be sent");
+        assert!(matches!(err, WebSocketError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_build_close_payload_truncates_on_utf8_boundary() {
+        let reason = "é".repeat(100); // 200 bytes UTF-8.
+        let payload = build_close_payload(CloseCode::Normal, Some(&reason)).unwrap();
+        assert!(payload.len() <= 125);
+        let parsed =
+            std::str::from_utf8(&payload[2..]).expect("reason bytes must stay valid UTF-8");
+        assert!(!parsed.is_empty());
     }
 
     #[test]
