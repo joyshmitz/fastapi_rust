@@ -615,8 +615,8 @@ fn header_str<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-fn connection_has_token(req: &Request, token: &str) -> bool {
-    let Some(v) = header_str(req, "connection") else {
+fn header_has_token(req: &Request, name: &str, token: &str) -> bool {
+    let Some(v) = header_str(req, name) else {
         return false;
     };
     v.split(',')
@@ -624,12 +624,15 @@ fn connection_has_token(req: &Request, token: &str) -> bool {
         .any(|t| t.eq_ignore_ascii_case(token))
 }
 
+fn connection_has_token(req: &Request, token: &str) -> bool {
+    header_has_token(req, "connection", token)
+}
+
 fn is_websocket_upgrade_request(req: &Request) -> bool {
     if req.method() != Method::Get {
         return false;
     }
-    let upgrade = header_str(req, "upgrade").unwrap_or("");
-    if !upgrade.eq_ignore_ascii_case("websocket") {
+    if !header_has_token(req, "upgrade", "websocket") {
         return false;
     }
     connection_has_token(req, "upgrade")
@@ -3655,6 +3658,49 @@ mod tests {
             .insert("Host".to_string(), b"bad host".to_vec());
         let err = validate_host_header(&request, &config).unwrap_err();
         assert_eq!(err.kind, HostValidationErrorKind::Invalid);
+    }
+
+    // ========================================================================
+    // WebSocket upgrade request detection tests
+    // ========================================================================
+
+    #[test]
+    fn websocket_upgrade_detection_accepts_token_lists_case_insensitive() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/ws");
+        request
+            .headers_mut()
+            .insert("Upgrade".to_string(), b"h2c, WebSocket".to_vec());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"keep-alive, UPGRADE".to_vec());
+
+        assert!(is_websocket_upgrade_request(&request));
+    }
+
+    #[test]
+    fn websocket_upgrade_detection_rejects_missing_connection_upgrade_token() {
+        let mut request = Request::new(fastapi_core::Method::Get, "/ws");
+        request
+            .headers_mut()
+            .insert("Upgrade".to_string(), b"websocket".to_vec());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"keep-alive".to_vec());
+
+        assert!(!is_websocket_upgrade_request(&request));
+    }
+
+    #[test]
+    fn websocket_upgrade_detection_rejects_non_get_method() {
+        let mut request = Request::new(fastapi_core::Method::Post, "/ws");
+        request
+            .headers_mut()
+            .insert("Upgrade".to_string(), b"websocket".to_vec());
+        request
+            .headers_mut()
+            .insert("Connection".to_string(), b"upgrade".to_vec());
+
+        assert!(!is_websocket_upgrade_request(&request));
     }
 
     // ========================================================================
