@@ -78,21 +78,47 @@ async fn parse_multipart_limited(
     body: Body,
     limit: usize,
     parser: &multipart::MultipartParser,
-) -> Result<Vec<multipart::Part>, RequestBodyStreamError> {
+) -> Result<Vec<multipart::Part>, MultipartExtractError> {
+    fn map_parser_error(err: multipart::MultipartError) -> MultipartExtractError {
+        match err {
+            multipart::MultipartError::FileTooLarge { size, max }
+            | multipart::MultipartError::TotalTooLarge { size, max } => {
+                MultipartExtractError::PayloadTooLarge { size, limit: max }
+            }
+            multipart::MultipartError::Io { detail } => {
+                MultipartExtractError::ReadError { message: detail }
+            }
+            other => MultipartExtractError::BadRequest {
+                message: other.to_string(),
+            },
+        }
+    }
+
+    fn map_stream_error(err: RequestBodyStreamError) -> MultipartExtractError {
+        match err {
+            RequestBodyStreamError::TooLarge { received, max } => {
+                MultipartExtractError::PayloadTooLarge {
+                    size: received,
+                    limit: max,
+                }
+            }
+            RequestBodyStreamError::ConnectionClosed => MultipartExtractError::BadRequest {
+                message: RequestBodyStreamError::ConnectionClosed.to_string(),
+            },
+            RequestBodyStreamError::Io(message) => MultipartExtractError::ReadError { message },
+        }
+    }
+
     match body {
-        Body::Empty => parser
-            .parse(&[])
-            .map_err(|e| RequestBodyStreamError::Io(e.to_string())),
+        Body::Empty => parser.parse(&[]).map_err(map_parser_error),
         Body::Bytes(bytes) => {
             if bytes.len() > limit {
-                return Err(RequestBodyStreamError::TooLarge {
-                    received: bytes.len(),
-                    max: limit,
+                return Err(MultipartExtractError::PayloadTooLarge {
+                    size: bytes.len(),
+                    limit,
                 });
             }
-            parser
-                .parse(&bytes)
-                .map_err(|e| RequestBodyStreamError::Io(e.to_string()))
+            parser.parse(&bytes).map_err(map_parser_error)
         }
         Body::Stream {
             stream,
@@ -102,10 +128,7 @@ async fn parse_multipart_limited(
 
             if let Some(n) = content_length {
                 if n > limit {
-                    return Err(RequestBodyStreamError::TooLarge {
-                        received: n,
-                        max: limit,
-                    });
+                    return Err(MultipartExtractError::PayloadTooLarge { size: n, limit });
                 }
             }
 
@@ -121,31 +144,30 @@ async fn parse_multipart_limited(
                 let Some(chunk) = next else {
                     break;
                 };
-                let chunk = chunk?;
+                let chunk = chunk.map_err(map_stream_error)?;
 
                 seen = seen.saturating_add(chunk.len());
                 if seen > limit {
-                    return Err(RequestBodyStreamError::TooLarge {
-                        received: seen,
-                        max: limit,
-                    });
+                    return Err(MultipartExtractError::PayloadTooLarge { size: seen, limit });
                 }
 
                 buffer.extend_from_slice(&chunk);
                 let mut newly_parsed = parser
                     .parse_incremental(&mut buffer, &mut state, false)
-                    .map_err(|e| RequestBodyStreamError::Io(e.to_string()))?;
+                    .map_err(map_parser_error)?;
                 parts.append(&mut newly_parsed);
                 let _ = ctx.checkpoint();
             }
 
             let mut tail = parser
                 .parse_incremental(&mut buffer, &mut state, true)
-                .map_err(|e| RequestBodyStreamError::Io(e.to_string()))?;
+                .map_err(map_parser_error)?;
             parts.append(&mut tail);
 
             if !state.is_done() {
-                return Err(RequestBodyStreamError::ConnectionClosed);
+                return Err(MultipartExtractError::BadRequest {
+                    message: RequestBodyStreamError::ConnectionClosed.to_string(),
+                });
             }
 
             Ok(parts)
@@ -291,19 +313,7 @@ impl FromRequest for multipart::MultipartForm {
         let limit = multipart_config.get_max_total_size();
         let spool_threshold = multipart_config.get_spool_threshold();
         let parser = multipart::MultipartParser::new(&boundary, multipart_config);
-        let parts = parse_multipart_limited(ctx, req.take_body(), limit, &parser)
-            .await
-            .map_err(|e| match e {
-                RequestBodyStreamError::TooLarge { received, .. } => {
-                    MultipartExtractError::PayloadTooLarge {
-                        size: received,
-                        limit,
-                    }
-                }
-                other => MultipartExtractError::ReadError {
-                    message: other.to_string(),
-                },
-            })?;
+        let parts = parse_multipart_limited(ctx, req.take_body(), limit, &parser).await?;
 
         Ok(multipart::MultipartForm::from_parts_with_spool_threshold(
             parts,
@@ -428,6 +438,39 @@ mod multipart_extractor_tests {
             file.bytes().expect("read upload bytes"),
             b"Hello stream".to_vec()
         );
+    }
+
+    #[test]
+    fn multipart_extract_file_too_large_maps_to_payload_too_large() {
+        let ctx = test_context();
+        let boundary = "----boundary";
+        let oversized = vec![b'a'; multipart::DEFAULT_MAX_FILE_SIZE + 1];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&oversized);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let mut req = Request::new(Method::Post, "/upload");
+        req.headers_mut().insert(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}").into_bytes(),
+        );
+        req.set_body(Body::Bytes(body));
+
+        let err =
+            futures_executor::block_on(multipart::MultipartForm::from_request(&ctx, &mut req))
+                .unwrap_err();
+        assert!(matches!(err, MultipartExtractError::PayloadTooLarge { .. }));
+        if let MultipartExtractError::PayloadTooLarge { size, limit } = err {
+            assert!(size > limit);
+            assert_eq!(limit, multipart::DEFAULT_MAX_FILE_SIZE);
+        }
     }
 }
 
