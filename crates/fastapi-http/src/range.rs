@@ -334,7 +334,10 @@ fn normalize_ranges(ranges: &mut Vec<ByteRange>) {
 #[must_use]
 pub fn supports_ranges(accept_ranges: Option<&str>) -> bool {
     match accept_ranges {
-        Some(value) => !value.eq_ignore_ascii_case("none"),
+        Some(value) => value
+            .split(',')
+            .map(str::trim)
+            .any(|unit| unit.eq_ignore_ascii_case("bytes")),
         None => false,
     }
 }
@@ -705,8 +708,12 @@ mod tests {
     fn test_supports_ranges() {
         assert!(supports_ranges(Some("bytes")));
         assert!(supports_ranges(Some("Bytes")));
+        assert!(supports_ranges(Some("bytes, other")));
         assert!(!supports_ranges(Some("none")));
         assert!(!supports_ranges(Some("None")));
+        assert!(!supports_ranges(Some("items")));
+        assert!(!supports_ranges(Some("")));
+        assert!(!supports_ranges(Some("   ")));
         assert!(!supports_ranges(None));
     }
 
