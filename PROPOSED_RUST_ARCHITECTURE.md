@@ -53,7 +53,7 @@ This section is a living, high-level parity view against the legacy FastAPI beha
 | Docs pages (Swagger/ReDoc shells) | `crates/fastapi-core/src/docs.rs` | Implemented | HTML shells exist; assets expected via CDN/static hosting. |
 | Docs endpoints wiring (routes) | `crates/fastapi-core/src/app.rs` (`enable_docs`) | Implemented | `.enable_docs(DocsConfig)` mounts `/docs`, `/redoc`, and `/docs/oauth2-redirect` (paths configurable). |
 | Testing harness | `crates/fastapi-core/src/testing.rs` | Implemented | In-process TestClient + assertions. |
-| WebSockets | N/A | Missing | Tracked as `bd-z09e`. |
+| WebSockets | `crates/fastapi-core/src/websocket.rs`, `crates/fastapi-http/tests/websocket.rs` | Partial | Upgrade + frame parsing + ping/pong + close-handshake hardening are implemented with E2E coverage. Remaining parity tracked in `bd-z09e` (full FastAPI/Starlette surface and edge-case semantics). |
 | HTTP/2 | N/A | Missing | Tracked as `bd-2c9t`. |
 
 **Highest-leverage gaps (parity):**
