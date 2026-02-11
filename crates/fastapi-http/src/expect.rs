@@ -124,11 +124,24 @@ impl ExpectHandler {
         match request.headers().get("expect") {
             None => ExpectResult::NoExpectation,
             Some(value) => {
-                let value_str = std::str::from_utf8(value)
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .unwrap_or_default();
+                let value_str = match std::str::from_utf8(value) {
+                    Ok(s) => s.trim().to_ascii_lowercase(),
+                    Err(_) => return ExpectResult::UnknownExpectation(String::new()),
+                };
 
-                if value_str == EXPECT_100_CONTINUE {
+                let mut saw_continue = false;
+                for token in value_str.split(',').map(str::trim) {
+                    if token.is_empty() {
+                        return ExpectResult::UnknownExpectation(value_str);
+                    }
+                    if token == EXPECT_100_CONTINUE {
+                        saw_continue = true;
+                    } else {
+                        return ExpectResult::UnknownExpectation(value_str);
+                    }
+                }
+
+                if saw_continue {
                     ExpectResult::ExpectsContinue
                 } else {
                     ExpectResult::UnknownExpectation(value_str)
@@ -432,11 +445,21 @@ mod tests {
     }
 
     #[test]
+    fn check_expect_100_continue_token_list() {
+        let req = request_with_expect("100-continue, 100-continue");
+        assert!(matches!(
+            ExpectHandler::check_expect(&req),
+            ExpectResult::ExpectsContinue
+        ));
+    }
+
+    #[test]
     fn check_expect_unknown() {
         let req = request_with_expect("something-else");
-        match ExpectHandler::check_expect(&req) {
-            ExpectResult::UnknownExpectation(val) => assert_eq!(val, "something-else"),
-            _ => panic!("Expected UnknownExpectation"),
+        let result = ExpectHandler::check_expect(&req);
+        assert!(matches!(result, ExpectResult::UnknownExpectation(_)));
+        if let ExpectResult::UnknownExpectation(val) = result {
+            assert_eq!(val, "something-else");
         }
     }
 
@@ -447,6 +470,26 @@ mod tests {
 
         let req_no = Request::new(Method::Get, "/");
         assert!(!ExpectHandler::expects_continue(&req_no));
+    }
+
+    #[test]
+    fn check_expect_mixed_token_list_is_unknown() {
+        let req = request_with_expect("100-continue, custom");
+        let result = ExpectHandler::check_expect(&req);
+        assert!(matches!(result, ExpectResult::UnknownExpectation(_)));
+        if let ExpectResult::UnknownExpectation(val) = result {
+            assert_eq!(val, "100-continue, custom");
+        }
+    }
+
+    #[test]
+    fn check_expect_empty_token_is_unknown() {
+        let req = request_with_expect("100-continue,");
+        let result = ExpectHandler::check_expect(&req);
+        assert!(matches!(result, ExpectResult::UnknownExpectation(_)));
+        if let ExpectResult::UnknownExpectation(val) = result {
+            assert_eq!(val, "100-continue,");
+        }
     }
 
     #[test]
