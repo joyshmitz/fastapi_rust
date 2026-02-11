@@ -656,14 +656,15 @@ Current parity status and the concrete gap list are tracked in:
 - `PROPOSED_RUST_ARCHITECTURE.md` (Section 0: Parity Matrix)
 - Beads (`br ready`, `br show <id>`) with the top-level epic `bd-uz2s`
 
-### Known Gaps (As Of 2026-02-10)
+### Known Gaps (As Of 2026-02-11)
 
 - **OpenAPI generation**: currently minimal; needs real operation/schema mapping from route metadata.
 - **TCP server integration/hardening**: `fastapi-http` has a server implementation, but the end-to-end
   surface is still evolving.
 - **WebSockets**: partial (handshake + basic frames). Full FastAPI/Starlette parity is tracked in `bd-z09e`.
-- **Multipart/form-data + file uploads**: partially implemented (core parser + `MultipartForm` extractor).
-  Full FastAPI/Starlette `UploadFile` semantics (streaming/spooled tempfiles/async file API) are tracked in `bd-3ess`.
+- **Multipart/form-data + file uploads**: parser + `MultipartForm` extractor + incremental streamed-body parsing +
+  streamed-part incremental flushing + `UploadFile` async API (`read`/`write`/`seek`/`close`) + temp-file spooling are implemented.
+  Remaining parity work is focused on end-to-end file streaming semantics that avoid final full `Part` materialization for very large uploads, tracked in `bd-3ess`.
 - **HTTP/2**: missing (`bd-2c9t`).
 
 ### Non-Negotiables / Constraints
