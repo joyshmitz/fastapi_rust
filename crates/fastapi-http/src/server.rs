@@ -954,9 +954,13 @@ where
                             }
                             http2::FrameType::Settings
                             | http2::FrameType::Ping
-                            | http2::FrameType::Goaway => {
+                            | http2::FrameType::Goaway
+                            | http2::FrameType::WindowUpdate => {
                                 if f.header.frame_type() == http2::FrameType::Goaway {
                                     return Ok(());
+                                }
+                                if f.header.frame_type() == http2::FrameType::WindowUpdate {
+                                    validate_window_update_payload(&f.payload)?;
                                 }
                                 if f.header.frame_type() == http2::FrameType::Ping {
                                     if f.header.stream_id != 0 || f.payload.len() != 8 {
@@ -2444,12 +2448,16 @@ impl TcpServer {
                                 }
                                 http2::FrameType::Settings
                                 | http2::FrameType::Ping
-                                | http2::FrameType::Goaway => {
+                                | http2::FrameType::Goaway
+                                | http2::FrameType::WindowUpdate => {
                                     // Re-process control frames by pushing back through the top-level loop.
                                     // For minimal correctness, handle them inline here.
                                     // SETTINGS/PING were already validated above; just dispatch quickly.
                                     if f.header.frame_type() == http2::FrameType::Goaway {
                                         return Ok(());
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::WindowUpdate {
+                                        validate_window_update_payload(&f.payload)?;
                                     }
                                     if f.header.frame_type() == http2::FrameType::Ping {
                                         if f.header.stream_id != 0 || f.payload.len() != 8 {
@@ -2843,9 +2851,13 @@ impl TcpServer {
                                 }
                                 http2::FrameType::Settings
                                 | http2::FrameType::Ping
-                                | http2::FrameType::Goaway => {
+                                | http2::FrameType::Goaway
+                                | http2::FrameType::WindowUpdate => {
                                     if f.header.frame_type() == http2::FrameType::Goaway {
                                         return Ok(());
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::WindowUpdate {
+                                        validate_window_update_payload(&f.payload)?;
                                     }
                                     if f.header.frame_type() == http2::FrameType::Ping {
                                         if f.header.stream_id != 0 || f.payload.len() != 8 {
@@ -3377,6 +3389,24 @@ fn apply_http2_settings(
     Ok(())
 }
 
+fn validate_window_update_payload(payload: &[u8]) -> Result<(), http2::Http2Error> {
+    if payload.len() != 4 {
+        return Err(http2::Http2Error::Protocol(
+            "WINDOW_UPDATE payload must be 4 bytes",
+        ));
+    }
+
+    let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let increment = raw & 0x7FFF_FFFF;
+    if increment == 0 {
+        return Err(http2::Http2Error::Protocol(
+            "WINDOW_UPDATE increment must be non-zero",
+        ));
+    }
+
+    Ok(())
+}
+
 fn extract_header_block_fragment(
     flags: u8,
     payload: &[u8],
@@ -3681,6 +3711,31 @@ mod tests {
         let request = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let result = server.parse_request(request);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn window_update_payload_validation_accepts_non_zero_increment() {
+        let payload = 1u32.to_be_bytes();
+        assert!(validate_window_update_payload(&payload).is_ok());
+    }
+
+    #[test]
+    fn window_update_payload_validation_rejects_bad_length() {
+        let err = validate_window_update_payload(&[0, 0, 0]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WINDOW_UPDATE payload must be 4 bytes")
+        );
+    }
+
+    #[test]
+    fn window_update_payload_validation_rejects_zero_increment() {
+        let payload = 0u32.to_be_bytes();
+        let err = validate_window_update_payload(&payload).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WINDOW_UPDATE increment must be non-zero")
+        );
     }
 
     // ========================================================================
