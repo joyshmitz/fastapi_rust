@@ -663,8 +663,8 @@ Current parity status and the concrete gap list are tracked in:
   surface is still evolving.
 - **WebSockets**: partial (handshake + basic frames). Full FastAPI/Starlette parity is tracked in `bd-z09e`.
 - **Multipart/form-data + file uploads**: parser + `MultipartForm` extractor + incremental streamed-body parsing +
-  streamed-part incremental flushing + `UploadFile` async API (`read`/`write`/`seek`/`close`) + temp-file spooling are implemented.
-  Remaining parity work is focused on end-to-end file streaming semantics that avoid final full `Part` materialization for very large uploads, tracked in `bd-3ess`.
+  streamed-part incremental flushing + spool-backed file parts + `UploadFile` async API (`read`/`write`/`seek`/`close`) are implemented.
+  Remaining parity work in `bd-3ess` is mainly API-surface refinement around fully streamed consumption paths and broader behavior parity edge cases.
 - **HTTP/2**: missing (`bd-2c9t`).
 
 ### Non-Negotiables / Constraints
