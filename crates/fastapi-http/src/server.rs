@@ -952,6 +952,54 @@ where
                                     break;
                                 }
                             }
+                            http2::FrameType::Settings
+                            | http2::FrameType::Ping
+                            | http2::FrameType::Goaway => {
+                                if f.header.frame_type() == http2::FrameType::Goaway {
+                                    return Ok(());
+                                }
+                                if f.header.frame_type() == http2::FrameType::Ping {
+                                    if f.header.stream_id != 0 || f.payload.len() != 8 {
+                                        return Err(http2::Http2Error::Protocol(
+                                            "invalid PING frame",
+                                        )
+                                        .into());
+                                    }
+                                    if (f.header.flags & FLAG_ACK) == 0 {
+                                        framed
+                                            .write_frame(
+                                                http2::FrameType::Ping,
+                                                FLAG_ACK,
+                                                0,
+                                                &f.payload,
+                                            )
+                                            .await?;
+                                    }
+                                }
+                                if f.header.frame_type() == http2::FrameType::Settings {
+                                    if f.header.stream_id != 0 {
+                                        return Err(http2::Http2Error::Protocol(
+                                            "SETTINGS must be on stream 0",
+                                        )
+                                        .into());
+                                    }
+                                    if (f.header.flags & FLAG_ACK) == 0 {
+                                        apply_http2_settings(
+                                            &mut hpack,
+                                            &mut max_frame_size,
+                                            &f.payload,
+                                        )?;
+                                        framed
+                                            .write_frame(
+                                                http2::FrameType::Settings,
+                                                FLAG_ACK,
+                                                0,
+                                                &[],
+                                            )
+                                            .await?;
+                                    }
+                                }
+                            }
                             _ => {
                                 return Err(http2::Http2Error::Protocol(
                                     "unsupported frame while reading request body",
@@ -2791,6 +2839,58 @@ impl TcpServer {
                                     body.extend_from_slice(data);
                                     if data_end_stream {
                                         break;
+                                    }
+                                }
+                                http2::FrameType::Settings
+                                | http2::FrameType::Ping
+                                | http2::FrameType::Goaway => {
+                                    if f.header.frame_type() == http2::FrameType::Goaway {
+                                        return Ok(());
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::Ping {
+                                        if f.header.stream_id != 0 || f.payload.len() != 8 {
+                                            return Err(http2::Http2Error::Protocol(
+                                                "invalid PING frame",
+                                            )
+                                            .into());
+                                        }
+                                        if (f.header.flags & FLAG_ACK) == 0 {
+                                            framed
+                                                .write_frame(
+                                                    http2::FrameType::Ping,
+                                                    FLAG_ACK,
+                                                    0,
+                                                    &f.payload,
+                                                )
+                                                .await?;
+                                            self.record_bytes_out(
+                                                (http2::FrameHeader::LEN + 8) as u64,
+                                            );
+                                        }
+                                    }
+                                    if f.header.frame_type() == http2::FrameType::Settings {
+                                        if f.header.stream_id != 0 {
+                                            return Err(http2::Http2Error::Protocol(
+                                                "SETTINGS must be on stream 0",
+                                            )
+                                            .into());
+                                        }
+                                        if (f.header.flags & FLAG_ACK) == 0 {
+                                            apply_http2_settings(
+                                                &mut hpack,
+                                                &mut max_frame_size,
+                                                &f.payload,
+                                            )?;
+                                            framed
+                                                .write_frame(
+                                                    http2::FrameType::Settings,
+                                                    FLAG_ACK,
+                                                    0,
+                                                    &[],
+                                                )
+                                                .await?;
+                                            self.record_bytes_out(http2::FrameHeader::LEN as u64);
+                                        }
                                     }
                                 }
                                 _ => {

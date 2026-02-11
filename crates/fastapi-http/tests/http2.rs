@@ -76,6 +76,77 @@ fn spawn_server(app: App) -> (Arc<TcpServer>, SocketAddr, std::thread::JoinHandl
     (server, addr, server_thread)
 }
 
+fn spawn_server_handler(
+    handler: &Arc<dyn fastapi_core::Handler>,
+) -> (Arc<TcpServer>, SocketAddr, std::thread::JoinHandle<()>) {
+    let server = Arc::new(TcpServer::new(ServerConfig::new("127.0.0.1:0")));
+    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+
+    let server_thread = {
+        let server = Arc::clone(&server);
+        let handler = Arc::clone(handler);
+        std::thread::spawn(move || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("test runtime must build");
+            rt.block_on(async move {
+                let cx = asupersync::Cx::for_testing();
+                let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind must succeed");
+                let local_addr = listener.local_addr().expect("local_addr must work");
+                addr_tx.send(local_addr).expect("addr send must succeed");
+
+                let _ = server.serve_on_handler(&cx, listener, handler).await;
+            });
+        })
+    };
+
+    let addr = addr_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must report addr");
+
+    (server, addr, server_thread)
+}
+
+fn spawn_server_closure() -> (Arc<TcpServer>, SocketAddr, std::thread::JoinHandle<()>) {
+    let server = Arc::new(TcpServer::new(ServerConfig::new("127.0.0.1:0")));
+    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+
+    let server_thread = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("test runtime must build");
+            rt.block_on(async move {
+                let cx = asupersync::Cx::for_testing();
+                let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind must succeed");
+                let local_addr = listener.local_addr().expect("local_addr must work");
+                addr_tx.send(local_addr).expect("addr send must succeed");
+
+                let _ = server
+                    .serve_on(
+                        &cx,
+                        listener,
+                        |_ctx: RequestContext, _req: &mut Request| async move {
+                            Response::ok().body(ResponseBody::Bytes(b"closure-path-ok".to_vec()))
+                        },
+                    )
+                    .await;
+            });
+        })
+    };
+
+    let addr = addr_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must report addr");
+
+    (server, addr, server_thread)
+}
+
 fn read_settings_handshake(stream: &mut TcpStream) {
     let mut saw_settings = false;
     let mut saw_ack = false;
@@ -186,6 +257,124 @@ fn http2_h2c_prior_knowledge_get_root() {
     let _ = stream.shutdown(Shutdown::Both);
 
     // Stop the server and wake accept() with a dummy connection.
+    server.shutdown();
+    drop(TcpStream::connect(addr));
+    server_thread.join().expect("server thread join");
+}
+
+#[test]
+fn http2_handler_path_allows_interleaved_ping_while_reading_body() {
+    let app = App::builder()
+        .post(
+            "/",
+            |_ctx: &RequestContext, _req: &mut Request| async move {
+                Response::ok().body(ResponseBody::Bytes(b"handler-path-ok".to_vec()))
+            },
+        )
+        .build();
+
+    let handler: Arc<dyn fastapi_core::Handler> = Arc::new(app);
+    let (server, addr, server_thread) = spawn_server_handler(&handler);
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
+
+    stream.write_all(PREFACE).expect("write preface");
+    write_frame(&mut stream, 0x4, 0x0, 0, &[]);
+
+    read_settings_handshake(&mut stream);
+    write_frame(&mut stream, 0x4, 0x1, 0, &[]);
+
+    // :method=POST, :scheme=http, :path=/, :authority=www.example.com
+    let header_block: [u8; 17] = [
+        0x83, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90,
+        0xf4, 0xff,
+    ];
+    write_frame(&mut stream, 0x1, 0x4, 1, &header_block); // HEADERS | END_HEADERS (no END_STREAM)
+
+    let ping_payload = b"pingpong";
+    write_frame(&mut stream, 0x6, 0x0, 0, ping_payload); // PING
+    write_frame(&mut stream, 0x0, 0x1, 1, b"abc"); // DATA | END_STREAM
+
+    let (ty, flags, sid, payload) = read_frame(&mut stream);
+    assert_eq!(ty, 0x6, "expected PING ack before response frames");
+    assert_eq!(flags & 0x1, 0x1, "PING ack flag must be set");
+    assert_eq!(sid, 0, "PING must be on stream 0");
+    assert_eq!(payload, ping_payload);
+
+    let resp_header_block = read_header_block(&mut stream, 1);
+    let mut dec = fastapi_http::http2::HpackDecoder::new();
+    let decoded = dec
+        .decode(&resp_header_block)
+        .expect("decode response headers");
+    assert!(
+        decoded.contains(&(b":status".to_vec(), b"200".to_vec())),
+        "expected :status 200, got: {decoded:?}"
+    );
+
+    let body = read_data_body(&mut stream, 1);
+    assert_eq!(body, b"handler-path-ok");
+
+    let _ = stream.shutdown(Shutdown::Both);
+    server.shutdown();
+    drop(TcpStream::connect(addr));
+    server_thread.join().expect("server thread join");
+}
+
+#[test]
+fn http2_closure_path_allows_interleaved_ping_while_reading_body() {
+    let (server, addr, server_thread) = spawn_server_closure();
+
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
+
+    stream.write_all(PREFACE).expect("write preface");
+    write_frame(&mut stream, 0x4, 0x0, 0, &[]);
+
+    read_settings_handshake(&mut stream);
+    write_frame(&mut stream, 0x4, 0x1, 0, &[]);
+
+    // :method=POST, :scheme=http, :path=/, :authority=www.example.com
+    let header_block: [u8; 17] = [
+        0x83, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90,
+        0xf4, 0xff,
+    ];
+    write_frame(&mut stream, 0x1, 0x4, 1, &header_block); // HEADERS | END_HEADERS (no END_STREAM)
+
+    let ping_payload = b"pingpong";
+    write_frame(&mut stream, 0x6, 0x0, 0, ping_payload); // PING
+    write_frame(&mut stream, 0x0, 0x1, 1, b"abc"); // DATA | END_STREAM
+
+    let (ty, flags, sid, payload) = read_frame(&mut stream);
+    assert_eq!(ty, 0x6, "expected PING ack before response frames");
+    assert_eq!(flags & 0x1, 0x1, "PING ack flag must be set");
+    assert_eq!(sid, 0, "PING must be on stream 0");
+    assert_eq!(payload, ping_payload);
+
+    let resp_header_block = read_header_block(&mut stream, 1);
+    let mut dec = fastapi_http::http2::HpackDecoder::new();
+    let decoded = dec
+        .decode(&resp_header_block)
+        .expect("decode response headers");
+    assert!(
+        decoded.contains(&(b":status".to_vec(), b"200".to_vec())),
+        "expected :status 200, got: {decoded:?}"
+    );
+
+    let body = read_data_body(&mut stream, 1);
+    assert_eq!(body, b"closure-path-ok");
+
+    let _ = stream.shutdown(Shutdown::Both);
     server.shutdown();
     drop(TcpStream::connect(addr));
     server_thread.join().expect("server thread join");
